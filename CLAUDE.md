@@ -218,9 +218,25 @@ python -m src.mission_control.tui.app
 
 ### MVP Progress
 - **MVP1** ✅ Complete — single pod + event bus + backtest engine + TUI (46 tests passing)
-- **MVP2** 🔜 All 5 pods + LLM agents (CIO/CEO via Claude SDK) + building view TUI
+- **MVP2** 🔜 All 5 pods + LLM agents (CIO/CEO via Claude SDK) + building view TUI + Polymarket integration
 - **MVP3** 🔜 News scraper (GDELT + FRED + EDGAR + RSS + Reddit + X) + pod researchers
 - **MVP4** 🔜 Execution hardening + Alpaca paper trading + full TUI visual effects
+
+### External API Keys
+**NEVER hardcode API keys. Always load from `.env` via `python-dotenv` or `os.environ`.**
+- `POLYMARKET_API_KEY` — stored in `.env` (gitignored). Used by pod researchers in MVP2.
+  - Docs: https://docs.polymarket.com / CLOB API: https://clob.polymarket.com
+  - Relevant pods: Delta (event odds), Gamma (macro odds), Epsilon (tail risk)
+  - Key fields to extract: `market`, `question`, `outcomePrices`, `volume`, `endDate`
+  - Rate limit: check docs; cache responses aggressively in PodNamespace
+
+### Polymarket Integration Notes
+- Use the **CLOB API** (`clob.polymarket.com`) for real-time market odds
+- Use the **Gamma Markets API** (`gamma-api.polymarket.com`) for market search/metadata
+- Authentication: `L1-MM-POLYGON` header with API key from `.env`
+- Treat Polymarket odds as a **research signal only** — never as the sole trigger for a trade
+- Pod isolation applies: each pod's researcher fetches and processes independently; signals stay in `PodNamespace`
+- Circuit breaker required: API downtime must not block pod operation
 
 ### Skill Usage in This Project
 - `superpowers:brainstorming` — before any new feature/phase

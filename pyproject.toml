@@ -23,6 +23,7 @@ dependencies = [
     "snscrape>=0.7",
     "aiohttp>=3.9",
     "tenacity>=8.0",
+    "python-dotenv>=1.0",
 ]
 
 [project.optional-dependencies]
