@@ -53,7 +53,7 @@ Thumbs.db
 
 # Data cache directories
 data_cache/
-cache/
+/cache/
 *.duckdb
 *.duckdb.wal
 
