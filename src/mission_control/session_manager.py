@@ -11,8 +11,10 @@ from src.agents.cio.cio_agent import CIOAgent
 from src.agents.governance.governance_orchestrator import GovernanceOrchestrator
 from src.agents.risk.cro_agent import CROAgent
 from src.backtest.accounting.capital_allocator import CapitalAllocator
+from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.core.models.allocation import MandateUpdate
 from src.core.models.config import PodConfig, RiskBudget, ExecutionConfig, BacktestConfig
 from src.core.models.enums import TimeHorizon, AgentType
 from src.core.models.messages import AgentMessage
@@ -136,11 +138,16 @@ class SessionManager:
         self._governance: Optional[GovernanceOrchestrator] = None
         self._allocator: Optional[CapitalAllocator] = None
 
+        # Governance state tracking
+        self._latest_mandate: Optional[MandateUpdate] = None
+        self._risk_halt: bool = False
+        self._risk_halt_reason: Optional[str] = None
+
         self._session_active = False
         self._capital_per_pod = 0.0
         self._iteration = 0
 
-        logger.info("[session_manager] Initialized with DataProvider")
+        logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
     async def start_live_session(
         self,
@@ -224,6 +231,11 @@ class SessionManager:
 
                 # Create PodNamespace (isolated state store)
                 namespace = PodNamespace(pod_id)
+
+                # Create PortfolioAccountant for this pod
+                accountant = PortfolioAccountant(pod_id=pod_id, initial_nav=capital_per_pod)
+                namespace.set("accountant", accountant)
+                logger.info("[session_manager] Created PortfolioAccountant for pod %s: initial_nav=$%.2f", pod_id, capital_per_pod)
 
                 # Create PodGateway (I/O boundary)
                 gateway = PodGateway(pod_id, self._event_bus, pod_config)
@@ -397,19 +409,44 @@ class SessionManager:
                             breached_pods = governance_result.get("breached_pods", [])
                             mandate = governance_result.get("mandate")
 
+                            # Store latest mandate for execution enforcement
+                            if mandate:
+                                self._latest_mandate = mandate
+                                logger.info(
+                                    "[session_manager] [iter %d] Mandate updated: allocations=%s, firm_nav=%.2f",
+                                    self._iteration,
+                                    mandate.pod_allocations,
+                                    mandate.firm_nav,
+                                )
+
+                            # Check for CRO halt
+                            if governance_result.get("cro_halt"):
+                                self._risk_halt = True
+                                self._risk_halt_reason = governance_result.get("cro_halt_reason", "Unknown")
+                                logger.error(
+                                    "[session_manager] [iter %d] RISK HALT ACTIVE: %s",
+                                    self._iteration, self._risk_halt_reason
+                                )
+                            else:
+                                self._risk_halt = False
+                                self._risk_halt_reason = None
+
                             # Log governance cycle
                             self._session_logger.log_reasoning(
                                 "governance",
                                 "cycle",
                                 f"Iteration {self._iteration}: Breached={breached_pods}, "
                                 f"Loop6_Consensus={governance_result.get('loop6_consensus', False)}, "
-                                f"Loop7_Consensus={governance_result.get('loop7_consensus', False)}",
+                                f"Loop7_Consensus={governance_result.get('loop7_consensus', False)}, "
+                                f"RiskHalt={self._risk_halt}",
                                 metadata={
                                     "iteration": self._iteration,
                                     "breached_pods": breached_pods,
                                     "loop6_consensus": governance_result.get("loop6_consensus", False),
                                     "loop7_consensus": governance_result.get("loop7_consensus", False),
                                     "mandate_authorized_by": mandate.authorized_by if mandate else None,
+                                    "risk_halt": self._risk_halt,
+                                    "risk_halt_reason": self._risk_halt_reason,
                                 }
                             )
 
@@ -531,6 +568,21 @@ class SessionManager:
     def data_provider(self) -> DataProvider:
         """Access the DataProvider for TUI injection."""
         return self._data_provider
+
+    @property
+    def latest_mandate(self) -> Optional[MandateUpdate]:
+        """Get the latest mandate from governance cycle."""
+        return self._latest_mandate
+
+    @property
+    def risk_halt(self) -> bool:
+        """Check if execution is halted due to risk constraints."""
+        return self._risk_halt
+
+    @property
+    def risk_halt_reason(self) -> Optional[str]:
+        """Get the reason for risk halt."""
+        return self._risk_halt_reason
 
     def log_trade(
         self,

@@ -94,3 +94,12 @@ class PositionSnapshot(BaseModel):
         if self.cost_basis == 0:
             return 0.0
         return (self.current_price - self.cost_basis) / self.cost_basis * 100
+
+
+class PodPosition(BaseModel):
+    """Position model exposed in PodSummary (crosses pod boundary)."""
+    symbol: str
+    qty: float
+    current_price: float
+    unrealized_pnl: float = 0.0
+    notional: float = 0.0  # qty * current_price

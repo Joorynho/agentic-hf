@@ -6,6 +6,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 from .enums import PodStatus
+from .execution import PodPosition
 
 
 class PodRiskMetrics(BaseModel):
@@ -36,8 +37,8 @@ class PodSummary(BaseModel):
     expected_return_estimate: float
     turnover_daily_pct: float
     heartbeat_ok: bool
+    positions: list[PodPosition] = Field(default_factory=list)  # Real open positions from PortfolioAccountant
     error_message: str | None = None
-    # NOTE: No positions, signals, or model parameters -- by design
 
     @property
     def nav(self) -> float:

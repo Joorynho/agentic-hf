@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
+from typing import Optional
 
 from src.core.bus.collaboration_runner import CollaborationRunner
 from src.core.bus.event_bus import EventBus
-from src.core.models.execution import Order, RiskApprovalToken
+from src.core.models.allocation import MandateUpdate
+from src.core.models.enums import PodStatus
+from src.core.models.execution import Order, RiskApprovalToken, PodPosition
 from src.core.models.market import Bar
+from src.core.models.pod_summary import PodSummary, PodRiskMetrics, PodExposureBucket
 from src.pods.base.agent import BasePodAgent
 from src.pods.base.gateway import PodGateway
 from src.pods.base.namespace import PodNamespace
@@ -65,6 +70,17 @@ class PodRuntime:
         self._risk = risk
         self._exec_trader = exec_trader
         self._ops = ops
+
+    def set_governance_state(
+        self,
+        mandate: Optional[MandateUpdate] = None,
+        risk_halt: bool = False,
+        risk_halt_reason: Optional[str] = None,
+    ) -> None:
+        """Set governance state (mandate, risk halt) for execution enforcement."""
+        self._ns.set("governance_mandate", mandate)
+        self._ns.set("governance_risk_halt", risk_halt)
+        self._ns.set("governance_risk_halt_reason", risk_halt_reason)
 
     async def run_cycle(self, bar: Bar) -> None:
         """Run one full agent cycle for a single bar."""
@@ -131,3 +147,135 @@ class PodRuntime:
             current_order = pm_accept.get("order") or revised
 
         return None  # max iterations reached without approval
+
+    async def get_summary(self) -> PodSummary:
+        """Generate PodSummary with real trading data from PortfolioAccountant.
+
+        Returns:
+            PodSummary with current NAV, positions, risk metrics, and exposure buckets.
+        """
+        # Retrieve PortfolioAccountant from pod namespace
+        accountant = self._ns.get("accountant")
+        if accountant is None:
+            # Fallback: return empty summary (pod not fully initialized)
+            logger.warning("[%s] PortfolioAccountant not found in namespace", self._pod_id)
+            return PodSummary(
+                pod_id=self._pod_id,
+                timestamp=datetime.now(),
+                status=PodStatus.INITIALIZING,
+                risk_metrics=PodRiskMetrics(
+                    pod_id=self._pod_id,
+                    timestamp=datetime.now(),
+                    nav=0.0,
+                    daily_pnl=0.0,
+                    drawdown_from_hwm=0.0,
+                    current_vol_ann=0.0,
+                    gross_leverage=0.0,
+                    net_leverage=0.0,
+                    var_95_1d=0.0,
+                    es_95_1d=0.0,
+                ),
+                exposure_buckets=[],
+                expected_return_estimate=0.0,
+                turnover_daily_pct=0.0,
+                heartbeat_ok=True,
+                positions=[],
+                error_message="PortfolioAccountant not initialized",
+            )
+
+        # Build positions list from accountant
+        positions: list[PodPosition] = []
+        for symbol, snapshot in accountant.current_positions.items():
+            positions.append(
+                PodPosition(
+                    symbol=symbol,
+                    qty=snapshot.qty,
+                    current_price=snapshot.current_price,
+                    unrealized_pnl=snapshot.unrealized_pnl,
+                    notional=snapshot.notional,
+                )
+            )
+
+        # Calculate leverage
+        total_notional = sum(abs(p.notional) for p in positions)
+        gross_leverage = total_notional / accountant.nav if accountant.nav > 0 else 0.0
+
+        # Calculate net leverage (long notional - short notional) / NAV
+        long_notional = sum(p.notional for p in positions if p.notional > 0)
+        short_notional = sum(abs(p.notional) for p in positions if p.notional < 0)
+        net_leverage = (long_notional - short_notional) / accountant.nav if accountant.nav > 0 else 0.0
+
+        # Calculate volatility and VaR from price history (simplified)
+        # For MVP4, use placeholder values; will enhance in future phases
+        vol_ann = self._calculate_volatility()
+        var_95 = self._calculate_var(accountant.nav)
+
+        # Calculate drawdown from HWM
+        drawdown = accountant.drawdown_from_hwm()
+
+        # Build exposure buckets (simplified: all US equities for MVP4)
+        exposure_buckets = []
+        if total_notional > 0 and accountant.nav > 0:
+            exposure_pct = total_notional / accountant.nav
+            exposure_buckets.append(
+                PodExposureBucket(
+                    asset_class="US_EQUITIES",
+                    direction="long" if long_notional >= 0 else "short",
+                    notional_pct_nav=exposure_pct,
+                )
+            )
+
+        # Build risk metrics
+        risk_metrics = PodRiskMetrics(
+            pod_id=self._pod_id,
+            timestamp=datetime.now(),
+            nav=accountant.nav,
+            daily_pnl=accountant.daily_pnl,
+            drawdown_from_hwm=max(0.0, drawdown),  # Clamp to non-negative
+            current_vol_ann=vol_ann,
+            gross_leverage=gross_leverage,
+            net_leverage=net_leverage,
+            var_95_1d=var_95,
+            es_95_1d=var_95 * 1.25,  # Expected shortfall approximation
+        )
+
+        # Determine pod status
+        status = PodStatus.ACTIVE
+
+        # Create and return summary
+        summary = PodSummary(
+            pod_id=self._pod_id,
+            timestamp=datetime.now(),
+            status=status,
+            risk_metrics=risk_metrics,
+            exposure_buckets=exposure_buckets,
+            expected_return_estimate=0.0,  # Placeholder; calculated by PM agent
+            turnover_daily_pct=0.0,  # Placeholder; calculated from order history
+            heartbeat_ok=True,
+            positions=positions,
+            error_message=None,
+        )
+
+        logger.debug(
+            "[%s] Generated summary: NAV=$%.2f, positions=%d, leverage=%.2fx",
+            self._pod_id, accountant.nav, len(positions), gross_leverage
+        )
+
+        return summary
+
+    def _calculate_volatility(self) -> float:
+        """Calculate annualized volatility from recent NAV history.
+
+        For MVP4, returns placeholder 0.0. Enhanced in future phases
+        with actual return calculations.
+        """
+        return 0.0
+
+    def _calculate_var(self, nav: float) -> float:
+        """Calculate 95% Value at Risk estimate.
+
+        For MVP4, returns placeholder based on standard assumptions.
+        Enhanced in future phases with actual distribution analysis.
+        """
+        # Placeholder: assume 2% daily risk at 95% confidence
+        return -nav * 0.02
