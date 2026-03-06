@@ -72,27 +72,27 @@ class AgenticHFApp(App):
 
     def action_show_pods(self) -> None:
         from src.mission_control.tui.screens.pod_table import PodTableWidget
-        self._swap(PodTableWidget())
+        self._swap(PodTableWidget(data_provider=self._data_provider))
 
     def action_show_drilldown(self) -> None:
         from src.mission_control.tui.screens.pod_drilldown import PodDrilldownWidget
-        self._swap(PodDrilldownWidget("alpha"))
+        self._swap(PodDrilldownWidget(data_provider=self._data_provider))
 
     def action_show_risk(self) -> None:
         from src.mission_control.tui.screens.risk_limits import RiskLimitsWidget
-        self._swap(RiskLimitsWidget())
+        self._swap(RiskLimitsWidget(data_provider=self._data_provider))
 
     def action_show_control(self) -> None:
         from src.mission_control.tui.screens.control_plane import ControlPlaneWidget
-        self._swap(ControlPlaneWidget())
+        self._swap(ControlPlaneWidget(data_provider=self._data_provider))
 
     def action_show_audit(self) -> None:
-        from src.mission_control.tui.screens.audit_screen import AuditWidget
-        self._swap(AuditWidget())
+        from src.mission_control.tui.screens.audit_screen import AuditScreenWidget
+        self._swap(AuditScreenWidget(data_provider=self._data_provider))
 
     def action_show_building(self) -> None:
         from src.mission_control.tui.screens.building_view import BuildingViewWidget
-        self._swap(BuildingViewWidget())
+        self._swap(BuildingViewWidget(data_provider=self._data_provider))
 
 
 def run() -> None:

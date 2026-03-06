@@ -1,93 +1,57 @@
-"""F6 — Control Plane screen.
-
-Capital allocation bars, pod pause/resume buttons, governance triggers, kill switches.
-RBAC-gated: kill switches require CRO role (enforced in UI via confirmation prompt).
-"""
-from __future__ import annotations
-
+"""F6 — Control Plane screen (MVP3 real data)."""
 from textual.widgets import Static
+from textual.reactive import Reactive
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
-from rich.columns import Columns
-from rich.console import Group
-from rich import box
 
-
-_ALLOCATIONS = {
-    "alpha": 0.20,
-    "beta": 0.20,
-    "gamma": 0.22,
-    "delta": 0.18,
-    "epsilon": 0.20,
-}
-
-_POD_STATUS = {
-    "alpha": "ACTIVE",
-    "beta": "ACTIVE",
-    "gamma": "ACTIVE",
-    "delta": "ACTIVE",
-    "epsilon": "ACTIVE",
-}
-
-
-def _bar(pct: float, width: int = 20) -> str:
-    filled = int(pct * width)
-    empty = width - filled
-    return f"[green]{'█' * filled}[/green][dim]{'░' * empty}[/dim]"
+from src.mission_control.data_provider import DataProvider
 
 
 class ControlPlaneWidget(Static):
-    """F6 control plane — capital allocation + pod controls + kill switches."""
+    """Capital allocation and pod control."""
+
+    data: Reactive[DataProvider | None] = Reactive(None)
+
+    def __init__(self, data_provider: DataProvider | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.data = data_provider
 
     def render(self) -> Panel:
-        # Allocation table
-        alloc_table = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-        alloc_table.add_column("Pod", style="bold cyan", width=10)
-        alloc_table.add_column("Bar", width=24)
-        alloc_table.add_column("Pct", width=6)
+        if not self.data or not self.data.pod_summaries:
+            return Panel(
+                "[yellow]No allocation data available[/yellow]",
+                title="[bold cyan]CONTROL PLANE[/bold cyan]",
+                border_style="bright_blue",
+            )
 
-        for pod_id, pct in _ALLOCATIONS.items():
-            alloc_table.add_row(pod_id.upper(), _bar(pct), f"{pct:.0%}")
+        table = Table.grid(padding=(0, 2))
+        table.add_column("Pod", style="cyan", width=12)
+        table.add_column("Allocation", width=15)
+        table.add_column("Status", width=12)
+        table.add_column("Action", width=20)
 
-        # Pod controls
-        pod_controls = Table(box=box.SIMPLE, show_header=False, padding=(0, 1))
-        pod_controls.add_column("Pod", width=10)
-        pod_controls.add_column("Actions", width=30)
+        pods = self.data.pod_summaries
+        equal_alloc = 1.0 / len(pods) if pods else 0
 
-        for pod_id, status in _POD_STATUS.items():
-            if status == "ACTIVE":
-                actions = f"[yellow][ PAUSE {pod_id.upper():5s} ][/yellow]   [dim][ RESUME ][/dim]"
-            else:
-                actions = f"[dim][ PAUSE  ][/dim]   [green][ RESUME {pod_id.upper():5s} ][/green]"
-            pod_controls.add_row(pod_id.upper(), actions)
+        for pod_id in sorted(pods.keys()):
+            summary = pods[pod_id]
+            status = summary.get('status', 'UNKNOWN') if isinstance(summary, dict) else summary.status.value
+            status_color = {"ACTIVE": "green", "PAUSED": "yellow", "HALTED": "red"}.get(str(status), "white")
 
-        # Governance buttons
-        gov_text = Text()
-        gov_text.append("  [ TRIGGER CEO/CIO REVIEW ]", style="bold cyan")
-        gov_text.append("    ")
-        gov_text.append("[ FORCE REBALANCE ]", style="bold cyan")
+            table.add_row(
+                pod_id,
+                f"{equal_alloc:.1%}",
+                f"[{status_color}]{status}[/{status_color}]",
+                "[dim](reserve for future)[/dim]",
+            )
 
-        # Kill switches
-        kill_text = Text()
-        kill_text.append("  ■ KILL POD  ", style="bold red on dark_red")
-        kill_text.append("   ")
-        kill_text.append("■■ KILL FIRM  ", style="bold white on red")
-        kill_text.append("  [dim](CRO role required)[/dim]")
-
-        body = Group(
-            Text("[bold]CAPITAL ALLOCATION[/bold]", justify="left"),
-            alloc_table,
-            Text(""),
-            Columns([
-                Group(Text("[bold]POD CONTROLS[/bold]"), pod_controls),
-                Group(
-                    Text("[bold]GOVERNANCE[/bold]"),
-                    gov_text,
-                    Text(""),
-                    Text("[bold]KILL SWITCHES[/bold]"),
-                    kill_text,
-                ),
-            ]),
+        return Panel(
+            table,
+            title="[bold cyan]CONTROL PLANE[/bold cyan]",
+            subtitle="[dim]F6[/dim]",
+            border_style="bright_blue",
         )
-        return Panel(body, title="[bold red]CONTROL PLANE[/bold red]", border_style="red")
+
+    def watch_data(self, data: DataProvider | None) -> None:
+        """Re-render when data changes."""
+        self.refresh()

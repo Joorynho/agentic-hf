@@ -1,78 +1,69 @@
-"""F5 — Risk Limits screen.
-
-Live actuals vs limits for all 5 pods + firm aggregate row.
-Green < 70% of limit, Yellow 70-90%, Red > 90% (blinking).
-"""
-from __future__ import annotations
-
-from textual.widgets import DataTable, Static
+"""F5 — Risk Limits screen (MVP3 real data)."""
+from textual.widgets import Static
+from textual.reactive import Reactive
 from rich.panel import Panel
 from rich.table import Table
-from rich.text import Text
-from rich import box
 
-
-# (actual, limit)
-_RISK_DATA = {
-    "alpha":   {"vol": (9.4, 12.0),  "dd": (3.2, 10.0),  "lev": (1.2, 1.5), "var": (1.1, 2.0)},
-    "beta":    {"vol": (6.1, 8.0),   "dd": (1.8, 7.0),   "lev": (1.7, 2.0), "var": (0.8, 1.5)},
-    "gamma":   {"vol": (8.9, 10.0),  "dd": (4.1, 8.0),   "lev": (1.1, 1.2), "var": (1.4, 2.0)},
-    "delta":   {"vol": (11.2, 15.0), "dd": (9.8, 12.0),  "lev": (0.9, 1.0), "var": (2.1, 2.5)},
-    "epsilon": {"vol": (7.3, 10.0),  "dd": (2.1, 9.0),   "lev": (1.3, 1.5), "var": (1.0, 2.0)},
-}
-_FIRM = {"var": (2.1, 3.0), "lev": (1.2, 1.5)}
-
-
-def _color(actual: float, limit: float) -> str:
-    pct = actual / limit if limit else 0
-    if pct > 0.90:
-        return "bold red"
-    if pct > 0.70:
-        return "bold yellow"
-    return "green"
-
-
-def _cell(actual: float, limit: float, suffix: str = "%") -> str:
-    color = _color(actual, limit)
-    warn = " ⚠" if actual / limit > 0.90 else ""
-    return f"[{color}]{actual:.1f}{suffix}/{limit:.1f}{suffix}{warn}[/{color}]"
+from src.mission_control.data_provider import DataProvider
 
 
 class RiskLimitsWidget(Static):
-    """F5 risk limits table — all 5 pods + firm row."""
+    """Risk metrics with color-coded thresholds."""
+
+    data: Reactive[DataProvider | None] = Reactive(None)
+
+    def __init__(self, data_provider: DataProvider | None = None, **kwargs):
+        super().__init__(**kwargs)
+        self.data = data_provider
 
     def render(self) -> Panel:
-        t = Table(box=box.SIMPLE_HEAD, show_header=True, padding=(0, 1), expand=True)
-        t.add_column("Pod", style="bold cyan", width=10)
-        t.add_column("Vol act/lim", width=16)
-        t.add_column("DD act/lim", width=16)
-        t.add_column("Lev act/lim", width=16)
-        t.add_column("VaR act/lim", width=16)
-        t.add_column("⚠", width=3)
-
-        for pod_id, d in _RISK_DATA.items():
-            v, dd, lev, var = d["vol"], d["dd"], d["lev"], d["var"]
-            alerts = sum(1 for a, lim in [v, dd, lev, var] if a / lim > 0.90)
-            alert_str = f"[red]{'!' * alerts}[/red]" if alerts else ""
-            t.add_row(
-                pod_id.upper(),
-                _cell(*v),
-                _cell(*dd),
-                _cell(*lev, suffix="x"),
-                _cell(*var),
-                alert_str,
+        if not self.data or not self.data.pod_summaries:
+            return Panel(
+                "[yellow]No pod data available[/yellow]",
+                title="[bold cyan]RISK LIMITS[/bold cyan]",
+                border_style="bright_blue",
             )
 
-        # Firm row
-        t.add_section()
-        t.add_row(
-            "[bold white]FIRM[/bold white]",
-            "",
-            "",
-            _cell(*_FIRM["lev"], suffix="x"),
-            _cell(*_FIRM["var"]),
-            "",
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Pod", style="cyan", width=10)
+        table.add_column("Drawdown", width=15)
+        table.add_column("Leverage", width=15)
+        table.add_column("VaR", width=15)
+        table.add_column("Vol", width=15)
+
+        for pod_id, summary in self.data.pod_summaries.items():
+            if isinstance(summary, dict):
+                dd = summary.get('risk_metrics', {}).get('drawdown_from_hwm', 0.0)
+                lev = summary.get('risk_metrics', {}).get('gross_leverage', 0.0)
+                var = summary.get('risk_metrics', {}).get('var_95_1d', 0.0)
+                vol = summary.get('risk_metrics', {}).get('current_vol_ann', 0.0)
+            else:
+                dd = summary.risk_metrics.drawdown_from_hwm
+                lev = summary.risk_metrics.gross_leverage
+                var = summary.risk_metrics.var_95_1d
+                vol = summary.risk_metrics.current_vol_ann
+
+            # Color code: <70%=green, 70-90%=yellow, >90%=red of limit
+            dd_color = "green" if dd < 0.07 else "yellow" if dd < 0.09 else "red"
+            lev_color = "green" if lev < 1.4 else "yellow" if lev < 1.8 else "red"
+            var_color = "green" if var < 0.015 else "yellow" if var < 0.020 else "red"
+            vol_color = "green" if vol < 0.10 else "yellow" if vol < 0.15 else "red"
+
+            table.add_row(
+                pod_id,
+                f"[{dd_color}]{dd:.2%}[/{dd_color}]",
+                f"[{lev_color}]{lev:.2f}x[/{lev_color}]",
+                f"[{var_color}]{var:.3f}[/{var_color}]",
+                f"[{vol_color}]{vol:.2%}[/{vol_color}]",
+            )
+
+        return Panel(
+            table,
+            title="[bold cyan]RISK LIMITS[/bold cyan]",
+            subtitle="[dim]F5[/dim]",
+            border_style="bright_blue",
         )
 
-        return Panel(t, title="[bold yellow]RISK LIMITS — ACTUALS vs HARD LIMITS[/bold yellow]",
-                     border_style="yellow")
+    def watch_data(self, data: DataProvider | None) -> None:
+        """Re-render when data changes."""
+        self.refresh()
