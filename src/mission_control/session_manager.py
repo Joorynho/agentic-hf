@@ -53,7 +53,7 @@ class SessionManager:
 
         self._pod_gateways = {}  # TODO: initialize pod gateways
         self._pod_runtimes = {}  # TODO: initialize pod runtimes
-        self._governance = None  # TODO: initialize governance orchestrator
+        self._governance = None  # TODO: initialize governance orchestrator with session_logger=self._session_logger
 
         self._session_active = False
         self._capital_per_pod = 0.0
@@ -106,8 +106,8 @@ class SessionManager:
             #   - Subscribe to pod summary events
 
             # TODO: Initialize governance orchestrator
-            # - Create CEO, CIO, CRO agents
-            # - Wire into GovernanceOrchestrator
+            # - Create CEO, CIO, CRO agents with session_logger=self._session_logger
+            # - Wire into GovernanceOrchestrator with session_logger=self._session_logger
 
             # TODO: Fetch initial market snapshot
             bars = await self._alpaca.fetch_bars(initial_symbols)

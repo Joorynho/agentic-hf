@@ -11,6 +11,7 @@ from src.core.models.allocation import MandateUpdate
 from src.core.models.collaboration import CollaborationLoop
 from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
+from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +34,13 @@ class GovernanceOrchestrator:
         cio: CIOAgent,
         cro: CROAgent,
         runner: CollaborationRunner | None = None,
+        session_logger: SessionLogger | None = None,
     ) -> None:
         self._ceo = ceo
         self._cio = cio
         self._cro = cro
-        self._runner = runner or CollaborationRunner()
+        self._session_logger = session_logger
+        self._runner = runner or CollaborationRunner(session_logger=session_logger)
 
     # ------------------------------------------------------------------
     # Loop 6: CEO ↔ CIO ↔ CRO firm deliberation
