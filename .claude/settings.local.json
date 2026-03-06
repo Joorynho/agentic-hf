@@ -153,7 +153,11 @@
       "Bash(python -m pytest tests/integration/test_mvp4_execution.py -v --tb=short)",
       "Bash(python -m pytest tests/ -v --tb=short -x)",
       "Bash(python -m pytest tests/unit/test_portfolio_accountant_fills.py -v)",
-      "Bash(python -m pytest tests/backtest/test_engine.py tests/integration/test_mvp1.py::test_mvp1_backtest_full_run -v)"
+      "Bash(python -m pytest tests/backtest/test_engine.py tests/integration/test_mvp1.py::test_mvp1_backtest_full_run -v)",
+      "Bash(python -m pytest tests/unit/test_portfolio_accountant_fills.py -v --tb=short)",
+      "Bash(python -m pytest tests/unit/test_session_logger_trades.py -v --tb=short)",
+      "Bash(python -m pytest tests/integration/test_mvp4_session_logger_trades.py -v --tb=short)",
+      "Bash(python -m pytest tests/unit/test_session_logger_trades.py tests/unit/test_portfolio_accountant_fills.py -v --tb=short)"
     ]
   }
 }

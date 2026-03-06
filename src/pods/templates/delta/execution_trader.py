@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from datetime import datetime
 from typing import Optional
 
 from src.core.models.execution import Order, RiskApprovalToken, OrderResult
@@ -19,9 +20,11 @@ class DeltaExecutionTrader(BasePodAgent):
         namespace,
         bus,
         alpaca_adapter: Optional[AlpacaAdapter] = None,
+        session_logger=None,
     ):
         super().__init__(agent_id, pod_id, namespace, bus)
         self._alpaca = alpaca_adapter
+        self._session_logger = session_logger
 
     async def run_cycle(self, context: dict) -> dict:
         order: Order | None = context.get("approved_order")
@@ -78,6 +81,27 @@ class DeltaExecutionTrader(BasePodAgent):
                 )
 
             self.store("last_order_result", result.model_dump(mode="json"))
+
+            # Log trade to SessionLogger if available and order was filled
+            if self._session_logger and result.status in ("FILLED", "PARTIAL"):
+                self._session_logger.log_trade(
+                    pod_id=self._pod_id,
+                    order_info={
+                        "order_id": result.order_id,
+                        "symbol": order.symbol,
+                        "side": order.side.value,
+                        "qty": result.fill_qty,
+                        "fill_price": result.fill_price,
+                        "notional": result.fill_qty * (result.fill_price or 0.0),
+                        "timestamp": (
+                            result.filled_at.isoformat()
+                            if result.filled_at
+                            else datetime.now().isoformat()
+                        ),
+                        "status": result.status,
+                    },
+                )
+
             return {"order_executed": True, "execution_result": result.model_dump(mode="json")}
 
         except Exception as exc:

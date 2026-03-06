@@ -245,23 +245,34 @@ class SessionManager:
                 risk = agent_classes["risk"](
                     agent_id=f"{pod_id}.risk", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )
-                # Pass Alpaca adapter to exec_trader if available
+                # Pass Alpaca adapter and session_logger to exec_trader
                 try:
                     exec_trader = agent_classes["exec_trader"](
                         agent_id=f"{pod_id}.exec_trader",
                         pod_id=pod_id,
                         namespace=namespace,
                         bus=self._event_bus,
-                        alpaca_adapter=self._alpaca
+                        alpaca_adapter=self._alpaca,
+                        session_logger=self._session_logger
                     )
                 except TypeError:
-                    # Fallback for exec_traders that don't support alpaca_adapter parameter
-                    exec_trader = agent_classes["exec_trader"](
-                        agent_id=f"{pod_id}.exec_trader",
-                        pod_id=pod_id,
-                        namespace=namespace,
-                        bus=self._event_bus
-                    )
+                    # Fallback for exec_traders that don't support both parameters
+                    try:
+                        exec_trader = agent_classes["exec_trader"](
+                            agent_id=f"{pod_id}.exec_trader",
+                            pod_id=pod_id,
+                            namespace=namespace,
+                            bus=self._event_bus,
+                            alpaca_adapter=self._alpaca
+                        )
+                    except TypeError:
+                        # Last resort fallback
+                        exec_trader = agent_classes["exec_trader"](
+                            agent_id=f"{pod_id}.exec_trader",
+                            pod_id=pod_id,
+                            namespace=namespace,
+                            bus=self._event_bus
+                        )
                 ops = agent_classes["ops"](
                     agent_id=f"{pod_id}.ops", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )
