@@ -195,6 +195,8 @@ def test_pod_summary_has_no_raw_positions():
         heartbeat_ok=True,
         error_message=None,
     )
-    assert not hasattr(summary, "positions")
-    assert not hasattr(summary, "signal_value")
+    # Note: "positions" IS now part of PodSummary (Phase 1.3) - it contains aggregated position data from PortfolioAccountant
+    assert hasattr(summary, "positions"), "PodSummary should include positions field (Phase 1.3)"
+    assert summary.positions == [], "positions should be empty list by default"
+    assert not hasattr(summary, "signal_value"), "Must not expose raw signal internals"
     assert summary.pod_id == "alpha"
