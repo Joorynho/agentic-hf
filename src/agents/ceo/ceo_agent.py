@@ -10,6 +10,7 @@ from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import EventType
 from src.core.models.messages import AgentMessage, Event
 from src.core.models.pod_summary import PodSummary
+from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -33,8 +34,9 @@ class CEOAgent:
     Fallback: auto-approves static mandate from defaults when no API key.
     """
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(self, bus: EventBus, session_logger: SessionLogger | None = None) -> None:
         self._bus = bus
+        self._session_logger = session_logger
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._has_llm = bool(self._api_key)
         self._current_mandate: MandateUpdate | None = None
@@ -56,6 +58,16 @@ class CEOAgent:
             mandate = self._rule_based_mandate(pod_summaries, cro_constraints or {})
 
         self._current_mandate = mandate
+
+        # Log decision if session logger is available
+        if self._session_logger:
+            decision_text = (
+                f"Mandate approved (llm={self._has_llm}). "
+                f"Narrative: {mandate.narrative}. "
+                f"Constraints: {json.dumps(mandate.constraints)}. "
+                f"Authorized by: {mandate.authorized_by}"
+            )
+            self._session_logger.log_reasoning("ceo", "decision", decision_text)
 
         # EventBus.publish requires an AgentMessage, not a raw dict.
         # Wrap the mandate payload in an AgentMessage from ceo to governance.
@@ -162,6 +174,11 @@ class CEOAgent:
                 "narrative (str), objectives (list[str]), constraints (dict), rationale (str). "
                 "Keep it concise and actionable."
             )
+
+            # Log prompt before LLM call
+            if self._session_logger:
+                self._session_logger.log_reasoning("ceo", "prompt", prompt)
+
             client = openai.OpenAI(api_key=self._api_key)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -169,7 +186,13 @@ class CEOAgent:
                 response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            data = json.loads(resp.choices[0].message.content)
+            response_text = resp.choices[0].message.content
+
+            # Log response after LLM call
+            if self._session_logger:
+                self._session_logger.log_reasoning("ceo", "response", response_text)
+
+            data = json.loads(response_text)
             return MandateUpdate(
                 timestamp=datetime.now(timezone.utc),
                 narrative=data.get("narrative", "LLM mandate"),
