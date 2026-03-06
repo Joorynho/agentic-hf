@@ -53,7 +53,7 @@ class BacktestRunner:
                 accountant.mark_to_market(tick_prices)
 
         return {
-            "nav_final": accountant.nav(),
+            "nav_final": accountant.nav,
             "drawdown_from_hwm": accountant.drawdown_from_hwm(),
             "total_bars_processed": total_bars,
             "pod_id": config.pod_id,

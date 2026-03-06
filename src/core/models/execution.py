@@ -73,3 +73,24 @@ class OrderResult(BaseModel):
     fill_qty: float
     reason: str | None = None
     filled_at: datetime | None = None
+
+
+class PositionSnapshot(BaseModel):
+    """Snapshot of an open position with current market data."""
+    symbol: str
+    qty: float  # Positive = long, negative = short
+    cost_basis: float  # Average cost per share
+    current_price: float  # Current market price
+    unrealized_pnl: float  # qty * (current_price - cost_basis)
+
+    @property
+    def notional(self) -> float:
+        """Notional value of position at current price."""
+        return self.qty * self.current_price
+
+    @property
+    def pnl_pct(self) -> float:
+        """PnL as percentage of cost basis."""
+        if self.cost_basis == 0:
+            return 0.0
+        return (self.current_price - self.cost_basis) / self.cost_basis * 100
