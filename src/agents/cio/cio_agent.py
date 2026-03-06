@@ -19,14 +19,14 @@ _AGENT_ID = "cio"
 class CIOAgent:
     """Firm-level CIO: capital allocation across pods. Participates in Loop 4/7.
 
-    LLM mode: uses claude-haiku to reason about allocation weights.
+    LLM mode: uses gpt-4o-mini to reason about allocation weights.
     Fallback: equal-weight or drift-correction rule.
     """
 
     def __init__(self, bus: EventBus, allocator: CapitalAllocator) -> None:
         self._bus = bus
         self._allocator = allocator
-        self._api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._has_llm = bool(self._api_key)
 
     @property
@@ -135,7 +135,7 @@ class CIOAgent:
         cro_constraints: dict,
     ) -> list[AllocationRecord]:
         try:
-            import anthropic
+            import openai
 
             current = self._allocator.current_allocations()
             summaries_text = "\n".join(
@@ -152,13 +152,14 @@ class CIOAgent:
                 "Propose new allocations as JSON: {\"allocations\": {\"pod_id\": float, ...}}. "
                 "Values must sum to 1.0. All values >= 0."
             )
-            client = anthropic.Anthropic(api_key=self._api_key)
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            client = openai.OpenAI(api_key=self._api_key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
                 max_tokens=300,
-                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            data = json.loads(resp.content[0].text)
+            data = json.loads(resp.choices[0].message.content)
             new_allocs: dict[str, float] = data.get("allocations", {})
             now = datetime.now(timezone.utc)
             return [

@@ -29,13 +29,13 @@ _DEFAULT_CONSTRAINTS = {
 class CEOAgent:
     """Firm-level CEO: approves mandates, sets objectives, participates in Loop 6/7.
 
-    LLM mode: uses claude-haiku to generate narrative + approve mandate.
+    LLM mode: uses gpt-4o-mini to generate narrative + approve mandate.
     Fallback: auto-approves static mandate from defaults when no API key.
     """
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
-        self._api_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._has_llm = bool(self._api_key)
         self._current_mandate: MandateUpdate | None = None
 
@@ -146,7 +146,7 @@ class CEOAgent:
         cro_constraints: dict,
     ) -> MandateUpdate:
         try:
-            import anthropic
+            import openai
 
             summaries_text = "\n".join(
                 f"- {s.pod_id}: status={s.status} pnl={s.risk_metrics.daily_pnl:.2f} "
@@ -162,13 +162,14 @@ class CEOAgent:
                 "narrative (str), objectives (list[str]), constraints (dict), rationale (str). "
                 "Keep it concise and actionable."
             )
-            client = anthropic.Anthropic(api_key=self._api_key)
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
+            client = openai.OpenAI(api_key=self._api_key)
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
                 max_tokens=400,
-                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            data = json.loads(resp.content[0].text)
+            data = json.loads(resp.choices[0].message.content)
             return MandateUpdate(
                 timestamp=datetime.now(timezone.utc),
                 narrative=data.get("narrative", "LLM mandate"),
