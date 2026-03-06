@@ -83,14 +83,14 @@ class CapitalAllocator:
         now = datetime.now(timezone.utc)
 
         # Publish event on bus
-        event = Event(
+        msg = AgentMessage(
             timestamp=now,
-            event_type=EventType.ALLOCATION_CHANGE,
-            source=_PUBLISHER,
-            data={"records": [r.model_dump(mode="json") for r in records]},
-            tags=["allocation"],
+            sender=_PUBLISHER,
+            recipient="*",
+            topic="governance.allocation",
+            payload={"records": [r.model_dump(mode="json") for r in records]},
         )
-        await self._bus.publish("governance.allocation", event.model_dump(mode="json"), _PUBLISHER)
+        await self._bus.publish("governance.allocation", msg, _PUBLISHER)
 
         logger.info("Allocation applied: %s", {r.pod_id: r.new_pct for r in records})
 

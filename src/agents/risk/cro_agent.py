@@ -115,18 +115,14 @@ class CROAgent:
     async def firm_kill_switch(self, reason: str) -> None:
         """Halt the entire firm. All pods receive KILL_SWITCH."""
         logger.critical("[cro] FIRM KILL SWITCH: %s", reason)
-        event = Event(
+        msg = AgentMessage(
             timestamp=datetime.now(timezone.utc),
-            event_type=EventType.KILL_SWITCH,
-            source=_AGENT_ID,
-            data={"scope": "firm", "reason": reason},
-            tags=["kill_switch", "firm"],
+            sender=_AGENT_ID,
+            recipient="*",
+            topic="risk.alert",
+            payload={"scope": "firm", "reason": reason, "action": "kill"},
         )
-        await self._bus.publish(
-            "risk.alert",
-            event.model_dump(mode="json"),
-            publisher_id="risk_manager",
-        )
+        await self._bus.publish("risk.alert", msg, publisher_id="risk_manager")
 
     async def handle_governance_message(self, msg: AgentMessage) -> AgentMessage | None:
         """Respond in governance loops. CRO provides hard constraint validation."""
@@ -189,31 +185,23 @@ class CROAgent:
 
     async def _publish_alert(self, pod_id: str, message: str, severity: str) -> None:
         logger.warning("[cro] ALERT [%s] %s: %s", severity.upper(), pod_id, message)
-        event = Event(
+        msg = AgentMessage(
             timestamp=datetime.now(timezone.utc),
-            event_type=EventType.RISK_ALERT,
-            source=_AGENT_ID,
-            data={"pod_id": pod_id, "message": message, "severity": severity},
-            tags=["risk_alert", severity, pod_id],
+            sender=_AGENT_ID,
+            recipient="*",
+            topic="risk.alert",
+            payload={"pod_id": pod_id, "message": message, "severity": severity, "action": "alert"},
         )
-        await self._bus.publish(
-            "risk.alert",
-            event.model_dump(mode="json"),
-            publisher_id="risk_manager",
-        )
+        await self._bus.publish("risk.alert", msg, publisher_id="risk_manager")
         self._active_alerts[pod_id] = severity
 
     async def _issue_kill_switch(self, pod_id: str, reason: str) -> None:
-        logger.critical("[cro] KILL SWITCH → %s: %s", pod_id, reason)
-        event = Event(
+        logger.critical("[cro] KILL SWITCH -> %s: %s", pod_id, reason)
+        msg = AgentMessage(
             timestamp=datetime.now(timezone.utc),
-            event_type=EventType.KILL_SWITCH,
-            source=_AGENT_ID,
-            data={"pod_id": pod_id, "reason": reason, "scope": "pod"},
-            tags=["kill_switch", pod_id],
+            sender=_AGENT_ID,
+            recipient="*",
+            topic="risk.alert",
+            payload={"pod_id": pod_id, "reason": reason, "scope": "pod", "action": "kill"},
         )
-        await self._bus.publish(
-            "risk.alert",
-            event.model_dump(mode="json"),
-            publisher_id="risk_manager",
-        )
+        await self._bus.publish("risk.alert", msg, publisher_id="risk_manager")
