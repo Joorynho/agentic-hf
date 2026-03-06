@@ -28,4 +28,8 @@ class MandateUpdate(BaseModel):
     authorized_by: Literal["ceo_llm", "ceo_rule_based"]
     cio_approved: bool = False
     cro_approved: bool = False
+    pod_allocations: dict[str, float] = Field(default_factory=dict)  # pod_id -> allocation %
+    firm_nav: float = 0.0  # Total firm NAV for notional calculations
+    cro_halt: bool = False  # Risk halt flag
+    cro_halt_reason: str | None = None  # Why execution was halted
     model_config = {"frozen": True}

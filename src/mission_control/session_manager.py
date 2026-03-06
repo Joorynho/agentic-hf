@@ -367,7 +367,15 @@ class SessionManager:
                         await asyncio.sleep(interval_seconds)
                         continue  # Skip this iteration on fetch failure
 
-                    # 2. Push bars to each pod (async)
+                    # 2. Inject governance state to all pods (before bar processing)
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        runtime.set_governance_state(
+                            mandate=self._latest_mandate,
+                            risk_halt=self._risk_halt,
+                            risk_halt_reason=self._risk_halt_reason,
+                        )
+
+                    # 3. Push bars to each pod (async)
                     for pod_id, gateway in self._pod_gateways.items():
                         for symbol in bars:
                             for bar in bars[symbol]:
@@ -379,11 +387,11 @@ class SessionManager:
                                         self._iteration, pod_id, e
                                     )
 
-                    # 3. Collect pod summaries for governance and emission
+                    # 4. Collect pod summaries for governance and emission
                     pod_summaries = await self._collect_pod_summaries()
                     logger.debug("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
 
-                    # 4. Emit pod summaries to EventBus (for TUI and DataProvider)
+                    # 5. Emit pod summaries to EventBus (for TUI and DataProvider)
                     for pod_id, gateway in self._pod_gateways.items():
                         summary = pod_summaries.get(pod_id)
                         if summary:
@@ -399,7 +407,7 @@ class SessionManager:
                                     self._iteration, pod_id, e
                                 )
 
-                    # 5. Every N iterations: run governance cycle
+                    # 6. Every N iterations: run governance cycle
                     if self._iteration > 0 and self._iteration % governance_freq == 0:
                         try:
                             logger.info("[session_manager] [iter %d] Running governance cycle", self._iteration)
@@ -462,7 +470,7 @@ class SessionManager:
                                 self._iteration, e, exc_info=True
                             )
 
-                    # 6. Periodic account logging
+                    # 7. Periodic account logging
                     if self._iteration % 10 == 0:
                         try:
                             account = await self._alpaca.fetch_account()
@@ -475,7 +483,7 @@ class SessionManager:
                         except Exception as e:
                             logger.warning("[session_manager] [iter %d] Failed to fetch account: %s", self._iteration, e)
 
-                    # 7. Sleep
+                    # 8. Sleep
                     await asyncio.sleep(interval_seconds)
 
                 except asyncio.CancelledError:

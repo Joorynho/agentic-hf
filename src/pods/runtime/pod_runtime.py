@@ -118,8 +118,12 @@ class PodRuntime:
             await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
             return
 
-        # 5. Execution Trader
+        # 5. Execution Trader (with governance constraints)
         ctx["approved_order"] = approved_order
+        # Inject governance state into context
+        ctx["mandate"] = self._ns.get("governance_mandate")
+        ctx["risk_halt"] = self._ns.get("governance_risk_halt", False)
+        ctx["risk_halt_reason"] = self._ns.get("governance_risk_halt_reason")
         await self._exec_trader.run_cycle(ctx)  # type: ignore[union-attr]
 
         # 6. Ops

@@ -3,6 +3,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 
+from src.core.models.allocation import MandateUpdate
 from src.core.models.execution import Order, RiskApprovalToken, OrderResult
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.pods.base.agent import BasePodAgent
@@ -35,13 +36,122 @@ class DeltaExecutionTrader(BasePodAgent):
             logger.warning("[delta.exec] Invalid/expired token — order %s rejected", order.id)
             return {"execution_rejected": True}
 
+        # Extract governance state from context (passed by SessionManager)
+        mandate: Optional[MandateUpdate] = context.get("mandate")
+        risk_halt: bool = context.get("risk_halt", False)
+
+        # Check risk halt first (hard constraint)
+        if risk_halt:
+            risk_halt_reason = context.get("risk_halt_reason", "Unknown risk constraint breach")
+            logger.error(
+                "[delta.exec] Order %s rejected: Risk halt active (%s)", order.id, risk_halt_reason
+            )
+            self._session_logger and self._session_logger.log_reasoning(
+                f"execution:{self._pod_id}",
+                "order_rejected_risk_halt",
+                f"Order {order.symbol} rejected due to risk halt: {risk_halt_reason}",
+            )
+            return {
+                "execution_rejected": True,
+                "rejection_reason": "risk_halt_active",
+                "rejection_detail": risk_halt_reason,
+            }
+
         if self._alpaca:
-            return await self._execute_via_alpaca(order, token)
+            return await self._execute_via_alpaca(order, token, mandate=mandate)
         else:
             return self._queue_for_paper_adapter(order)
 
-    async def _execute_via_alpaca(self, order: Order, token: RiskApprovalToken) -> dict:
-        """Execute order via Alpaca API."""
+    async def _execute_via_alpaca(
+        self, order: Order, token: RiskApprovalToken, mandate: Optional[MandateUpdate] = None
+    ) -> dict:
+        """Execute order via Alpaca API, respecting CIO allocation and CRO risk constraints."""
+        try:
+            # Check allocation constraint (from CIO mandate)
+            if mandate and self._pod_id in mandate.pod_allocations:
+                allocation_pct = mandate.pod_allocations[self._pod_id]
+                firm_nav = mandate.firm_nav if mandate.firm_nav > 0 else 1.0
+
+                # Calculate current notional and requested notional
+                current_positions = self.recall("current_positions", {})
+                last_prices = self.recall("last_prices", {})
+                current_notional = sum(
+                    pos.get("qty", 0) * last_prices.get(pos.get("symbol", ""), 100)
+                    for pos in (current_positions.values() if isinstance(current_positions, dict) else [])
+                )
+
+                last_price = last_prices.get(order.symbol, 100.0)
+                requested_notional = order.quantity * last_price
+                max_notional = allocation_pct * firm_nav
+
+                # If exceeds allocation, try to scale order down
+                if current_notional + requested_notional > max_notional:
+                    available_notional = max_notional - current_notional
+                    if available_notional <= 0:
+                        logger.warning(
+                            "[delta.exec] Order %s rejected: allocation limit reached (%.0f%%, current=$%.2f, max=$%.2f)",
+                            order.id, allocation_pct * 100, current_notional, max_notional,
+                        )
+                        self._session_logger and self._session_logger.log_reasoning(
+                            f"execution:{self._pod_id}",
+                            "order_rejected_allocation_limit",
+                            f"Order {order.symbol} rejected: allocation limit reached ({allocation_pct*100:.0f}%)",
+                        )
+                        return {
+                            "execution_rejected": True,
+                            "rejection_reason": "allocation_limit_exceeded",
+                            "rejection_detail": f"Allocation {allocation_pct*100:.0f}% limit reached",
+                        }
+
+                    # Scale order down to fit allocation
+                    scaled_qty = available_notional / last_price
+                    logger.info(
+                        "[delta.exec] Scaling order %s from %.2f to %.2f (allocation limit)",
+                        order.id, order.quantity, scaled_qty,
+                    )
+                    self._session_logger and self._session_logger.log_reasoning(
+                        f"execution:{self._pod_id}",
+                        "order_scaled_allocation",
+                        f"Order {order.symbol} scaled from {order.quantity} to {scaled_qty} shares",
+                    )
+                    # Mutate the order quantity
+                    order.quantity = scaled_qty
+
+            # Check leverage limit from risk token
+            if token and hasattr(token, "constraints") and token.constraints:
+                max_leverage = token.constraints.get("max_leverage", 2.0)
+                current_positions = self.recall("current_positions", {})
+                last_prices = self.recall("last_prices", {})
+                current_nav = self.recall("current_nav", 10000.0)  # Default to $10k
+
+                current_notional = sum(
+                    pos.get("qty", 0) * last_prices.get(pos.get("symbol", ""), 100)
+                    for pos in (current_positions.values() if isinstance(current_positions, dict) else [])
+                )
+                last_price = last_prices.get(order.symbol, 100.0)
+                requested_notional = order.quantity * last_price
+                new_leverage = (current_notional + requested_notional) / current_nav if current_nav > 0 else 0
+
+                if new_leverage > max_leverage:
+                    logger.warning(
+                        "[delta.exec] Order %s rejected: leverage limit (%.1fx) exceeded (current+requested=%.1fx)",
+                        order.id, max_leverage, new_leverage,
+                    )
+                    self._session_logger and self._session_logger.log_reasoning(
+                        f"execution:{self._pod_id}",
+                        "order_rejected_leverage_limit",
+                        f"Order {order.symbol} rejected: leverage {new_leverage:.1f}x exceeds limit {max_leverage:.1f}x",
+                    )
+                    return {
+                        "execution_rejected": True,
+                        "rejection_reason": "leverage_limit_exceeded",
+                        "rejection_detail": f"Leverage {new_leverage:.1f}x exceeds {max_leverage:.1f}x limit",
+                    }
+
+        except Exception as e:
+            logger.error("[delta.exec] Error checking governance constraints: %s", e)
+            # Continue with execution (fail-open for allocation checks)
+
         try:
             logger.info(
                 "[delta.exec] Submitting order to Alpaca: %s %.0f %s @ $%s",
@@ -100,6 +210,16 @@ class DeltaExecutionTrader(BasePodAgent):
                         ),
                         "status": result.status,
                     },
+                )
+
+            # Log mandate application if available
+            if self._session_logger and mandate:
+                allocation_pct = mandate.pod_allocations.get(self._pod_id, 0.0)
+                self._session_logger.log_reasoning(
+                    f"execution:{self._pod_id}",
+                    "mandate_applied",
+                    f"Order {order.symbol} {order.quantity}: Allocation {allocation_pct*100:.0f}%, "
+                    f"Result: {result.status}",
                 )
 
             return {"order_executed": True, "execution_result": result.model_dump(mode="json")}
