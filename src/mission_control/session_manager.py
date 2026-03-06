@@ -6,16 +6,95 @@ import logging
 from datetime import datetime, timezone
 from typing import Optional
 
+from src.agents.ceo.ceo_agent import CEOAgent
+from src.agents.cio.cio_agent import CIOAgent
+from src.agents.governance.governance_orchestrator import GovernanceOrchestrator
+from src.agents.risk.cro_agent import CROAgent
+from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.core.models.config import PodConfig, RiskBudget, ExecutionConfig, BacktestConfig
+from src.core.models.enums import TimeHorizon, AgentType
 from src.core.models.messages import AgentMessage
+from src.core.models.pod_summary import PodSummary
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.mission_control.data_provider import DataProvider
 from src.mission_control.session_logger import SessionLogger
+from src.pods.base.gateway import PodGateway
+from src.pods.base.namespace import PodNamespace
+from src.pods.runtime.pod_runtime import PodRuntime
+from src.pods.templates.beta.researcher import BetaResearcher
+from src.pods.templates.beta.signal_agent import BetaSignalAgent
+from src.pods.templates.beta.pm_agent import BetaPMAgent
+from src.pods.templates.beta.risk_agent import BetaRiskAgent
+from src.pods.templates.beta.execution_trader import BetaExecutionTrader
+from src.pods.templates.beta.ops_agent import BetaOpsAgent
+from src.pods.templates.gamma.researcher import GammaResearcher
+from src.pods.templates.gamma.signal_agent import GammaSignalAgent
+from src.pods.templates.gamma.pm_agent import GammaPMAgent
+from src.pods.templates.gamma.risk_agent import GammaRiskAgent
+from src.pods.templates.gamma.execution_trader import GammaExecutionTrader
+from src.pods.templates.gamma.ops_agent import GammaOpsAgent
+from src.pods.templates.delta.researcher import DeltaResearcher
+from src.pods.templates.delta.signal_agent import DeltaSignalAgent
+from src.pods.templates.delta.pm_agent import DeltaPMAgent
+from src.pods.templates.delta.risk_agent import DeltaRiskAgent
+from src.pods.templates.delta.execution_trader import DeltaExecutionTrader
+from src.pods.templates.delta.ops_agent import DeltaOpsAgent
+from src.pods.templates.epsilon.researcher import EpsilonResearcher
+from src.pods.templates.epsilon.signal_agent import EpsilonSignalAgent
+from src.pods.templates.epsilon.pm_agent import EpsilonPMAgent
+from src.pods.templates.epsilon.risk_agent import EpsilonRiskAgent
+from src.pods.templates.epsilon.execution_trader import EpsilonExecutionTrader
+from src.pods.templates.epsilon.ops_agent import EpsilonOpsAgent
 
 logger = logging.getLogger(__name__)
 
 POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+
+# Pod agent factories keyed by pod_id
+POD_AGENTS = {
+    "alpha": {
+        "researcher": BetaResearcher,  # Reuse Beta agents for Alpha (placeholder)
+        "signal": BetaSignalAgent,
+        "pm": BetaPMAgent,
+        "risk": BetaRiskAgent,
+        "exec_trader": BetaExecutionTrader,
+        "ops": BetaOpsAgent,
+    },
+    "beta": {
+        "researcher": BetaResearcher,
+        "signal": BetaSignalAgent,
+        "pm": BetaPMAgent,
+        "risk": BetaRiskAgent,
+        "exec_trader": BetaExecutionTrader,
+        "ops": BetaOpsAgent,
+    },
+    "gamma": {
+        "researcher": GammaResearcher,
+        "signal": GammaSignalAgent,
+        "pm": GammaPMAgent,
+        "risk": GammaRiskAgent,
+        "exec_trader": GammaExecutionTrader,
+        "ops": GammaOpsAgent,
+    },
+    "delta": {
+        "researcher": DeltaResearcher,
+        "signal": DeltaSignalAgent,
+        "pm": DeltaPMAgent,
+        "risk": DeltaRiskAgent,
+        "exec_trader": DeltaExecutionTrader,
+        "ops": DeltaOpsAgent,
+    },
+    "epsilon": {
+        "researcher": EpsilonResearcher,
+        "signal": EpsilonSignalAgent,
+        "pm": EpsilonPMAgent,
+        "risk": EpsilonRiskAgent,
+        "exec_trader": EpsilonExecutionTrader,
+        "ops": EpsilonOpsAgent,
+    },
+}
 
 
 class SessionManager:
@@ -51,9 +130,11 @@ class SessionManager:
         self._session_logger = SessionLogger(session_dir=session_dir)
         self._data_provider = DataProvider(bus=self._event_bus, audit_log=self._audit_log)
 
-        self._pod_gateways = {}  # TODO: initialize pod gateways
-        self._pod_runtimes = {}  # TODO: initialize pod runtimes
-        self._governance = None  # TODO: initialize governance orchestrator with session_logger=self._session_logger
+        self._pod_gateways: dict[str, PodGateway] = {}
+        self._pod_runtimes: dict[str, PodRuntime] = {}
+        self._pod_capital: dict[str, float] = {}
+        self._governance: Optional[GovernanceOrchestrator] = None
+        self._allocator: Optional[CapitalAllocator] = None
 
         self._session_active = False
         self._capital_per_pod = 0.0
@@ -98,23 +179,113 @@ class SessionManager:
             await self._data_provider.subscribe_to_updates()
             logger.info("[session_manager] DataProvider subscriptions active")
 
-            # TODO: Initialize pods with capital allocation
-            # For each pod_id:
-            #   - Create PodNamespace
-            #   - Create PodGateway
-            #   - Create PodRuntime with 6 agents
-            #   - Subscribe to pod summary events
+            # Initialize CapitalAllocator (for CIO agent)
+            self._allocator = CapitalAllocator(pod_ids=POD_IDS, bus=self._event_bus, audit_log=self._audit_log)
+            logger.info("[session_manager] CapitalAllocator initialized with %d pods", len(POD_IDS))
 
-            # TODO: Initialize governance orchestrator
-            # - Create CEO, CIO, CRO agents with session_logger=self._session_logger
-            # - Wire into GovernanceOrchestrator with session_logger=self._session_logger
+            # Initialize pods with capital allocation
+            for pod_id in POD_IDS:
+                # Create PodConfig with sensible defaults for live trading
+                pod_config = PodConfig(
+                    pod_id=pod_id,
+                    name=f"{pod_id.capitalize()} Strategy",
+                    strategy_family="multi-signal",
+                    universe=initial_symbols,
+                    time_horizon=TimeHorizon.INTRADAY,
+                    risk_budget=RiskBudget(
+                        target_vol=0.10,
+                        max_leverage=2.0,
+                        max_drawdown=0.15,
+                        max_concentration=0.30,
+                        max_sector_exposure=0.40,
+                        liquidity_min_adv_pct=0.01,
+                        var_limit_95=0.025,
+                        es_limit_95=0.035,
+                    ),
+                    execution=ExecutionConfig(
+                        style="neutral",
+                        max_participation_rate=0.05,
+                        allowed_venues=["NASDAQ", "NYSE"],
+                        order_types=["market", "limit"],
+                    ),
+                    backtest=BacktestConfig(
+                        start_date=datetime.now(timezone.utc).date(),
+                        end_date=datetime.now(timezone.utc).date(),
+                        min_history_days=252,
+                        walk_forward_folds=1,
+                        latency_ms=50,
+                        tcm_bps=5.0,
+                        slippage_model="sqrt_impact",
+                    ),
+                    pm_agent_type=AgentType.RULE_BASED,
+                    enabled=True,
+                )
 
-            # TODO: Fetch initial market snapshot
+                # Create PodNamespace (isolated state store)
+                namespace = PodNamespace(pod_id)
+
+                # Create PodGateway (I/O boundary)
+                gateway = PodGateway(pod_id, self._event_bus, pod_config)
+
+                # Create PodRuntime
+                runtime = PodRuntime(pod_id=pod_id, namespace=namespace, gateway=gateway, bus=self._event_bus)
+
+                # Instantiate the 6 pod agents using pod-specific factories
+                agent_classes = POD_AGENTS[pod_id]
+                researcher = agent_classes["researcher"](
+                    agent_id=f"{pod_id}.researcher", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+                signal = agent_classes["signal"](
+                    agent_id=f"{pod_id}.signal", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+                pm = agent_classes["pm"](
+                    agent_id=f"{pod_id}.pm", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+                risk = agent_classes["risk"](
+                    agent_id=f"{pod_id}.risk", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+                exec_trader = agent_classes["exec_trader"](
+                    agent_id=f"{pod_id}.exec_trader", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+                ops = agent_classes["ops"](
+                    agent_id=f"{pod_id}.ops", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                )
+
+                # Inject agents into runtime
+                runtime.set_agents(researcher, signal, pm, risk, exec_trader, ops)
+
+                # Store references
+                self._pod_gateways[pod_id] = gateway
+                self._pod_runtimes[pod_id] = runtime
+                self._pod_capital[pod_id] = capital_per_pod
+
+                # Subscribe to pod summary events for external monitoring
+                await gateway.subscribe_market_data()
+
+                logger.info(
+                    "[session_manager] Pod %s initialized: capital=$%.2f, agents=6",
+                    pod_id, capital_per_pod,
+                )
+
+            # Initialize governance orchestrator with CEO, CIO, CRO agents
+            ceo = CEOAgent(bus=self._event_bus, session_logger=self._session_logger)
+            cio = CIOAgent(bus=self._event_bus, allocator=self._allocator, session_logger=self._session_logger)
+            cro = CROAgent(bus=self._event_bus)
+            self._governance = GovernanceOrchestrator(
+                ceo=ceo,
+                cio=cio,
+                cro=cro,
+                session_logger=self._session_logger,
+            )
+            logger.info("[session_manager] GovernanceOrchestrator initialized: CEO, CIO, CRO")
+
+            # Fetch initial market snapshot
             bars = await self._alpaca.fetch_bars(initial_symbols)
             logger.info("[session_manager] Fetched initial bars for %d symbols", len(bars))
 
             self._session_active = True
-            logger.info("[session_manager] Session started")
+            logger.info("[session_manager] Session started: %d pods × $%.2f = $%.2f total capital",
+                       len(POD_IDS), capital_per_pod, total_capital)
 
         except Exception as exc:
             logger.error("[session_manager] Failed to start session: %s", exc)
@@ -209,6 +380,23 @@ class SessionManager:
         )
         await self._event_bus.publish(f"pod.{pod_id}.gateway", msg, publisher_id=f"pod.{pod_id}")
         logger.debug("[session_manager] Published pod %s summary", pod_id)
+
+    async def _collect_pod_summaries(self) -> list[PodSummary]:
+        """Collect current summaries from all pod gateways for governance.
+
+        Returns:
+            List of PodSummary objects from active pods.
+        """
+        summaries: list[PodSummary] = []
+        for pod_id, gateway in self._pod_gateways.items():
+            try:
+                # Note: PodGateway.get_summary() is not yet implemented.
+                # For now, return empty list. This will be implemented in MVP3.
+                # TODO: implement gateway.get_summary() method
+                pass
+            except Exception as exc:
+                logger.warning("[session_manager] Failed to collect summary for %s: %s", pod_id, exc)
+        return summaries
 
     async def stop_session(self) -> None:
         """Stop the session and cleanup."""
