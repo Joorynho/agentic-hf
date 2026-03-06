@@ -43,14 +43,32 @@ class DataProvider:
         """Aggregate NAV across all pods (or 0 if none)."""
         if not self._pod_summaries:
             return 0.0
-        return sum(s.risk_metrics.nav for s in self._pod_summaries.values())
+        total = 0.0
+        for s in self._pod_summaries.values():
+            if isinstance(s, dict):
+                # Handle raw dict payloads from _on_pod_summary
+                nav = s.get('risk_metrics', {}).get('nav', 0.0) if isinstance(s.get('risk_metrics'), dict) else s.get('nav', 0.0)
+                total += nav
+            else:
+                # Handle PodSummary objects
+                total += s.risk_metrics.nav
+        return total
 
     @property
     def firm_daily_pnl(self) -> float:
         """Aggregate daily PnL across all pods."""
         if not self._pod_summaries:
             return 0.0
-        return sum(s.risk_metrics.daily_pnl for s in self._pod_summaries.values())
+        total = 0.0
+        for s in self._pod_summaries.values():
+            if isinstance(s, dict):
+                # Handle raw dict payloads from _on_pod_summary
+                pnl = s.get('risk_metrics', {}).get('daily_pnl', 0.0) if isinstance(s.get('risk_metrics'), dict) else s.get('daily_pnl', 0.0)
+                total += pnl
+            else:
+                # Handle PodSummary objects
+                total += s.risk_metrics.daily_pnl
+        return total
 
     @property
     def pod_summaries(self) -> dict[str, PodSummary]:
