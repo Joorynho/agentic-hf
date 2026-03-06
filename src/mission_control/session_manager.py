@@ -245,9 +245,23 @@ class SessionManager:
                 risk = agent_classes["risk"](
                     agent_id=f"{pod_id}.risk", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )
-                exec_trader = agent_classes["exec_trader"](
-                    agent_id=f"{pod_id}.exec_trader", pod_id=pod_id, namespace=namespace, bus=self._event_bus
-                )
+                # Pass Alpaca adapter to exec_trader if available
+                try:
+                    exec_trader = agent_classes["exec_trader"](
+                        agent_id=f"{pod_id}.exec_trader",
+                        pod_id=pod_id,
+                        namespace=namespace,
+                        bus=self._event_bus,
+                        alpaca_adapter=self._alpaca
+                    )
+                except TypeError:
+                    # Fallback for exec_traders that don't support alpaca_adapter parameter
+                    exec_trader = agent_classes["exec_trader"](
+                        agent_id=f"{pod_id}.exec_trader",
+                        pod_id=pod_id,
+                        namespace=namespace,
+                        bus=self._event_bus
+                    )
                 ops = agent_classes["ops"](
                     agent_id=f"{pod_id}.ops", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )

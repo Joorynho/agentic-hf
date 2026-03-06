@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
+from typing import Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -59,3 +60,16 @@ class RiskApprovalToken(BaseModel):
 
     def is_valid(self) -> bool:
         return (time.time() * 1000 - self.issued_at_ms) < self.expires_ms
+
+
+class OrderResult(BaseModel):
+    """Result of order execution on Alpaca."""
+    order_id: str | None
+    symbol: str
+    qty: float
+    side: Literal["buy", "sell"]
+    status: Literal["FILLED", "PARTIAL", "REJECTED", "PENDING"]
+    fill_price: float | None
+    fill_qty: float
+    reason: str | None = None
+    filled_at: datetime | None = None

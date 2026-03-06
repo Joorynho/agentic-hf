@@ -1,6 +1,7 @@
 """Alpaca paper trading adapter — fetches real-time data and executes orders."""
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from datetime import datetime, timezone
@@ -144,8 +145,9 @@ class AlpacaAdapter:
         side: str,  # "buy" or "sell"
         order_type: str = "market",
         limit_price: Optional[float] = None,
+        timeout_seconds: int = 30,
     ) -> dict:
-        """Place an order.
+        """Place an order with fill polling.
 
         Args:
             symbol: Ticker (e.g., 'AAPL')
@@ -153,11 +155,15 @@ class AlpacaAdapter:
             side: 'buy' or 'sell'
             order_type: 'market' or 'limit' (default 'market')
             limit_price: Required if order_type='limit'
+            timeout_seconds: Max seconds to wait for fill (default 30)
 
         Returns:
-            dict with keys: order_id, symbol, qty, side, status, filled_qty, filled_avg_price
+            dict with keys: order_id, symbol, qty, side, status, filled_qty, filled_avg_price, filled_at
+            - status: "FILLED" | "PARTIAL" | "PENDING" | "REJECTED"
+            - filled_at: timestamp if filled, else None
         """
         try:
+            # Submit order to Alpaca
             order = self._client.submit_order(
                 symbol=symbol,
                 qty=qty,
@@ -166,18 +172,7 @@ class AlpacaAdapter:
                 time_in_force="day",
                 limit_price=limit_price if order_type == "limit" else None,
             )
-            result = {
-                "order_id": order.id,
-                "symbol": order.symbol,
-                "qty": float(order.qty),
-                "side": order.side,
-                "status": order.status,
-                "filled_qty": float(order.filled_qty) if order.filled_qty else 0.0,
-                "filled_avg_price": float(order.filled_avg_price)
-                if order.filled_avg_price
-                else None,
-                "submitted_at": order.submitted_at,
-            }
+
             logger.info(
                 "[alpaca] Order placed: %s %s %s@%s (id=%s)",
                 side,
@@ -186,10 +181,83 @@ class AlpacaAdapter:
                 "market" if order_type == "market" else f"${limit_price}",
                 order.id,
             )
+
+            # Poll for fill (up to timeout_seconds)
+            filled_at = None
+            for i in range(timeout_seconds):
+                # Check current order status
+                order_status = self._client.get_order(order.id)
+
+                if order_status.filled_qty and float(order_status.filled_qty) > 0:
+                    filled_at = datetime.now(timezone.utc)
+                    fill_price = (
+                        float(order_status.filled_avg_price)
+                        if order_status.filled_avg_price
+                        else float(order_status.limit_price) if order_status.limit_price else None
+                    )
+                    filled_qty = float(order_status.filled_qty)
+
+                    result_status = (
+                        "FILLED" if filled_qty >= qty
+                        else "PARTIAL"
+                    )
+
+                    result = {
+                        "order_id": order.id,
+                        "symbol": order.symbol,
+                        "qty": qty,
+                        "side": side,
+                        "status": result_status,
+                        "filled_qty": filled_qty,
+                        "filled_avg_price": fill_price,
+                        "filled_at": filled_at,
+                    }
+
+                    logger.info(
+                        "[alpaca] Order %s: %s %.2f @ $%.2f (id=%s)",
+                        result_status,
+                        symbol,
+                        filled_qty,
+                        fill_price or 0.0,
+                        order.id,
+                    )
+                    return result
+
+                # Wait before next poll (except on last iteration)
+                if i < timeout_seconds - 1:
+                    await asyncio.sleep(1)
+
+            # Timeout reached — return PENDING with current status
+            logger.warning(
+                "[alpaca] Order %s did not fill within %d seconds (id=%s)",
+                symbol,
+                timeout_seconds,
+                order.id,
+            )
+            result = {
+                "order_id": order.id,
+                "symbol": symbol,
+                "qty": qty,
+                "side": side,
+                "status": "PENDING",
+                "filled_qty": float(order.filled_qty) if order.filled_qty else 0.0,
+                "filled_avg_price": None,
+                "filled_at": None,
+            }
             return result
+
         except Exception as exc:
             logger.error("[alpaca] place_order failed: %s", exc)
-            raise
+            return {
+                "order_id": None,
+                "symbol": symbol,
+                "qty": qty,
+                "side": side,
+                "status": "REJECTED",
+                "filled_qty": 0.0,
+                "filled_avg_price": None,
+                "filled_at": None,
+            }
 
     async def get_open_positions(self) -> dict[str, dict]:
         """Get all open positions.
