@@ -156,6 +156,7 @@ class SessionManager:
         if initial_symbols is None:
             initial_symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"]
 
+        self._start_time = datetime.now()
         self._capital_per_pod = capital_per_pod
         total_capital = capital_per_pod * len(POD_IDS)
 
@@ -347,7 +348,7 @@ class SessionManager:
 
                     # 4. Emit pod summaries to EventBus (for TUI and DataProvider)
                     for pod_id, gateway in self._pod_gateways.items():
-                        summary = next((s for s in pod_summaries if s.pod_id == pod_id), None)
+                        summary = pod_summaries.get(pod_id)
                         if summary:
                             try:
                                 await gateway.emit_summary(summary)
@@ -443,48 +444,45 @@ class SessionManager:
         await self._event_bus.publish(f"pod.{pod_id}.gateway", msg, publisher_id=f"pod.{pod_id}")
         logger.debug("[session_manager] Published pod %s summary", pod_id)
 
-    async def _collect_pod_summaries(self) -> list[PodSummary]:
-        """Collect current summaries from all pod runtimes for governance.
+    async def _collect_pod_summaries(self) -> dict[str, PodSummary]:
+        """Collect current summary from each pod runtime.
 
         Returns:
-            List of PodSummary objects from active pods.
-
-        Note: This is a placeholder. In production, PodRuntime will have a
-        get_summary() method that extracts state from the namespace. For now,
-        returns empty list; actual summary collection will be implemented
-        when pod agents emit summaries via the EventBus.
+            Dictionary mapping pod_id to PodSummary.
         """
-        summaries: list[PodSummary] = []
+        summaries: dict[str, PodSummary] = {}
         for pod_id, runtime in self._pod_runtimes.items():
             try:
-                # TODO: Once PodRuntime.get_summary() is implemented,
-                # uncomment the following:
-                # summary = runtime.get_summary()
-                # if summary:
-                #     summaries.append(summary)
-                #     logger.debug("[session_manager] Collected summary for pod %s", pod_id)
-
-                # For now, log that we're tracking this pod
-                logger.debug("[session_manager] Tracking pod %s for summary collection", pod_id)
+                summary = await runtime.get_summary()
+                summaries[pod_id] = summary
+                logger.debug("[session_manager] Collected summary for pod %s", pod_id)
             except Exception as exc:
-                logger.warning("[session_manager] Failed to collect summary for %s: %s", pod_id, exc)
+                logger.warning("[session_manager] Error collecting summary for pod %s: %s", pod_id, exc)
+                # Continue with next pod even if one fails
         return summaries
 
-    async def stop_session(self) -> None:
-        """Stop the live session and clean up resources."""
+    async def stop_session(self) -> dict:
+        """Stop event loop and gracefully shut down all pods.
+
+        Returns:
+            Dictionary with session summary: uptime_seconds, iterations, pods_closed, final_capital.
+        """
         logger.info("[session_manager] Stopping live session")
         self._session_active = False
 
         # Give current iteration time to complete
         await asyncio.sleep(0.5)
 
-        # Close all pod runtimes (graceful shutdown)
+        # Gracefully shut down all pod runtimes
+        closed_count = 0
         for pod_id, runtime in self._pod_runtimes.items():
             try:
-                # PodRuntime doesn't have explicit close(), but we log for tracking
-                logger.debug("[session_manager] Closing pod runtime: %s", pod_id)
-            except Exception as e:
-                logger.warning("[session_manager] Error closing pod %s: %s", pod_id, e)
+                if hasattr(runtime, 'stop'):
+                    await runtime.stop()
+                logger.info("[session_manager] Stopped pod runtime: %s", pod_id)
+                closed_count += 1
+            except Exception as exc:
+                logger.warning("[session_manager] Error stopping pod %s: %s", pod_id, exc)
 
         # Close session logger
         try:
@@ -492,6 +490,17 @@ class SessionManager:
             logger.info("[session_manager] Session logs saved to: %s", self._session_logger.session_dir)
         except Exception as e:
             logger.error("[session_manager] Error closing session logger: %s", e)
+
+        # Calculate uptime
+        uptime_seconds = (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else 0
+
+        # Return session summary
+        return {
+            "uptime_seconds": uptime_seconds,
+            "iterations": self._iteration,
+            "pods_closed": closed_count,
+            "final_capital": self._capital_per_pod * len(self._pod_runtimes),
+        }
 
     @property
     def data_provider(self) -> DataProvider:
