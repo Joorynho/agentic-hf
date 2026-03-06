@@ -204,5 +204,9 @@ class CEOAgent:
                 cro_approved=bool(cro_constraints),
             )
         except Exception as exc:
+            # Log the error response to close the prompt entry
+            if self._session_logger:
+                self._session_logger.log_reasoning("ceo", "response", f"ERROR: {str(exc)}")
+
             logger.info("[ceo] LLM mandate failed (%s) — fallback", exc)
             return self._rule_based_mandate(pod_summaries, cro_constraints)
