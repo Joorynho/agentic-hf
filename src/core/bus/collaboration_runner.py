@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 from src.core.models.collaboration import CollaborationLoop
 from src.core.models.messages import AgentMessage
+from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,14 @@ class CollaborationRunner:
 
     Full transcript is stored in CollaborationLoop.messages for audit.
     """
+
+    def __init__(self, session_logger: SessionLogger | None = None):
+        """Initialize CollaborationRunner.
+
+        Args:
+            session_logger: Optional SessionLogger for persisting completed loops.
+        """
+        self._session_logger = session_logger
 
     async def run_loop(
         self,
@@ -73,4 +82,9 @@ class CollaborationRunner:
             )
 
         loop.completed_at = datetime.now(timezone.utc)
+
+        # Log completed loop to session persistence
+        if self._session_logger:
+            self._session_logger.log_collaboration_loop(loop)
+
         return loop
