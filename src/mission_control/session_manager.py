@@ -314,43 +314,105 @@ class SessionManager:
         )
 
         try:
-            symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"]  # TODO: get from pod configs
+            symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]  # Trading universe
 
             while self._session_active:
                 self._iteration += 1
 
                 try:
                     # 1. Fetch latest bars from Alpaca
-                    bars = await self._alpaca.fetch_bars(symbols, timeframe="1Min")
-                    logger.debug("[session_manager] [iter %d] Fetched bars", self._iteration)
+                    try:
+                        bars = await self._alpaca.fetch_bars(symbols, timeframe="1Min")
+                        logger.debug("[session_manager] [iter %d] Fetched bars for %d symbols", self._iteration, len(bars))
+                    except Exception as e:
+                        logger.error("[session_manager] [iter %d] Failed to fetch bars: %s", self._iteration, e)
+                        await asyncio.sleep(interval_seconds)
+                        continue  # Skip this iteration on fetch failure
 
                     # 2. Push bars to each pod (async)
-                    # TODO: for pod_id, gateway in self._pod_gateways.items():
-                    #       for symbol in bars:
-                    #           for bar in bars[symbol]:
-                    #               await gateway.push_bar(bar)
+                    for pod_id, gateway in self._pod_gateways.items():
+                        for symbol in bars:
+                            for bar in bars[symbol]:
+                                try:
+                                    await gateway.push_bar(bar)
+                                except Exception as e:
+                                    logger.warning(
+                                        "[session_manager] [iter %d] Failed to push bar to %s: %s",
+                                        self._iteration, pod_id, e
+                                    )
 
-                    # 3. Every N iterations: run governance
-                    if self._iteration % governance_freq == 0:
-                        logger.info("[session_manager] [iter %d] Running governance cycle", self._iteration)
-                        # TODO: await self._governance.run_full_cycle(pod_summaries)
+                    # 3. Collect pod summaries for governance and emission
+                    pod_summaries = await self._collect_pod_summaries()
+                    logger.debug("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
 
-                    # 4. Emit pod summaries to EventBus
-                    # TODO: for pod_id, gateway in self._pod_gateways.items():
-                    #       summary = await gateway.get_summary()
-                    #       await gateway.emit_summary(summary)
+                    # 4. Emit pod summaries to EventBus (for TUI and DataProvider)
+                    for pod_id, gateway in self._pod_gateways.items():
+                        summary = next((s for s in pod_summaries if s.pod_id == pod_id), None)
+                        if summary:
+                            try:
+                                await gateway.emit_summary(summary)
+                                logger.debug(
+                                    "[session_manager] [iter %d] Emitted summary for %s: NAV=%.2f",
+                                    self._iteration, pod_id, summary.nav
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    "[session_manager] [iter %d] Failed to emit summary for %s: %s",
+                                    self._iteration, pod_id, e
+                                )
 
-                    # 5. Log session state
+                    # 5. Every N iterations: run governance cycle
+                    if self._iteration > 0 and self._iteration % governance_freq == 0:
+                        try:
+                            logger.info("[session_manager] [iter %d] Running governance cycle", self._iteration)
+                            governance_result = await self._governance.run_full_cycle(pod_summaries)
+
+                            # Extract results
+                            breached_pods = governance_result.get("breached_pods", [])
+                            mandate = governance_result.get("mandate")
+
+                            # Log governance cycle
+                            self._session_logger.log_reasoning(
+                                "governance",
+                                "cycle",
+                                f"Iteration {self._iteration}: Breached={breached_pods}, "
+                                f"Loop6_Consensus={governance_result.get('loop6_consensus', False)}, "
+                                f"Loop7_Consensus={governance_result.get('loop7_consensus', False)}",
+                                metadata={
+                                    "iteration": self._iteration,
+                                    "breached_pods": breached_pods,
+                                    "loop6_consensus": governance_result.get("loop6_consensus", False),
+                                    "loop7_consensus": governance_result.get("loop7_consensus", False),
+                                    "mandate_authorized_by": mandate.authorized_by if mandate else None,
+                                }
+                            )
+
+                            if breached_pods:
+                                logger.warning(
+                                    "[session_manager] [iter %d] Risk breach detected in pods: %s",
+                                    self._iteration, breached_pods
+                                )
+
+                        except Exception as e:
+                            logger.error(
+                                "[session_manager] [iter %d] Governance cycle failed: %s",
+                                self._iteration, e, exc_info=True
+                            )
+
+                    # 6. Periodic account logging
                     if self._iteration % 10 == 0:
-                        account = await self._alpaca.fetch_account()
-                        logger.info(
-                            "[session_manager] [iter %d] Account: equity=$%.2f, positions=%d",
-                            self._iteration,
-                            account["equity"],
-                            account["position_count"],
-                        )
+                        try:
+                            account = await self._alpaca.fetch_account()
+                            logger.info(
+                                "[session_manager] [iter %d] Account: equity=$%.2f, positions=%d",
+                                self._iteration,
+                                account["equity"],
+                                account["position_count"],
+                            )
+                        except Exception as e:
+                            logger.warning("[session_manager] [iter %d] Failed to fetch account: %s", self._iteration, e)
 
-                    # 6. Sleep
+                    # 7. Sleep
                     await asyncio.sleep(interval_seconds)
 
                 except asyncio.CancelledError:
@@ -382,39 +444,54 @@ class SessionManager:
         logger.debug("[session_manager] Published pod %s summary", pod_id)
 
     async def _collect_pod_summaries(self) -> list[PodSummary]:
-        """Collect current summaries from all pod gateways for governance.
+        """Collect current summaries from all pod runtimes for governance.
 
         Returns:
             List of PodSummary objects from active pods.
+
+        Note: This is a placeholder. In production, PodRuntime will have a
+        get_summary() method that extracts state from the namespace. For now,
+        returns empty list; actual summary collection will be implemented
+        when pod agents emit summaries via the EventBus.
         """
         summaries: list[PodSummary] = []
-        for pod_id, gateway in self._pod_gateways.items():
+        for pod_id, runtime in self._pod_runtimes.items():
             try:
-                # Note: PodGateway.get_summary() is not yet implemented.
-                # For now, return empty list. This will be implemented in MVP3.
-                # TODO: implement gateway.get_summary() method
-                pass
+                # TODO: Once PodRuntime.get_summary() is implemented,
+                # uncomment the following:
+                # summary = runtime.get_summary()
+                # if summary:
+                #     summaries.append(summary)
+                #     logger.debug("[session_manager] Collected summary for pod %s", pod_id)
+
+                # For now, log that we're tracking this pod
+                logger.debug("[session_manager] Tracking pod %s for summary collection", pod_id)
             except Exception as exc:
                 logger.warning("[session_manager] Failed to collect summary for %s: %s", pod_id, exc)
         return summaries
 
     async def stop_session(self) -> None:
-        """Stop the session and cleanup."""
-        logger.info("[session_manager] Stopping session")
+        """Stop the live session and clean up resources."""
+        logger.info("[session_manager] Stopping live session")
         self._session_active = False
 
+        # Give current iteration time to complete
+        await asyncio.sleep(0.5)
+
+        # Close all pod runtimes (graceful shutdown)
+        for pod_id, runtime in self._pod_runtimes.items():
+            try:
+                # PodRuntime doesn't have explicit close(), but we log for tracking
+                logger.debug("[session_manager] Closing pod runtime: %s", pod_id)
+            except Exception as e:
+                logger.warning("[session_manager] Error closing pod %s: %s", pod_id, e)
+
+        # Close session logger
         try:
-            # TODO: Close all pod positions
-            # positions = await self._alpaca.get_open_positions()
-            # if positions:
-            #     logger.info("[session_manager] Closing %d open positions", len(positions))
-            #     await self._alpaca.close_all_positions()
-
             self._session_logger.close()
-            logger.info("[session_manager] Session stopped")
-
-        except Exception as exc:
-            logger.error("[session_manager] Error stopping session: %s", exc)
+            logger.info("[session_manager] Session logs saved to: %s", self._session_logger.session_dir)
+        except Exception as e:
+            logger.error("[session_manager] Error closing session logger: %s", e)
 
     @property
     def data_provider(self) -> DataProvider:
