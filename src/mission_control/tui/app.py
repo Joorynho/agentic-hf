@@ -1,5 +1,5 @@
 """
-Agentic HF -- Mission Control TUI (MVP2).
+Agentic HF -- Mission Control TUI (MVP3).
 
 Run with:  python -m src.mission_control.tui.app
 
@@ -10,10 +10,14 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Header, Footer
 
+from src.core.bus.event_bus import EventBus
+from src.core.bus.audit_log import AuditLog
+from src.mission_control.data_provider import DataProvider
+
 
 class AgenticHFApp(App):
     TITLE = "AGENTIC HF -- Mission Control"
-    SUB_TITLE = "MVP2"
+    SUB_TITLE = "MVP3"
 
     CSS = """
     Screen { background: #0a0a0a; }
@@ -36,10 +40,25 @@ class AgenticHFApp(App):
         Binding("q", "quit", "Quit"),
     ]
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Initialize EventBus and DataProvider at app startup
+        self._audit_log = AuditLog()
+        self._bus = EventBus(audit_log=self._audit_log)
+        self._data_provider = DataProvider(bus=self._bus, audit_log=self._audit_log)
+        self._initialized = False
+
+    def on_mount(self) -> None:
+        """Initialize subscriptions after app mounts."""
+        if not self._initialized:
+            import asyncio
+            asyncio.create_task(self._data_provider.subscribe_to_updates())
+            self._initialized = True
+
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
         from src.mission_control.tui.screens.firm_dashboard import FirmDashboardWidget
-        yield FirmDashboardWidget()
+        yield FirmDashboardWidget(data_provider=self._data_provider)
         yield Footer()
 
     def _swap(self, widget) -> None:
@@ -50,7 +69,7 @@ class AgenticHFApp(App):
 
     def action_show_firm(self) -> None:
         from src.mission_control.tui.screens.firm_dashboard import FirmDashboardWidget
-        self._swap(FirmDashboardWidget())
+        self._swap(FirmDashboardWidget(data_provider=self._data_provider))
 
     def action_show_pods(self) -> None:
         from src.mission_control.tui.screens.pod_table import PodTableWidget
