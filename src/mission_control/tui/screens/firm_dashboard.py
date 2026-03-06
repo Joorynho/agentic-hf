@@ -66,6 +66,5 @@ class FirmDashboardWidget(Static):
         )
 
     def watch_data(self, data: DataProvider | None) -> None:
-        """Re-render when DataProvider updates."""
-        if data is not None:
-            self.refresh()
+        """Re-render when DataProvider updates (including when set to None)."""
+        self.refresh()

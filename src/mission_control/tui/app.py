@@ -48,11 +48,10 @@ class AgenticHFApp(App):
         self._data_provider = DataProvider(bus=self._bus, audit_log=self._audit_log)
         self._initialized = False
 
-    def on_mount(self) -> None:
+    async def on_mount(self) -> None:
         """Initialize subscriptions after app mounts."""
         if not self._initialized:
-            import asyncio
-            asyncio.create_task(self._data_provider.subscribe_to_updates())
+            await self._data_provider.subscribe_to_updates()
             self._initialized = True
 
     def compose(self) -> ComposeResult:
