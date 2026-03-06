@@ -16,6 +16,12 @@ class EventType(str, Enum):
     ORDER_REJECTED = "order_rejected"
     MANDATE_UPDATE = "mandate_update"
     REBALANCE = "rebalance"
+    POLYMARKET_SIGNAL = "polymarket_signal"
+    COLLABORATION_START = "collaboration_start"
+    COLLABORATION_END = "collaboration_end"
+    GOVERNANCE_QUERY = "governance_query"
+    GOVERNANCE_RESPONSE = "governance_response"
+    RISK_ALERT = "risk_alert"
 
 
 class PodStatus(str, Enum):
