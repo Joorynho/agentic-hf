@@ -8,7 +8,9 @@ from typing import Optional
 
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.core.models.messages import AgentMessage
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
+from src.mission_control.data_provider import DataProvider
 from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
@@ -47,6 +49,7 @@ class SessionManager:
         self._audit_log = audit_log or AuditLog()
         self._event_bus = event_bus or EventBus(audit_log=self._audit_log)
         self._session_logger = SessionLogger(session_dir=session_dir)
+        self._data_provider = DataProvider(bus=self._event_bus, audit_log=self._audit_log)
 
         self._pod_gateways = {}  # TODO: initialize pod gateways
         self._pod_runtimes = {}  # TODO: initialize pod runtimes
@@ -56,7 +59,7 @@ class SessionManager:
         self._capital_per_pod = 0.0
         self._iteration = 0
 
-        logger.info("[session_manager] Initialized")
+        logger.info("[session_manager] Initialized with DataProvider")
 
     async def start_live_session(
         self,
@@ -90,6 +93,10 @@ class SessionManager:
                 account["equity"],
                 account["buying_power"],
             )
+
+            # Initialize DataProvider subscriptions
+            await self._data_provider.subscribe_to_updates()
+            logger.info("[session_manager] DataProvider subscriptions active")
 
             # TODO: Initialize pods with capital allocation
             # For each pod_id:
@@ -186,6 +193,23 @@ class SessionManager:
         finally:
             await self.stop_session()
 
+    async def publish_pod_summary(self, pod_id: str, summary: dict) -> None:
+        """Publish pod summary to EventBus for TUI consumption.
+
+        Args:
+            pod_id: ID of the pod (e.g., 'alpha', 'beta')
+            summary: Pod summary dict with risk_metrics, positions, etc.
+        """
+        msg = AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender=f"pod.{pod_id}.gateway",
+            recipient="*",
+            topic=f"pod.{pod_id}.gateway",
+            payload=summary,
+        )
+        await self._event_bus.publish(f"pod.{pod_id}.gateway", msg, publisher_id=f"pod.{pod_id}")
+        logger.debug("[session_manager] Published pod %s summary", pod_id)
+
     async def stop_session(self) -> None:
         """Stop the session and cleanup."""
         logger.info("[session_manager] Stopping session")
@@ -203,6 +227,11 @@ class SessionManager:
 
         except Exception as exc:
             logger.error("[session_manager] Error stopping session: %s", exc)
+
+    @property
+    def data_provider(self) -> DataProvider:
+        """Access the DataProvider for TUI injection."""
+        return self._data_provider
 
     def log_trade(
         self,
