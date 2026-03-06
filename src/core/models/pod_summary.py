@@ -38,3 +38,8 @@ class PodSummary(BaseModel):
     heartbeat_ok: bool
     error_message: str | None = None
     # NOTE: No positions, signals, or model parameters -- by design
+
+    @property
+    def nav(self) -> float:
+        """Convenience property to access NAV from risk_metrics."""
+        return self.risk_metrics.nav
