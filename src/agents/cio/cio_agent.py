@@ -10,6 +10,7 @@ from src.core.bus.event_bus import EventBus
 from src.core.models.allocation import AllocationRecord
 from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
+from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
 
@@ -23,9 +24,10 @@ class CIOAgent:
     Fallback: equal-weight or drift-correction rule.
     """
 
-    def __init__(self, bus: EventBus, allocator: CapitalAllocator) -> None:
+    def __init__(self, bus: EventBus, allocator: CapitalAllocator, session_logger: SessionLogger | None = None) -> None:
         self._bus = bus
         self._allocator = allocator
+        self._session_logger = session_logger
         self._api_key = os.getenv("OPENAI_API_KEY", "")
         self._has_llm = bool(self._api_key)
 
@@ -152,6 +154,11 @@ class CIOAgent:
                 "Propose new allocations as JSON: {\"allocations\": {\"pod_id\": float, ...}}. "
                 "Values must sum to 1.0. All values >= 0."
             )
+
+            # Log prompt before LLM call
+            if self._session_logger:
+                self._session_logger.log_reasoning("cio", "prompt", prompt)
+
             client = openai.OpenAI(api_key=self._api_key)
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
@@ -159,10 +166,16 @@ class CIOAgent:
                 response_format={"type": "json_object"},
                 messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            data = json.loads(resp.choices[0].message.content)
+            response_text = resp.choices[0].message.content
+
+            # Log response after LLM call
+            if self._session_logger:
+                self._session_logger.log_reasoning("cio", "response", response_text)
+
+            data = json.loads(response_text)
             new_allocs: dict[str, float] = data.get("allocations", {})
             now = datetime.now(timezone.utc)
-            return [
+            records = [
                 AllocationRecord(
                     timestamp=now, pod_id=pid,
                     old_pct=current.get(pid, 0.0),
@@ -172,6 +185,21 @@ class CIOAgent:
                 )
                 for pid in current
             ]
+
+            # Log decision after allocation records are created
+            if self._session_logger:
+                decision_text = (
+                    f"Allocations proposed (llm=True). "
+                    f"Changes: {json.dumps({r.pod_id: {'old': r.old_pct, 'new': r.new_pct} for r in records})}. "
+                    f"Authorized by: cio_llm"
+                )
+                self._session_logger.log_reasoning("cio", "decision", decision_text)
+
+            return records
         except Exception as exc:
+            # Log the error response to close the prompt entry
+            if self._session_logger:
+                self._session_logger.log_reasoning("cio", "response", f"ERROR: {str(exc)}")
+
             logger.info("[cio] LLM allocation failed (%s) — fallback", exc)
             return self._rule_based_allocation(pod_summaries)
