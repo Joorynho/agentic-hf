@@ -94,15 +94,19 @@ class DataProvider:
         """Subscribe to EventBus topics for live updates.
 
         Called once at app startup to wire up subscriptions.
+        Subscribes to concrete pod gateway topics for the 5 design pods.
         """
-        # Subscribe to pod gateway summaries
-        # Pattern: pod.{pod_id}.gateway → topic carries PodSummary
-        await self._bus.subscribe("pod.*.gateway", self._on_pod_summary)
+        # Subscribe to pod gateway summaries for each of the 5 design pods
+        POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+        for pod_id in POD_IDS:
+            topic = f"pod.{pod_id}.gateway"
+            await self._bus.subscribe(topic, self._on_pod_summary)
+            logger.debug("[data_provider] Subscribed to %s", topic)
 
         # Subscribe to governance loops
         await self._bus.subscribe("governance.*", self._on_governance_event)
 
-        logger.info("[data_provider] Subscribed to EventBus topics")
+        logger.info("[data_provider] Subscribed to EventBus topics (%d pod topics)", len(POD_IDS))
 
     async def _on_pod_summary(self, msg) -> None:
         """Handle pod summary update from gateway."""
