@@ -15,11 +15,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+
+# Load .env file at module import time
+_env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(str(_env_path))
 
 from src.core.bus.event_bus import EventBus
 from src.core.models.messages import AgentMessage

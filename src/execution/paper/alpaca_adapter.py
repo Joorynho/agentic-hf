@@ -5,13 +5,18 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
 from alpaca_trade_api import REST, TimeFrame
 from alpaca_trade_api.rest import TimeFrameUnit
 import pandas as pd
 
 from src.core.models.market import Bar
+
+# Always load .env from project root, regardless of working directory
+load_dotenv(Path(__file__).resolve().parent.parent.parent.parent / ".env")
 
 logger = logging.getLogger(__name__)
 

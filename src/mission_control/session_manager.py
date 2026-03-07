@@ -3,8 +3,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
+
+# Load .env file at module import time
+_env_path = Path(__file__).parent.parent.parent / ".env"
+load_dotenv(str(_env_path))
 
 from src.agents.ceo.ceo_agent import CEOAgent
 from src.agents.cio.cio_agent import CIOAgent
