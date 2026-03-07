@@ -179,7 +179,10 @@
       "Bash(npm install)",
       "Bash(node --version)",
       "Bash(wc -l echo \"\" echo \"TypeScript/JSX component files:\" ls -1 src/components/*.tsx)",
-      "Bash(wc -l echo \"\" echo \"Documentation files:\" ls -1 *.md)"
+      "Bash(wc -l echo \"\" echo \"Documentation files:\" ls -1 *.md)",
+      "Bash(/tmp/deliverables.txt:*)",
+      "Bash(git add src/web/server.py)",
+      "Bash(node -e \"require\\(''fs''\\).readFileSync\\(''web/dist/index.html'', ''utf8''\\)\")"
     ]
   }
 }
