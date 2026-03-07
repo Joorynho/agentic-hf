@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.core.bus.event_bus import EventBus
@@ -355,4 +359,27 @@ def create_app(
 
     app.state.update_session_state = update_session_state
 
+    # --- Static file serving for the web dashboard ---
+    # Resolve the path to web/dist/ relative to this file (src/web/server.py -> ../../web/dist)
+    _static_dir = Path(os.path.join(os.path.dirname(__file__), "../../web/dist")).resolve()
+    _index_html = _static_dir / "index.html"
+
+    if _static_dir.is_dir():
+        @app.get("/")
+        async def serve_root():
+            """Serve the dashboard index.html at the root path."""
+            if _index_html.is_file():
+                return FileResponse(str(_index_html), media_type="text/html")
+            raise HTTPException(status_code=404, detail="index.html not found in web/dist/")
+
+        # Mount static files LAST so API routes (/api/*, /ws, /health) take priority
+        app.mount("/", StaticFiles(directory=str(_static_dir), html=False), name="static")
+        logger.info("[web] Serving static files from %s", _static_dir)
+    else:
+        logger.warning("[web] Static directory not found: %s — dashboard will not be served", _static_dir)
+
     return app
+
+
+# Create app instance for uvicorn
+app = create_app()
