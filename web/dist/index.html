@@ -1133,14 +1133,142 @@
         building.castShadow = true;
         scene.add(building);
 
+        // Floor animation state
+        const floorAnimations = {};
+        floorData.forEach((data, index) => {
+            floorAnimations[index] = { baseIntensity: 0.15, currentIntensity: 0.15 };
+        });
+
+        // Light flow lines for governance animations
+        let governanceLightLines = [];
+
+        function triggerTradePulse() {
+            // Find Execution floor (index 1, cyan, y: -5)
+            const executionFloorIndex = 1;
+            if (!floorAnimations[executionFloorIndex]) return;
+
+            // Use GSAP to animate floor emissive intensity
+            gsap.to(floorAnimations[executionFloorIndex], {
+                currentIntensity: 2.0,
+                duration: 0.3,
+                ease: 'power2.out',
+                onUpdate: function() {
+                    floors[executionFloorIndex].material.emissiveIntensity = floorAnimations[executionFloorIndex].currentIntensity;
+                }
+            });
+
+            gsap.to(floorAnimations[executionFloorIndex], {
+                currentIntensity: 0.3,
+                duration: 1.2,
+                delay: 0.3,
+                ease: 'expo.out',
+                onUpdate: function() {
+                    floors[executionFloorIndex].material.emissiveIntensity = floorAnimations[executionFloorIndex].currentIntensity;
+                },
+                onComplete: function() {
+                    floorAnimations[executionFloorIndex].currentIntensity = 0.15;
+                    floors[executionFloorIndex].material.emissiveIntensity = 0.15;
+                }
+            });
+        }
+
+        function triggerGovernanceLightFlow(agentName) {
+            // Map agent to floor index and color
+            const agentMap = {
+                'CEO': { floorIndex: 0, color: 0xff4757 },      // Risk floor, red
+                'CIO': { floorIndex: 2, color: 0x2ecc71 },       // Research floor, green
+                'CRO': { floorIndex: 5, color: 0xf39c12 }        // Governance floor, orange
+            };
+
+            const agent = agentMap[agentName];
+            if (!agent) return;
+
+            // Create line from agent floor to AI Systems hub (index 3, y: 5)
+            const agentFloorY = floorData[agent.floorIndex].y;
+            const hubFloorY = 5;  // AI Systems floor
+
+            const lineGeometry = new THREE.BufferGeometry();
+            const positions = new Float32Array([
+                0, agentFloorY, 0,     // Start at agent floor center
+                0, hubFloorY, 0        // End at hub floor center
+            ]);
+            lineGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+
+            const lineMaterial = new THREE.LineBasicMaterial({
+                color: agent.color,
+                linewidth: 2,
+                opacity: 0,
+                transparent: true
+            });
+
+            const line = new THREE.Line(lineGeometry, lineMaterial);
+            scene.add(line);
+            governanceLightLines.push(line);
+
+            // Animate line opacity
+            const lineState = { opacity: 0 };
+            gsap.to(lineState, {
+                opacity: 1,
+                duration: 0.3,
+                ease: 'power2.out',
+                onUpdate: function() {
+                    lineMaterial.opacity = lineState.opacity;
+                }
+            });
+
+            gsap.to(lineState, {
+                opacity: 0,
+                duration: 1.7,
+                delay: 0.3,
+                ease: 'expo.in',
+                onUpdate: function() {
+                    lineMaterial.opacity = lineState.opacity;
+                },
+                onComplete: function() {
+                    scene.remove(line);
+                    lineGeometry.dispose();
+                    lineMaterial.dispose();
+                    governanceLightLines = governanceLightLines.filter(l => l !== line);
+                }
+            });
+        }
+
+        function triggerRiskAlert() {
+            // Find Risk floor (index 0, red, y: -10)
+            const riskFloorIndex = 0;
+            if (!floorAnimations[riskFloorIndex]) return;
+
+            // Flash sequence
+            gsap.to(floorAnimations[riskFloorIndex], {
+                currentIntensity: 3.0,
+                duration: 0.5,
+                ease: 'power2.out',
+                onUpdate: function() {
+                    floors[riskFloorIndex].material.emissiveIntensity = floorAnimations[riskFloorIndex].currentIntensity;
+                }
+            });
+
+            gsap.to(floorAnimations[riskFloorIndex], {
+                currentIntensity: 0.15,
+                duration: 1.5,
+                delay: 0.5,
+                ease: 'expo.out',
+                onUpdate: function() {
+                    floors[riskFloorIndex].material.emissiveIntensity = floorAnimations[riskFloorIndex].currentIntensity;
+                }
+            });
+        }
+
         // Animation loop
         function animate() {
             requestAnimationFrame(animate);
 
-            // Pulsing light effect on floors
+            // Base pulsing light effect on idle floors (not animating)
             floors.forEach((floor, i) => {
-                const pulse = Math.sin(Date.now() * 0.003 + i * 0.5) * 0.15 + 0.2;
-                floor.material.emissiveIntensity = pulse;
+                if (!floorAnimations[i] || floorAnimations[i].currentIntensity === floorAnimations[i].baseIntensity) {
+                    const pulse = Math.sin(Date.now() * 0.003 + i * 0.5) * 0.15 + 0.2;
+                    floor.material.emissiveIntensity = pulse;
+                }
             });
 
             renderer.render(scene, camera);
@@ -1631,6 +1759,7 @@
             });
 
             // Risk alerts
+            const previousAlertCount = riskAlerts.length;
             riskAlerts = [];
             if (leverageRatio > 2.0) {
                 riskAlerts.push({ severity: 'critical', message: 'Leverage exceeds 2.0x' });
@@ -1640,6 +1769,12 @@
             }
             if (maxPosition > 30) {
                 riskAlerts.push({ severity: 'warning', message: 'Concentration risk: Single position > 30%' });
+            }
+
+            // ANIMATION: Trigger risk alert flash if new alerts
+            const hasCriticalAlert = riskAlerts.some(a => a.severity === 'critical');
+            if (hasCriticalAlert && previousAlertCount === 0) {
+                triggerRiskAlert();
             }
 
             // Update DOM
@@ -1862,11 +1997,18 @@
                 if (trade.symbol && trade.side && trade.qty) {
                     addExecutedTrade(trade.pod_id || 'unknown', trade.symbol, trade.side, trade.qty, trade.fill_price || 0);
                 }
+
+                // ANIMATION: Trigger execution floor pulse
+                triggerTradePulse();
+
             } else if (message.type === 'governance') {
                 // Expected format: { agent: 'CEO'|'CIO'|'CRO', decision: '...', reasoning: '...', weights?: {...} }
                 const gov = message.data;
                 if (gov.agent && gov.decision) {
                     recordGovernanceDecision(gov.agent, gov.decision, gov.reasoning || '', gov.weights || null);
+
+                    // ANIMATION: Trigger governance light flow
+                    triggerGovernanceLightFlow(gov.agent);
                 }
             }
         }
