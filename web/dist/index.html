@@ -1,2019 +1,1173 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Agentic HF Mission Control</title>
-
-    <!-- Three.js library -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
-    <!-- Lenis (smooth scroll) -->
-    <script src="https://cdn.jsdelivr.net/gh/darkroomengineering/lenis@latest/bundled/lenis.js"></script>
-
-    <!-- GSAP -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/ScrollTrigger.min.js"></script>
-
-    <!-- Chart.js -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        html, body {
-            width: 100%;
-            height: 100%;
-            overflow: hidden;
-        }
-
-        body {
-            background: #0b0f14;
-            color: #e0e7ff;
-            font-family: 'JetBrains Mono', 'Courier Prime', monospace;
-            font-size: 12px;
-            line-height: 1.5;
-            -webkit-font-smoothing: antialiased;
-        }
-
-        .app {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            height: 100vh;
-            gap: 1px;
-            background: #1a1f2e;
-        }
-
-        /* LEFT PANEL: 3D Building */
-        .viewport-container {
-            position: relative;
-            background: #0b0f14;
-            overflow: hidden;
-        }
-
-        #viewport {
-            width: 100%;
-            height: 100%;
-            display: block;
-        }
-
-        .viewport-label {
-            position: absolute;
-            top: 16px;
-            left: 16px;
-            font-size: 11px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            font-weight: 600;
-            z-index: 10;
-        }
-
-        .scroll-hint {
-            position: absolute;
-            bottom: 16px;
-            left: 16px;
-            font-size: 10px;
-            color: #6b7280;
-            z-index: 10;
-            animation: pulse 2s infinite;
-        }
-
-        @keyframes pulse {
-            0%, 100% { opacity: 0.5; }
-            50% { opacity: 1; }
-        }
-
-        /* RIGHT PANEL: Data */
-        .data-container {
-            display: flex;
-            flex-direction: column;
-            background: #0f1419;
-            overflow: hidden;
-            border-left: 1px solid #1a1f2e;
-        }
-
-        .data-header {
-            padding: 16px;
-            border-bottom: 1px solid #1a1f2e;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-
-        .data-header h1 {
-            font-size: 13px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .connection-status {
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .status-indicator {
-            width: 6px;
-            height: 6px;
-            border-radius: 50%;
-            background: #ff4757;
-            animation: disconnected 0.5s infinite;
-        }
-
-        .status-indicator.connected {
-            background: #00d9ff;
-            animation: pulse-dot 1s infinite;
-        }
-
-        @keyframes pulse-dot {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
-        }
-
-        @keyframes disconnected {
-            0%, 100% { opacity: 0.5; }
-            50% { opacity: 1; }
-        }
-
-        .data-content {
-            flex: 1;
-            overflow-y: auto;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .info-section {
-            border-bottom: 1px solid #1a1f2e;
-            padding: 16px;
-        }
-
-        .info-section-title {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            margin-bottom: 12px;
-            font-weight: 600;
-        }
-
-        .info-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-        }
-
-        .info-card {
-            background: #1a1f2e;
-            padding: 10px;
-            border: 1px solid #2d3748;
-            border-radius: 3px;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .info-label {
-            font-size: 9px;
-            color: #6b7280;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
-        }
-
-        .info-value {
-            font-size: 13px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .info-value.positive {
-            color: #10b981;
-        }
-
-        .info-value.negative {
-            color: #ef4444;
-        }
-
-        /* Pod Table */
-        .pods-table-container {
-            flex: 1;
-            overflow: hidden;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .pods-table-header {
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-            background: #0f1419;
-        }
-
-        .pods-table-header-title {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        thead {
-            position: sticky;
-            top: 0;
-            background: #1a1f2e;
-        }
-
-        th {
-            padding: 8px 12px;
-            text-align: right;
-            border-bottom: 1px solid #2d3748;
-            color: #6b7280;
-            font-weight: 500;
-            font-size: 9px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        th:first-child {
-            text-align: left;
-        }
-
-        td {
-            padding: 8px 12px;
-            border-bottom: 1px solid #1a1f2e;
-            text-align: right;
-        }
-
-        td:first-child {
-            text-align: left;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        tbody tr {
-            transition: background 200ms;
-        }
-
-        tbody tr:hover {
-            background: #1a1f2e;
-        }
-
-        .pod-status {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 2px;
-            font-size: 8px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .pod-status.active {
-            background: rgba(16, 185, 129, 0.15);
-            color: #10b981;
-        }
-
-        .pod-status.risk {
-            background: rgba(239, 68, 68, 0.15);
-            color: #ef4444;
-        }
-
-        .value-positive {
-            color: #10b981;
-        }
-
-        .value-negative {
-            color: #ef4444;
-        }
-
-        .value-neutral {
-            color: #9ca3af;
-        }
-
-        /* Scrollbar */
-        ::-webkit-scrollbar {
-            width: 6px;
-        }
-
-        ::-webkit-scrollbar-track {
-            background: #0f1419;
-        }
-
-        ::-webkit-scrollbar-thumb {
-            background: #2d3748;
-            border-radius: 3px;
-        }
-
-        ::-webkit-scrollbar-thumb:hover {
-            background: #4b5563;
-        }
-
-        .empty-state {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            height: 100%;
-            flex-direction: column;
-            gap: 8px;
-            color: #6b7280;
-            text-align: center;
-            padding: 32px;
-        }
-
-        .empty-state-text {
-            font-size: 11px;
-        }
-
-        .empty-state-hint {
-            font-size: 9px;
-            color: #4b5563;
-        }
-
-        /* TAB INTERFACE */
-        .data-tabs {
-            display: flex;
-            border-bottom: 1px solid #1a1f2e;
-            background: #0f1419;
-            gap: 0;
-        }
-
-        .data-tab {
-            flex: 1;
-            padding: 12px 16px;
-            border: none;
-            background: transparent;
-            color: #6b7280;
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            font-family: 'JetBrains Mono', monospace;
-            cursor: pointer;
-            border-bottom: 2px solid transparent;
-            transition: color 150ms;
-        }
-
-        .data-tab.active {
-            color: #00d9ff;
-            border-bottom-color: #00d9ff;
-        }
-
-        .data-tab:hover:not(.active) {
-            color: #9ca3af;
-        }
-
-        /* TAB CONTENT VISIBILITY */
-        .tab-content {
-            display: none;
-        }
-
-        .tab-content.active {
-            display: flex;
-            flex-direction: column;
-        }
-
-        /* NAV CHART CONTAINER */
-        .chart-container {
-            position: relative;
-            height: 200px;
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-        }
-
-        #navChart {
-            max-height: 180px;
-        }
-
-        /* METRICS GRID FOR PERFORMANCE TAB */
-        .perf-metrics-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 8px;
-            padding: 16px;
-            border-bottom: 1px solid #1a1f2e;
-        }
-
-        .perf-metric-card {
-            background: #1a1f2e;
-            padding: 10px;
-            border: 1px solid #2d3748;
-            border-radius: 3px;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .perf-metric-label {
-            font-size: 8px;
-            color: #6b7280;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
-        }
-
-        .perf-metric-value {
-            font-size: 12px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .perf-metric-value.positive {
-            color: #10b981;
-        }
-
-        .perf-metric-value.negative {
-            color: #ef4444;
-        }
-
-        /* COMPARISON TABLE */
-        .perf-table-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .perf-table-header {
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-            background: #0f1419;
-        }
-
-        .perf-table-header-title {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .perf-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .perf-table thead {
-            position: sticky;
-            top: 0;
-            background: #1a1f2e;
-        }
-
-        .perf-table th {
-            padding: 8px 12px;
-            text-align: right;
-            border-bottom: 1px solid #2d3748;
-            color: #6b7280;
-            font-weight: 500;
-            font-size: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .perf-table th:first-child {
-            text-align: left;
-        }
-
-        .perf-table td {
-            padding: 8px 12px;
-            border-bottom: 1px solid #1a1f2e;
-            text-align: right;
-            font-size: 11px;
-        }
-
-        .perf-table td:first-child {
-            text-align: left;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .perf-table tbody tr {
-            transition: background 200ms;
-        }
-
-        .perf-table tbody tr:hover {
-            background: #1a1f2e;
-        }
-
-        /* RISK HUB */
-        .risk-alert-banner {
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-            background: #0f1419;
-            min-height: 40px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
-        }
-
-        .risk-alert-badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 2px;
-            font-size: 9px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            white-space: nowrap;
-        }
-
-        .risk-alert-badge.critical {
-            background: rgba(239, 68, 68, 0.2);
-            color: #ef4444;
-            border: 1px solid #ef4444;
-            animation: alert-pulse 1s infinite;
-        }
-
-        .risk-alert-badge.warning {
-            background: rgba(243, 156, 18, 0.2);
-            color: #f39c12;
-            border: 1px solid #f39c12;
-        }
-
-        .risk-alert-badge.info {
-            background: rgba(59, 152, 211, 0.2);
-            color: #3498db;
-            border: 1px solid #3498db;
-        }
-
-        @keyframes alert-pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.6; }
-        }
-
-        .risk-metrics-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr;
-            gap: 8px;
-            padding: 16px;
-            border-bottom: 1px solid #1a1f2e;
-        }
-
-        .risk-metric-card {
-            background: #1a1f2e;
-            padding: 10px;
-            border: 1px solid #2d3748;
-            border-radius: 3px;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .risk-metric-card.critical {
-            border-color: #ef4444;
-            background: rgba(239, 68, 68, 0.05);
-        }
-
-        .risk-metric-card.warning {
-            border-color: #f39c12;
-            background: rgba(243, 156, 18, 0.05);
-        }
-
-        .risk-metric-label {
-            font-size: 8px;
-            color: #6b7280;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            margin-bottom: 4px;
-        }
-
-        .risk-metric-value {
-            font-size: 12px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .risk-metric-value.critical {
-            color: #ef4444;
-        }
-
-        .risk-metric-value.warning {
-            color: #f39c12;
-        }
-
-        .risk-metric-value.healthy {
-            color: #10b981;
-        }
-
-        /* EXECUTION HUB */
-        .exec-trades-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 0;
-            display: flex;
-            flex-direction: column;
-        }
-
-        .exec-trades-header {
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-            background: #0f1419;
-        }
-
-        .exec-trades-header-title {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .exec-trades-table {
-            width: 100%;
-            border-collapse: collapse;
-        }
-
-        .exec-trades-table thead {
-            position: sticky;
-            top: 0;
-            background: #1a1f2e;
-        }
-
-        .exec-trades-table th {
-            padding: 8px 10px;
-            text-align: right;
-            border-bottom: 1px solid #2d3748;
-            color: #6b7280;
-            font-weight: 500;
-            font-size: 8px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .exec-trades-table th:first-child {
-            text-align: left;
-        }
-
-        .exec-trades-table td {
-            padding: 6px 10px;
-            border-bottom: 1px solid #1a1f2e;
-            text-align: right;
-            font-size: 10px;
-        }
-
-        .exec-trades-table td:first-child {
-            text-align: left;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .trade-status {
-            display: inline-block;
-            padding: 2px 6px;
-            border-radius: 2px;
-            font-size: 7px;
-            font-weight: 600;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-        }
-
-        .trade-status.filled {
-            background: rgba(16, 185, 129, 0.15);
-            color: #10b981;
-        }
-
-        .trade-status.pending {
-            background: rgba(243, 156, 18, 0.15);
-            color: #f39c12;
-        }
-
-        .trade-status.failed {
-            background: rgba(239, 68, 68, 0.15);
-            color: #ef4444;
-        }
-
-        .exec-trades-table tbody tr {
-            transition: background 200ms;
-        }
-
-        .exec-trades-table tbody tr:hover {
-            background: #1a1f2e;
-        }
-
-        /* GOVERNANCE HUB */
-        .gov-decision-card {
-            background: #1a1f2e;
-            padding: 12px 16px;
-            border: 1px solid #2d3748;
-            border-radius: 3px;
-            margin-bottom: 12px;
-        }
-
-        .gov-decision-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 8px;
-        }
-
-        .gov-decision-agent {
-            font-size: 10px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        .gov-decision-time {
-            font-size: 8px;
-            color: #6b7280;
-        }
-
-        .gov-decision-content {
-            font-size: 9px;
-            color: #e0e7ff;
-            line-height: 1.4;
-        }
-
-        .gov-allocation-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr 1fr 1fr 1fr;
-            gap: 8px;
-            padding: 12px 16px;
-            border-bottom: 1px solid #1a1f2e;
-        }
-
-        .gov-allocation-pod {
-            background: #1a1f2e;
-            padding: 8px;
-            border: 1px solid #2d3748;
-            border-radius: 3px;
-            text-align: center;
-        }
-
-        .gov-pod-name {
-            font-size: 8px;
-            color: #6b7280;
-            text-transform: uppercase;
-            margin-bottom: 4px;
-        }
-
-        .gov-pod-weight {
-            font-size: 12px;
-            color: #00d9ff;
-            font-weight: 600;
-        }
-
-        /* GOVERNANCE TRANSCRIPT */
-        .gov-transcript-container {
-            flex: 1;
-            overflow-y: auto;
-            padding: 16px;
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-
-        .gov-message {
-            background: #1a1f2e;
-            padding: 10px 12px;
-            border-left: 3px solid #00d9ff;
-            border-radius: 2px;
-        }
-
-        .gov-message.ceo {
-            border-left-color: #ef4444;
-        }
-
-        .gov-message.cio {
-            border-left-color: #2ecc71;
-        }
-
-        .gov-message.cro {
-            border-left-color: #f39c12;
-        }
-
-        .gov-message-sender {
-            font-size: 9px;
-            text-transform: uppercase;
-            letter-spacing: 0.5px;
-            color: #6b7280;
-            margin-bottom: 4px;
-        }
-
-        .gov-message-text {
-            font-size: 9px;
-            color: #e0e7ff;
-            line-height: 1.4;
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Agentic HF — Mission Control</title>
+
+  <!-- Typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+
+  <!-- Three.js r128 -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <!-- GSAP -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
+  <!-- Chart.js -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
+
+  <style>
+    /* ============================================================
+       DESIGN TOKENS
+    ============================================================ */
+    :root {
+      --bg-void:      #070b0e;
+      --bg-base:      #0c1118;
+      --bg-surface:   #101820;
+      --bg-elevated:  #18232f;
+      --border-dim:   #1c2c3c;
+      --border-base:  #253547;
+      --text-primary: #d8e8f0;
+      --text-muted:   #6a90aa;
+      --text-dim:     #3a556a;
+      --cyan:         #00cfe8;
+      --cyan-glow:    rgba(0,207,232,0.10);
+      --amber:        #f0a030;
+      --red:          #e84040;
+      --green:        #00c888;
+      --purple:       #7c5cfc;
+      --font-ui:      'Plus Jakarta Sans', system-ui, sans-serif;
+      --font-mono:    'IBM Plex Mono', 'Courier New', monospace;
+    }
+
+    /* ============================================================
+       RESET
+    ============================================================ */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg-void); color: var(--text-primary); font-family: var(--font-ui); }
+    button { font-family: inherit; cursor: pointer; }
+
+    /* ============================================================
+       APP SHELL
+    ============================================================ */
+    .app {
+      display: grid;
+      grid-template-rows: 36px 1fr;
+      grid-template-columns: 62% 38%;
+      height: 100vh;
+      width: 100vw;
+    }
+
+    /* ============================================================
+       STATUS BAR
+    ============================================================ */
+    .status-bar {
+      grid-column: 1 / 3;
+      grid-row: 1;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 16px;
+      background: var(--bg-void);
+      border-bottom: 1px solid var(--border-dim);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      letter-spacing: 0.06em;
+      user-select: none;
+      flex-shrink: 0;
+    }
+    .sb-brand {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.22em;
+      color: var(--text-primary);
+      padding-right: 14px;
+      margin-right: 6px;
+      border-right: 1px solid var(--border-dim);
+    }
+    .sb-pill {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 9px;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-dim);
+      border-radius: 2px;
+    }
+    .sb-dot {
+      width: 5px; height: 5px;
+      border-radius: 50%;
+      background: var(--text-dim);
+    }
+    .sb-dot.on {
+      background: var(--green);
+      box-shadow: 0 0 7px rgba(0,200,136,0.55);
+      animation: blink 2.4s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
+    .sb-label { color: var(--text-muted); }
+    .sb-label.on { color: var(--green); }
+    .sb-spacer { flex: 1; }
+    .sb-clock { color: var(--text-dim); font-size: 10px; }
+
+    /* ============================================================
+       LEFT PANEL — 3D VIEWPORT
+    ============================================================ */
+    .left-panel {
+      grid-column: 1;
+      grid-row: 2;
+      position: relative;
+      background: var(--bg-void);
+      border-right: 1px solid var(--border-dim);
+      overflow: hidden;
+    }
+    #viewport { display: block; width: 100%; height: 100%; }
+
+    /* Floor label strip (bottom-left overlay) */
+    .floor-strip {
+      position: absolute;
+      left: 18px;
+      bottom: 20px;
+      display: flex;
+      flex-direction: column-reverse;
+      gap: 5px;
+      pointer-events: none;
+    }
+    .fl-item {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      letter-spacing: 0.14em;
+      color: var(--text-dim);
+    }
+    .fl-dot { width: 4px; height: 4px; border-radius: 50%; }
+
+    /* ============================================================
+       RIGHT PANEL — MISSION CONTROL
+    ============================================================ */
+    .right-panel {
+      grid-column: 2;
+      grid-row: 2;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-base);
+      overflow: hidden;
+    }
+
+    /* Tab bar */
+    .tab-bar {
+      display: flex;
+      align-items: stretch;
+      background: var(--bg-void);
+      border-bottom: 1px solid var(--border-dim);
+      flex-shrink: 0;
+    }
+    .tab-btn {
+      padding: 0 14px;
+      height: 38px;
+      font-family: var(--font-ui);
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      background: none;
+      border: none;
+      border-bottom: 2px solid transparent;
+      transition: color 0.18s, border-color 0.18s;
+      white-space: nowrap;
+    }
+    .tab-btn:hover { color: var(--text-muted); }
+    .tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+
+    /* Tab pane */
+    .tab-pane {
+      display: none;
+      flex-direction: column;
+      flex: 1;
+      overflow-y: auto;
+      padding: 14px;
+      gap: 12px;
+    }
+    .tab-pane.active { display: flex; }
+    .tab-pane::-webkit-scrollbar { width: 3px; }
+    .tab-pane::-webkit-scrollbar-track { background: transparent; }
+    .tab-pane::-webkit-scrollbar-thumb { background: var(--border-base); border-radius: 2px; }
+
+    /* ============================================================
+       KPI TILES
+    ============================================================ */
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+      gap: 7px;
+    }
+    .kpi {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-dim);
+      border-radius: 3px;
+      padding: 10px 11px;
+    }
+    .kpi-lbl {
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      margin-bottom: 5px;
+    }
+    .kpi-val {
+      font-family: var(--font-mono);
+      font-size: 19px;
+      font-weight: 400;
+      color: var(--text-primary);
+      line-height: 1;
+    }
+    .kpi-sub {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-muted);
+      margin-top: 3px;
+    }
+    .pos { color: var(--green) !important; }
+    .neg { color: var(--red) !important; }
+    .neu { color: var(--text-muted) !important; }
+
+    /* ============================================================
+       SECTION HEADER
+    ============================================================ */
+    .sec-hdr {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border-dim);
+      margin-bottom: 1px;
+    }
+    .sec-title {
+      font-size: 9px;
+      font-weight: 700;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+    }
+    .sec-badge { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); }
+
+    /* ============================================================
+       DATA TABLES
+    ============================================================ */
+    .tbl-wrap {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-dim);
+      border-radius: 3px;
+      overflow: hidden;
+    }
+    .dtbl { width: 100%; border-collapse: collapse; }
+    .dtbl thead th {
+      padding: 7px 10px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      background: var(--bg-elevated);
+      border-bottom: 1px solid var(--border-dim);
+      text-align: left;
+      white-space: nowrap;
+    }
+    .dtbl thead th.r { text-align: right; }
+    .dtbl tbody td {
+      padding: 8px 10px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-primary);
+      border-bottom: 1px solid var(--border-dim);
+    }
+    .dtbl tbody td.r { text-align: right; }
+    .dtbl tbody tr:last-child td { border-bottom: none; }
+    .dtbl tbody tr:hover td { background: var(--bg-elevated); }
+    .pod-name { font-weight: 600; letter-spacing: 0.06em; }
+
+    /* Badges */
+    .badge {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 2px;
+      font-family: var(--font-mono);
+      font-size: 9px;
+      font-weight: 500;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+    }
+    .b-active  { background:rgba(0,200,136,.1);   color:var(--green);      border:1px solid rgba(0,200,136,.25); }
+    .b-halted  { background:rgba(232,64,64,.1);    color:var(--red);        border:1px solid rgba(232,64,64,.25); }
+    .b-idle    { background:rgba(106,144,170,.08); color:var(--text-muted); border:1px solid var(--border-dim); }
+    .b-buy     { background:rgba(0,200,136,.1);   color:var(--green);      border:1px solid rgba(0,200,136,.25); }
+    .b-sell    { background:rgba(232,64,64,.1);    color:var(--red);        border:1px solid rgba(232,64,64,.25); }
+    .b-filled  { background:rgba(0,207,232,.1);    color:var(--cyan);       border:1px solid rgba(0,207,232,.2); }
+    .b-pending { background:rgba(240,160,48,.1);   color:var(--amber);      border:1px solid rgba(240,160,48,.2); }
+    .b-ceo     { background:rgba(232,64,64,.08);   color:var(--red);        border:1px solid rgba(232,64,64,.2); }
+    .b-cio     { background:rgba(0,200,136,.08);   color:var(--green);      border:1px solid rgba(0,200,136,.2); }
+    .b-cro     { background:rgba(240,160,48,.08);  color:var(--amber);      border:1px solid rgba(240,160,48,.2); }
+
+    /* Empty state */
+    .empty { padding: 28px 16px; text-align: center; }
+    .empty-txt  { font-family:var(--font-mono); font-size:11px; color:var(--text-dim); }
+    .empty-hint { font-size:10px; color:var(--text-dim); margin-top:4px; opacity:.6; }
+
+    /* ============================================================
+       CHART WRAPPER
+    ============================================================ */
+    .chart-wrap {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-dim);
+      border-radius: 3px;
+      padding: 12px;
+      height: 175px;
+      position: relative;
+    }
+
+    /* ============================================================
+       RISK ALERT BANNER
+    ============================================================ */
+    .risk-banner { display:none; padding:8px 12px; border-radius:3px; font-size:10px; font-weight:500; margin-bottom:2px; }
+    .risk-banner.critical { display:block; background:rgba(232,64,64,.1);  border:1px solid rgba(232,64,64,.3);  color:var(--red); }
+    .risk-banner.warning  { display:block; background:rgba(240,160,48,.1); border:1px solid rgba(240,160,48,.3); color:var(--amber); }
+    .risk-banner.info     { display:block; background:rgba(0,207,232,.07); border:1px solid rgba(0,207,232,.2);  color:var(--cyan); }
+
+    /* ============================================================
+       GOVERNANCE
+    ============================================================ */
+    .gov-list { display:flex; flex-direction:column; gap:6px; }
+    .gov-card { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:3px; padding:10px 12px; }
+    .gov-card-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:5px; }
+    .gov-card-body { font-size:11px; color:var(--text-muted); line-height:1.5; }
+    .gov-card-sub  { font-size:10px; color:var(--text-dim); margin-top:4px; }
+    .gov-time { font-family:var(--font-mono); font-size:9px; color:var(--text-dim); }
+
+    /* ============================================================
+       ALLOCATION GRID
+    ============================================================ */
+    .alloc-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+    .alloc-tile { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:3px; padding:8px 6px; text-align:center; }
+    .alloc-pod  { font-size:9px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); }
+    .alloc-val  { font-family:var(--font-mono); font-size:14px; color:var(--text-primary); margin-top:3px; }
+  </style>
 </head>
 <body>
-    <div class="app">
-        <!-- LEFT: 3D Viewport -->
-        <div class="viewport-container">
-            <canvas id="viewport"></canvas>
-            <div class="viewport-label">📡 Operational HQ</div>
-            <div class="scroll-hint">Scroll to explore ↓</div>
+<div class="app">
+
+  <!-- STATUS BAR -->
+  <header class="status-bar">
+    <span class="sb-brand">AGENTIC HF</span>
+    <div class="sb-pill">
+      <div class="sb-dot" id="conn-dot"></div>
+      <span class="sb-label" id="conn-label">DISCONNECTED</span>
+    </div>
+    <div class="sb-pill">
+      <span class="sb-label">ITER</span>
+      <span id="iter-ctr" style="color:var(--text-primary);font-family:var(--font-mono)">—</span>
+    </div>
+    <span class="sb-spacer"></span>
+    <span class="sb-clock" id="clock">—</span>
+  </header>
+
+  <!-- LEFT PANEL — 3D HQ TOWER -->
+  <div class="left-panel" id="left-panel">
+    <canvas id="viewport"></canvas>
+    <div class="floor-strip" id="floor-strip"></div>
+  </div>
+
+  <!-- RIGHT PANEL — MISSION CONTROL -->
+  <div class="right-panel">
+
+    <nav class="tab-bar">
+      <button class="tab-btn active" data-tab="operations">Operations</button>
+      <button class="tab-btn" data-tab="performance">Performance</button>
+      <button class="tab-btn" data-tab="risk">Risk</button>
+      <button class="tab-btn" data-tab="execution">Execution</button>
+      <button class="tab-btn" data-tab="governance">Governance</button>
+    </nav>
+
+    <!-- OPERATIONS -->
+    <div class="tab-pane active" id="tab-operations">
+      <div class="kpi-row">
+        <div class="kpi">
+          <div class="kpi-lbl">Firm NAV</div>
+          <div class="kpi-val" id="kpi-nav">—</div>
+          <div class="kpi-sub" id="kpi-pnl">—</div>
         </div>
-
-        <!-- RIGHT: Data Dashboard -->
-        <div class="data-container">
-            <div class="data-header">
-                <h1>⚡ Mission Control</h1>
-                <div class="connection-status">
-                    <span id="status-text">DISCONNECTED</span>
-                    <div class="status-indicator" id="status-indicator"></div>
-                </div>
-            </div>
-
-            <!-- TAB BAR -->
-            <div class="data-tabs">
-                <button class="data-tab active" data-tab="operations">Operations</button>
-                <button class="data-tab" data-tab="performance">Performance</button>
-                <button class="data-tab" data-tab="risk">Risk</button>
-                <button class="data-tab" data-tab="execution">Execution</button>
-                <button class="data-tab" data-tab="governance">Governance</button>
-            </div>
-
-            <div class="data-content">
-                <!-- OPERATIONS TAB -->
-                <div id="operations" class="tab-content active">
-                    <!-- Session Info -->
-                    <div class="info-section">
-                    <div class="info-section-title">Session Overview</div>
-                    <div class="info-grid">
-                        <div class="info-card">
-                            <div class="info-label">Iteration</div>
-                            <div class="info-value" id="iteration">—</div>
-                        </div>
-                        <div class="info-card">
-                            <div class="info-label">Firm NAV</div>
-                            <div class="info-value" id="firm-nav">—</div>
-                        </div>
-                        <div class="info-card">
-                            <div class="info-label">Daily P&L</div>
-                            <div class="info-value" id="firm-pnl">—</div>
-                        </div>
-                        <div class="info-card">
-                            <div class="info-label">Trades</div>
-                            <div class="info-value" id="trade-count">0</div>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- Pods Table -->
-                <div class="pods-table-container">
-                    <div class="pods-table-header">
-                        <div class="pods-table-header-title">📊 Pod Performance</div>
-                    </div>
-                    <div style="flex: 1; overflow-y: auto;">
-                        <table>
-                            <thead>
-                                <tr>
-                                    <th>Pod</th>
-                                    <th>NAV</th>
-                                    <th>Daily P&L</th>
-                                    <th>Status</th>
-                                </tr>
-                            </thead>
-                            <tbody id="pods-table">
-                                <tr>
-                                    <td colspan="4" class="empty-state">
-                                        <div class="empty-state-text">Awaiting data...</div>
-                                        <div class="empty-state-hint">Start a trading session to see live metrics</div>
-                                    </td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-                </div>
-
-                <!-- PERFORMANCE TAB -->
-                <div id="performance" class="tab-content">
-                    <!-- NAV Chart -->
-                    <div class="chart-container">
-                        <canvas id="navChart"></canvas>
-                    </div>
-
-                    <!-- Performance Metrics -->
-                    <div class="perf-metrics-grid">
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Daily Return %</div>
-                            <div class="perf-metric-value" id="perf-return">—</div>
-                        </div>
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Volatility</div>
-                            <div class="perf-metric-value" id="perf-volatility">—</div>
-                        </div>
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Sharpe Ratio</div>
-                            <div class="perf-metric-value" id="perf-sharpe">—</div>
-                        </div>
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Max Drawdown</div>
-                            <div class="perf-metric-value" id="perf-drawdown">—</div>
-                        </div>
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Active Positions</div>
-                            <div class="perf-metric-value" id="perf-active">0</div>
-                        </div>
-                        <div class="perf-metric-card">
-                            <div class="perf-metric-label">Win Rate</div>
-                            <div class="perf-metric-value" id="perf-winrate">—</div>
-                        </div>
-                    </div>
-
-                    <!-- Pod Comparison Table -->
-                    <div class="perf-table-container">
-                        <div class="perf-table-header">
-                            <div class="perf-table-header-title">📊 Pod Comparison</div>
-                        </div>
-                        <div style="flex: 1; overflow-y: auto;">
-                            <table class="perf-table">
-                                <thead>
-                                    <tr>
-                                        <th>Pod</th>
-                                        <th>Return %</th>
-                                        <th>Volatility</th>
-                                        <th>Sharpe</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="perf-pods-table">
-                                    <tr>
-                                        <td colspan="4" class="empty-state">
-                                            <div class="empty-state-text">Awaiting data...</div>
-                                        </td>
-                                    </tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- RISK HUB TAB -->
-                <div id="risk" class="tab-content">
-                    <div class="risk-alert-banner" id="risk-alert-banner">
-                        <span style="color: #00d9ff; font-size: 10px;">✓ All systems nominal</span>
-                    </div>
-
-                    <div class="risk-metrics-grid">
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Value at Risk (95%)</div>
-                            <div class="risk-metric-value" id="risk-var">—</div>
-                        </div>
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Leverage Ratio</div>
-                            <div class="risk-metric-value" id="risk-leverage">—</div>
-                        </div>
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Max Drawdown</div>
-                            <div class="risk-metric-value" id="risk-maxdd">—</div>
-                        </div>
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Concentration (Top)</div>
-                            <div class="risk-metric-value" id="risk-concentration">—</div>
-                        </div>
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Sector Exposure</div>
-                            <div class="risk-metric-value" id="risk-sector">—</div>
-                        </div>
-                        <div class="risk-metric-card">
-                            <div class="risk-metric-label">Cash Position</div>
-                            <div class="risk-metric-value" id="risk-cash">—</div>
-                        </div>
-                    </div>
-
-                    <div style="flex: 1; overflow-y: auto; padding: 0; display: flex; flex-direction: column;">
-                        <div style="padding: 12px 16px; border-bottom: 1px solid #1a1f2e; background: #0f1419;">
-                            <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #00d9ff; font-weight: 600;">Pod Risk Breakdown</div>
-                        </div>
-                        <table style="width: 100%; border-collapse: collapse;">
-                            <thead style="position: sticky; top: 0; background: #1a1f2e;">
-                                <tr>
-                                    <th style="padding: 8px 12px; text-align: left; border-bottom: 1px solid #2d3748; color: #6b7280; font-weight: 500; font-size: 8px; text-transform: uppercase;">Pod</th>
-                                    <th style="padding: 8px 12px; text-align: right; border-bottom: 1px solid #2d3748; color: #6b7280; font-weight: 500; font-size: 8px; text-transform: uppercase;">Risk %</th>
-                                    <th style="padding: 8px 12px; text-align: right; border-bottom: 1px solid #2d3748; color: #6b7280; font-weight: 500; font-size: 8px; text-transform: uppercase;">Leverage</th>
-                                    <th style="padding: 8px 12px; text-align: right; border-bottom: 1px solid #2d3748; color: #6b7280; font-weight: 500; font-size: 8px; text-transform: uppercase;">Status</th>
-                                </tr>
-                            </thead>
-                            <tbody id="risk-pods-table">
-                                <tr><td colspan="4" class="empty-state"><div class="empty-state-text">Awaiting data...</div></td></tr>
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-
-                <!-- EXECUTION HUB TAB -->
-                <div id="execution" class="tab-content">
-                    <div class="exec-trades-container">
-                        <div class="exec-trades-header">
-                            <div class="exec-trades-header-title">📊 Live Trades</div>
-                        </div>
-                        <div style="flex: 1; overflow-y: auto;">
-                            <table class="exec-trades-table">
-                                <thead>
-                                    <tr>
-                                        <th>Symbol</th>
-                                        <th>Side</th>
-                                        <th>Qty</th>
-                                        <th>Price</th>
-                                        <th>Status</th>
-                                        <th>Time</th>
-                                    </tr>
-                                </thead>
-                                <tbody id="exec-trades-table">
-                                    <tr><td colspan="6" class="empty-state"><div class="empty-state-text">No trades yet</div></td></tr>
-                                </tbody>
-                            </table>
-                        </div>
-                    </div>
-                </div>
-
-                <!-- GOVERNANCE HUB TAB -->
-                <div id="governance" class="tab-content">
-                    <div style="padding: 12px 16px; border-bottom: 1px solid #1a1f2e;">
-                        <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #00d9ff; font-weight: 600; margin-bottom: 12px;">Current Allocations</div>
-                        <div class="gov-allocation-grid" id="gov-allocation-grid">
-                            <!-- Populated by JS -->
-                        </div>
-                    </div>
-
-                    <div style="flex: 1; overflow-y: auto; display: flex; flex-direction: column;">
-                        <div style="padding: 12px 16px; border-bottom: 1px solid #1a1f2e; background: #0f1419;">
-                            <div style="font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: #00d9ff; font-weight: 600;">Recent Governance</div>
-                        </div>
-                        <div class="gov-transcript-container" id="gov-transcript">
-                            <div style="color: #6b7280; font-size: 9px;">Awaiting governance decisions...</div>
-                        </div>
-                    </div>
-                </div>
-            </div>
+        <div class="kpi">
+          <div class="kpi-lbl">Active Pods</div>
+          <div class="kpi-val" id="kpi-active">—</div>
+          <div class="kpi-sub">of 5</div>
         </div>
+        <div class="kpi">
+          <div class="kpi-lbl">Positions</div>
+          <div class="kpi-val" id="kpi-pos">—</div>
+          <div class="kpi-sub">open</div>
+        </div>
+      </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Pod Performance</span>
+          <span class="sec-badge" id="pod-badge">0 pods</span>
+        </div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th>
+              <th class="r">NAV</th>
+              <th class="r">Daily P&amp;L</th>
+              <th class="r">Status</th>
+            </tr></thead>
+            <tbody id="pods-table"><tr><td colspan="4" class="empty">
+              <div class="empty-txt">Awaiting data…</div>
+              <div class="empty-hint">Start a trading session to see live metrics</div>
+            </td></tr></tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
-    <script>
-        // ============================================
-        // THREE.JS SETUP
-        // ============================================
-
-        const canvas = document.getElementById('viewport');
-        const scene = new THREE.Scene();
-        const camera = new THREE.PerspectiveCamera(75, canvas.clientWidth / canvas.clientHeight, 0.1, 1000);
-        const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
-
-        renderer.setSize(canvas.clientWidth, canvas.clientHeight);
-        renderer.setClearColor(0x0b0f14, 1);
-        renderer.shadowMap.enabled = true;
-        renderer.shadowMap.type = THREE.PCFShadowShadowMap;
-
-        camera.position.set(0, 5, 20);
-        camera.lookAt(0, 0, 0);
-
-        // Lighting
-        const ambientLight = new THREE.AmbientLight(0xffffff, 0.4);
-        scene.add(ambientLight);
-
-        const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-        directionalLight.position.set(10, 15, 10);
-        directionalLight.castShadow = true;
-        directionalLight.shadow.mapSize.width = 2048;
-        directionalLight.shadow.mapSize.height = 2048;
-        scene.add(directionalLight);
-
-        // 6 Operational Floors
-        const floorData = [
-            { name: 'Risk', y: -10, color: 0xff4757 },
-            { name: 'Execution', y: -5, color: 0x00d9ff },
-            { name: 'Research', y: 0, color: 0x2ecc71 },
-            { name: 'AI Systems', y: 5, color: 0x9b59b6 },
-            { name: 'Treasury', y: 10, color: 0xf39c12 },
-            { name: 'Governance', y: 15, color: 0x3498db }
-        ];
-
-        const floors = [];
-
-        floorData.forEach((data, index) => {
-            const floorGeometry = new THREE.BoxGeometry(12, 3, 12);
-            const floorMaterial = new THREE.MeshStandardMaterial({
-                color: data.color,
-                emissive: data.color,
-                emissiveIntensity: 0.15,
-                metalness: 0.3,
-                roughness: 0.5
-            });
-            const floor = new THREE.Mesh(floorGeometry, floorMaterial);
-            floor.position.y = data.y;
-            floor.castShadow = true;
-            floor.receiveShadow = true;
-            floor.userData = { name: data.name, index };
-
-            scene.add(floor);
-            floors.push(floor);
-
-            // Add light above each floor
-            const pointLight = new THREE.PointLight(data.color, 0.4);
-            pointLight.position.set(0, data.y + 2, 6);
-            scene.add(pointLight);
-        });
-
-        // Building exterior
-        const buildingGeometry = new THREE.BoxGeometry(13, 33, 13);
-        const buildingMaterial = new THREE.MeshStandardMaterial({
-            color: 0x1a1f2e,
-            metalness: 0.4,
-            roughness: 0.6,
-            transparent: true,
-            opacity: 0.15
-        });
-        const building = new THREE.Mesh(buildingGeometry, buildingMaterial);
-        building.castShadow = true;
-        scene.add(building);
-
-        // Floor animation state
-        const floorAnimations = {};
-        floorData.forEach((data, index) => {
-            floorAnimations[index] = { baseIntensity: 0.15, currentIntensity: 0.15 };
-        });
-
-        // Light flow lines for governance animations
-        let governanceLightLines = [];
-
-        function triggerTradePulse() {
-            // Find Execution floor (index 1, cyan, y: -5)
-            const executionFloorIndex = 1;
-            if (!floorAnimations[executionFloorIndex]) return;
-
-            // Use GSAP to animate floor emissive intensity
-            gsap.to(floorAnimations[executionFloorIndex], {
-                currentIntensity: 2.0,
-                duration: 0.3,
-                ease: 'power2.out',
-                onUpdate: function() {
-                    floors[executionFloorIndex].material.emissiveIntensity = floorAnimations[executionFloorIndex].currentIntensity;
-                }
-            });
-
-            gsap.to(floorAnimations[executionFloorIndex], {
-                currentIntensity: 0.3,
-                duration: 1.2,
-                delay: 0.3,
-                ease: 'expo.out',
-                onUpdate: function() {
-                    floors[executionFloorIndex].material.emissiveIntensity = floorAnimations[executionFloorIndex].currentIntensity;
-                },
-                onComplete: function() {
-                    floorAnimations[executionFloorIndex].currentIntensity = 0.15;
-                    floors[executionFloorIndex].material.emissiveIntensity = 0.15;
-                }
-            });
-        }
-
-        function triggerGovernanceLightFlow(agentName) {
-            // Map agent to floor index and color
-            const agentMap = {
-                'CEO': { floorIndex: 0, color: 0xff4757 },      // Risk floor, red
-                'CIO': { floorIndex: 2, color: 0x2ecc71 },       // Research floor, green
-                'CRO': { floorIndex: 5, color: 0xf39c12 }        // Governance floor, orange
-            };
-
-            const agent = agentMap[agentName];
-            if (!agent) return;
-
-            // Create line from agent floor to AI Systems hub (index 3, y: 5)
-            const agentFloorY = floorData[agent.floorIndex].y;
-            const hubFloorY = 5;  // AI Systems floor
-
-            const lineGeometry = new THREE.BufferGeometry();
-            const positions = new Float32Array([
-                0, agentFloorY, 0,     // Start at agent floor center
-                0, hubFloorY, 0        // End at hub floor center
-            ]);
-            lineGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-
-            const lineMaterial = new THREE.LineBasicMaterial({
-                color: agent.color,
-                linewidth: 2,
-                opacity: 0,
-                transparent: true
-            });
-
-            const line = new THREE.Line(lineGeometry, lineMaterial);
-            scene.add(line);
-            governanceLightLines.push(line);
-
-            // Animate line opacity
-            const lineState = { opacity: 0 };
-            gsap.to(lineState, {
-                opacity: 1,
-                duration: 0.3,
-                ease: 'power2.out',
-                onUpdate: function() {
-                    lineMaterial.opacity = lineState.opacity;
-                }
-            });
-
-            gsap.to(lineState, {
-                opacity: 0,
-                duration: 1.7,
-                delay: 0.3,
-                ease: 'expo.in',
-                onUpdate: function() {
-                    lineMaterial.opacity = lineState.opacity;
-                },
-                onComplete: function() {
-                    scene.remove(line);
-                    lineGeometry.dispose();
-                    lineMaterial.dispose();
-                    governanceLightLines = governanceLightLines.filter(l => l !== line);
-                }
-            });
-        }
-
-        function triggerRiskAlert() {
-            // Find Risk floor (index 0, red, y: -10)
-            const riskFloorIndex = 0;
-            if (!floorAnimations[riskFloorIndex]) return;
-
-            // Flash sequence
-            gsap.to(floorAnimations[riskFloorIndex], {
-                currentIntensity: 3.0,
-                duration: 0.5,
-                ease: 'power2.out',
-                onUpdate: function() {
-                    floors[riskFloorIndex].material.emissiveIntensity = floorAnimations[riskFloorIndex].currentIntensity;
-                }
-            });
-
-            gsap.to(floorAnimations[riskFloorIndex], {
-                currentIntensity: 0.15,
-                duration: 1.5,
-                delay: 0.5,
-                ease: 'expo.out',
-                onUpdate: function() {
-                    floors[riskFloorIndex].material.emissiveIntensity = floorAnimations[riskFloorIndex].currentIntensity;
-                }
-            });
-        }
-
-        // Animation loop
-        function animate() {
-            requestAnimationFrame(animate);
-
-            // Base pulsing light effect on idle floors (not animating)
-            floors.forEach((floor, i) => {
-                if (!floorAnimations[i] || floorAnimations[i].currentIntensity === floorAnimations[i].baseIntensity) {
-                    const pulse = Math.sin(Date.now() * 0.003 + i * 0.5) * 0.15 + 0.2;
-                    floor.material.emissiveIntensity = pulse;
-                }
-            });
-
-            renderer.render(scene, camera);
-        }
-        animate();
-
-        // Handle window resize
-        window.addEventListener('resize', () => {
-            const width = canvas.clientWidth;
-            const height = canvas.clientHeight;
-            camera.aspect = width / height;
-            camera.updateProjectionMatrix();
-            renderer.setSize(width, height);
-        });
-
-        // ============================================
-        // LENIS SMOOTH SCROLL + GSAP
-        // ============================================
-
-        gsap.registerPlugin(ScrollTrigger);
-
-        const lenis = new Lenis({
-            duration: 1.2,
-            easing: (t) => Math.min(1, 1.001 - Math.pow(2, -10 * t))
-        });
-
-        function raf(time) {
-            lenis.raf(time);
-            requestAnimationFrame(raf);
-        }
-        requestAnimationFrame(raf);
-
-        // Scroll-driven camera movement through building
-        floorData.forEach((data, index) => {
-            gsap.to(camera.position, {
-                scrollTrigger: {
-                    trigger: `#floor-${index}`,
-                    start: 'top center',
-                    end: 'center center',
-                    scrub: 1,
-                    markers: false
-                },
-                y: data.y,
-                z: 25 - index * 1.5,
-                duration: 1
-            });
-        });
-
-        // ============================================
-        // WEBSOCKET & DATA BINDING
-        // ============================================
-
-        const WS_URL = `ws://${window.location.host}/ws`;
-        let ws = null;
-        let pods = {};
-        let trades = [];
-
-        function connectWebSocket() {
-            try {
-                ws = new WebSocket(WS_URL);
-
-                ws.onopen = () => {
-                    console.log('✓ Connected to WebSocket');
-                    updateStatusDot(true);
-                };
-
-                ws.onmessage = (event) => {
-                    try {
-                        const message = JSON.parse(event.data);
-                        handleMessage(message);
-                    } catch (e) {
-                        console.error('Failed to parse message:', e);
-                    }
-                };
-
-                ws.onerror = (error) => {
-                    console.error('WebSocket error:', error);
-                    updateStatusDot(false);
-                };
-
-                ws.onclose = () => {
-                    console.log('✗ WebSocket disconnected');
-                    updateStatusDot(false);
-                    setTimeout(connectWebSocket, 3000);
-                };
-            } catch (e) {
-                console.error('Failed to connect WebSocket:', e);
-                updateStatusDot(false);
-                setTimeout(connectWebSocket, 3000);
-            }
-        }
-
-        function updateStatusDot(connected) {
-            const indicator = document.getElementById('status-indicator');
-            const text = document.getElementById('status-text');
-            if (connected) {
-                indicator.classList.add('connected');
-                text.textContent = 'CONNECTED';
-            } else {
-                indicator.classList.remove('connected');
-                text.textContent = 'DISCONNECTED';
-            }
-        }
-
-        function updatePodsTable() {
-            const tbody = document.getElementById('pods-table');
-            const podIds = Object.keys(pods).sort();
-
-            if (podIds.length === 0) {
-                tbody.innerHTML = `
-                    <tr>
-                        <td colspan="4" class="empty-state">
-                            <div class="empty-state-text">Awaiting data...</div>
-                            <div class="empty-state-hint">Start a trading session to see live metrics</div>
-                        </td>
-                    </tr>
-                `;
-                return;
-            }
-
-            tbody.innerHTML = podIds.map(pod_id => {
-                const data = pods[pod_id];
-                const nav = data.nav || 0;
-                const daily_pnl = data.daily_pnl || 0;
-                const status = data.status || 'UNKNOWN';
-
-                const pnlClass = daily_pnl > 0 ? 'value-positive' : daily_pnl < 0 ? 'value-negative' : 'value-neutral';
-                const statusClass = status === 'ACTIVE' ? 'pod-status active' : 'pod-status risk';
-
-                return `
-                    <tr>
-                        <td>${pod_id}</td>
-                        <td class="value-neutral">$${nav.toFixed(2)}</td>
-                        <td class="${pnlClass}">${daily_pnl >= 0 ? '+' : ''}$${daily_pnl.toFixed(2)}</td>
-                        <td><span class="${statusClass}">${status}</span></td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        function updateFirmMetrics() {
-            const navs = Object.values(pods).map(p => p.nav || 0);
-            const firmNav = navs.reduce((a, b) => a + b, 0);
-
-            const pnls = Object.values(pods).map(p => p.daily_pnl || 0);
-            const firmPnl = pnls.reduce((a, b) => a + b, 0);
-
-            // Count active positions
-            let activePositions = 0;
-            Object.values(pods).forEach(p => {
-                if (p.current_positions && Array.isArray(p.current_positions)) {
-                    activePositions += p.current_positions.length;
-                }
-            });
-
-            document.getElementById('firm-nav').textContent = `$${firmNav.toFixed(2)}`;
-            document.getElementById('firm-pnl').className = `info-value ${firmPnl >= 0 ? 'positive' : 'negative'}`;
-            document.getElementById('firm-pnl').textContent = `${firmPnl >= 0 ? '+' : ''}$${firmPnl.toFixed(2)}`;
-            document.getElementById('trade-count').textContent = trades.length.toString();
-            document.getElementById('perf-active').textContent = activePositions.toString();
-            document.getElementById('iteration').textContent = Object.values(pods).length > 0 ? 'Running' : '—';
-        }
-
-        // ============================================
-        // TAB SWITCHING
-        // ============================================
-
-        const tabButtons = document.querySelectorAll('.data-tab');
-        const tabContents = document.querySelectorAll('.tab-content');
-
-        tabButtons.forEach(button => {
-            button.addEventListener('click', () => {
-                const tabName = button.getAttribute('data-tab');
-
-                // Remove active class from all
-                tabButtons.forEach(b => b.classList.remove('active'));
-                tabContents.forEach(c => c.classList.remove('active'));
-
-                // Add active class to clicked tab
-                button.classList.add('active');
-                document.getElementById(tabName).classList.add('active');
-
-                // Trigger chart redraw if switching to performance
-                if (tabName === 'performance' && navChart) {
-                    setTimeout(() => navChart.resize(), 100);
-                }
-            });
-        });
-
-        // ============================================
-        // NAV HISTORY & PERFORMANCE METRICS
-        // ============================================
-
-        let navHistory = [];  // Array of { timestamp, firmNav, pods: { pod_id: nav } }
-        let navChart = null;
-        const MAX_HISTORY = 100;  // Keep last 100 data points
-
-        function recordNavHistory() {
-            const navs = Object.values(pods).map(p => p.nav || 0);
-            const firmNav = navs.reduce((a, b) => a + b, 0);
-
-            const podsSnapshot = {};
-            Object.keys(pods).forEach(pid => {
-                podsSnapshot[pid] = pods[pid].nav || 0;
-            });
-
-            navHistory.push({
-                timestamp: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }),
-                firmNav,
-                pods: podsSnapshot
-            });
-
-            if (navHistory.length > MAX_HISTORY) {
-                navHistory.shift();
-            }
-
-            updateNavChart();
-        }
-
-        function updateNavChart() {
-            if (!navHistory.length) return;
-
-            const labels = navHistory.map(h => h.timestamp);
-            const firmLine = navHistory.map(h => h.firmNav);
-
-            // Get all unique pod IDs
-            const podIds = Object.keys(pods).sort();
-            const podDatasets = podIds.map((pid, idx) => {
-                const colors = ['#00d9ff', '#2ecc71', '#9b59b6', '#f39c12', '#3498db'];
-                const data = navHistory.map(h => h.pods[pid] || 0);
-                return {
-                    label: pid.toUpperCase(),
-                    data,
-                    borderColor: colors[idx % colors.length],
-                    backgroundColor: 'transparent',
-                    borderWidth: 1.5,
-                    pointRadius: 0,
-                    tension: 0.3,
-                    fill: false
-                };
-            });
-
-            const firmDataset = {
-                label: 'FIRM NAV',
-                data: firmLine,
-                borderColor: '#ffffff',
-                backgroundColor: 'transparent',
-                borderWidth: 2.5,
-                pointRadius: 0,
-                tension: 0.3,
-                fill: false
-            };
-
-            const ctx = document.getElementById('navChart');
-            if (!ctx) return;
-
-            // Destroy existing chart if it exists
-            if (navChart) {
-                navChart.destroy();
-            }
-
-            navChart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels,
-                    datasets: [firmDataset, ...podDatasets]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: false,
-                    interaction: {
-                        mode: 'index',
-                        intersect: false
-                    },
-                    plugins: {
-                        legend: {
-                            display: true,
-                            position: 'top',
-                            labels: {
-                                color: '#9ca3af',
-                                font: { size: 10, family: "'JetBrains Mono', monospace" },
-                                padding: 12,
-                                usePointStyle: true,
-                                pointStyle: 'line'
-                            }
-                        },
-                        tooltip: {
-                            backgroundColor: '#1a1f2e',
-                            titleColor: '#00d9ff',
-                            bodyColor: '#e0e7ff',
-                            borderColor: '#2d3748',
-                            borderWidth: 1,
-                            padding: 8,
-                            titleFont: { size: 10, family: "'JetBrains Mono', monospace" },
-                            bodyFont: { size: 10, family: "'JetBrains Mono', monospace" },
-                            displayColors: true
-                        }
-                    },
-                    scales: {
-                        x: {
-                            display: true,
-                            grid: {
-                                color: '#1a1f2e',
-                                drawBorder: false
-                            },
-                            ticks: {
-                                color: '#6b7280',
-                                font: { size: 8, family: "'JetBrains Mono', monospace" },
-                                maxTicksLimit: 6
-                            }
-                        },
-                        y: {
-                            display: true,
-                            grid: {
-                                color: '#1a1f2e',
-                                drawBorder: false
-                            },
-                            ticks: {
-                                color: '#6b7280',
-                                font: { size: 8, family: "'JetBrains Mono', monospace" },
-                                callback: (value) => '$' + value.toFixed(0)
-                            }
-                        }
-                    }
-                }
-            });
-        }
-
-        // Calculate performance metrics
-        function calculateMetrics() {
-            if (navHistory.length < 2) {
-                document.getElementById('perf-return').textContent = '—';
-                document.getElementById('perf-volatility').textContent = '—';
-                document.getElementById('perf-sharpe').textContent = '—';
-                document.getElementById('perf-drawdown').textContent = '—';
-                document.getElementById('perf-winrate').textContent = '—';
-                return;
-            }
-
-            // Daily return %
-            const firstNav = navHistory[0].firmNav;
-            const lastNav = navHistory[navHistory.length - 1].firmNav;
-            const returnPct = ((lastNav - firstNav) / firstNav) * 100;
-
-            // Returns array
-            const returns = [];
-            for (let i = 1; i < navHistory.length; i++) {
-                const prev = navHistory[i - 1].firmNav;
-                const curr = navHistory[i].firmNav;
-                if (prev > 0) {
-                    returns.push((curr - prev) / prev);
-                }
-            }
-
-            // Volatility (std dev of returns)
-            const avgReturn = returns.length > 0 ? returns.reduce((a, b) => a + b) / returns.length : 0;
-            const variance = returns.length > 0 ? returns.reduce((a, b) => a + Math.pow(b - avgReturn, 2)) / returns.length : 0;
-            const volatility = Math.sqrt(variance) * 100;
-
-            // Sharpe Ratio (assuming 0% risk-free rate)
-            const sharpe = volatility > 0 ? (avgReturn * 100) / volatility : 0;
-
-            // Max Drawdown
-            let maxDrawdown = 0;
-            let peak = navHistory[0].firmNav;
-            for (let i = 1; i < navHistory.length; i++) {
-                const current = navHistory[i].firmNav;
-                if (current > peak) peak = current;
-                const drawdown = ((peak - current) / peak) * 100;
-                if (drawdown > maxDrawdown) maxDrawdown = drawdown;
-            }
-
-            // Win rate (days with positive returns)
-            const winDays = returns.filter(r => r > 0).length;
-            const winRate = returns.length > 0 ? (winDays / returns.length) * 100 : 0;
-
-            // Update DOM
-            const returnEl = document.getElementById('perf-return');
-            returnEl.className = 'perf-metric-value ' + (returnPct >= 0 ? 'positive' : 'negative');
-            returnEl.textContent = (returnPct >= 0 ? '+' : '') + returnPct.toFixed(2) + '%';
-
-            document.getElementById('perf-volatility').textContent = volatility.toFixed(2) + '%';
-            document.getElementById('perf-sharpe').textContent = sharpe.toFixed(2);
-
-            const drawdownEl = document.getElementById('perf-drawdown');
-            drawdownEl.className = 'perf-metric-value ' + (maxDrawdown > 10 ? 'negative' : 'positive');
-            drawdownEl.textContent = '-' + maxDrawdown.toFixed(2) + '%';
-
-            document.getElementById('perf-winrate').textContent = winRate.toFixed(0) + '%';
-        }
-
-        function updatePerfPodsTable() {
-            const tbody = document.getElementById('perf-pods-table');
-            const podIds = Object.keys(pods).sort();
-
-            if (podIds.length === 0) {
-                tbody.innerHTML = `
-                    <tr>
-                        <td colspan="4" class="empty-state">
-                            <div class="empty-state-text">Awaiting data...</div>
-                        </td>
-                    </tr>
-                `;
-                return;
-            }
-
-            tbody.innerHTML = podIds.map(pod_id => {
-                const podHistory = navHistory.map(h => h.pods[pod_id] || 0);
-                const firstNav = podHistory.length > 0 ? podHistory[0] : 0;
-                const lastNav = podHistory.length > 0 ? podHistory[podHistory.length - 1] : 0;
-
-                // Return %
-                const returnPct = firstNav > 0 ? ((lastNav - firstNav) / firstNav) * 100 : 0;
-
-                // Volatility
-                const podReturns = [];
-                for (let i = 1; i < podHistory.length; i++) {
-                    const prev = podHistory[i - 1];
-                    const curr = podHistory[i];
-                    if (prev > 0) {
-                        podReturns.push((curr - prev) / prev);
-                    }
-                }
-                const avgReturn = podReturns.length > 0 ? podReturns.reduce((a, b) => a + b) / podReturns.length : 0;
-                const variance = podReturns.length > 0 ? podReturns.reduce((a, b) => a + Math.pow(b - avgReturn, 2)) / podReturns.length : 0;
-                const volatility = Math.sqrt(variance) * 100;
-
-                // Sharpe
-                const sharpe = volatility > 0 ? (avgReturn * 100) / volatility : 0;
-
-                const returnClass = returnPct >= 0 ? 'value-positive' : 'value-negative';
-
-                return `
-                    <tr>
-                        <td>${pod_id.toUpperCase()}</td>
-                        <td class="${returnClass}">${returnPct >= 0 ? '+' : ''}${returnPct.toFixed(2)}%</td>
-                        <td>${volatility.toFixed(2)}%</td>
-                        <td>${sharpe.toFixed(2)}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // ============================================
-        // RISK HUB
-        // ============================================
-
-        let riskAlerts = [];  // Array of { severity, message, timestamp }
-
-        function calculateRiskMetrics() {
-            if (Object.keys(pods).length === 0) return;
-
-            // Calculate risk metrics
-            const navs = Object.values(pods).map(p => p.nav || 0);
-            const firmNav = navs.reduce((a, b) => a + b, 0);
-
-            // VaR (simplified: 2% of firm NAV as estimate)
-            const var95 = firmNav * 0.02;
-
-            // Leverage (simplified: assume each pod has 1.5x leverage)
-            const totalExposure = Object.values(pods).reduce((sum, p) => {
-                const positions = p.current_positions || [];
-                const exposure = positions.reduce((s, pos) => s + (pos.current_price * pos.qty), 0);
-                return sum + exposure;
-            }, 0);
-            const leverageRatio = firmNav > 0 ? (totalExposure / firmNav) : 0;
-
-            // Max Drawdown (from history)
-            let maxDD = 0;
-            if (navHistory.length > 1) {
-                let peak = navHistory[0].firmNav;
-                for (let i = 1; i < navHistory.length; i++) {
-                    if (navHistory[i].firmNav > peak) peak = navHistory[i].firmNav;
-                    const dd = ((peak - navHistory[i].firmNav) / peak) * 100;
-                    if (dd > maxDD) maxDD = dd;
-                }
-            }
-
-            // Concentration (largest position as % of NAV)
-            let maxPosition = 0;
-            Object.values(pods).forEach(p => {
-                const positions = p.current_positions || [];
-                positions.forEach(pos => {
-                    const posValue = (pos.current_price * pos.qty);
-                    const posPercent = (posValue / firmNav) * 100;
-                    if (posPercent > maxPosition) maxPosition = posPercent;
-                });
-            });
-
-            // Risk alerts
-            const previousAlertCount = riskAlerts.length;
-            riskAlerts = [];
-            if (leverageRatio > 2.0) {
-                riskAlerts.push({ severity: 'critical', message: 'Leverage exceeds 2.0x' });
-            }
-            if (maxDD > 15) {
-                riskAlerts.push({ severity: 'warning', message: 'Drawdown approaching 15% threshold' });
-            }
-            if (maxPosition > 30) {
-                riskAlerts.push({ severity: 'warning', message: 'Concentration risk: Single position > 30%' });
-            }
-
-            // ANIMATION: Trigger risk alert flash if new alerts
-            const hasCriticalAlert = riskAlerts.some(a => a.severity === 'critical');
-            if (hasCriticalAlert && previousAlertCount === 0) {
-                triggerRiskAlert();
-            }
-
-            // Update DOM
-            document.getElementById('risk-var').textContent = '$' + var95.toFixed(2);
-
-            const leverageEl = document.getElementById('risk-leverage');
-            leverageEl.className = 'risk-metric-value ' + (leverageRatio > 2 ? 'critical' : leverageRatio > 1.5 ? 'warning' : 'healthy');
-            leverageEl.textContent = leverageRatio.toFixed(2) + 'x';
-
-            const maxddEl = document.getElementById('risk-maxdd');
-            maxddEl.className = 'risk-metric-value ' + (maxDD > 15 ? 'warning' : 'healthy');
-            maxddEl.textContent = '-' + maxDD.toFixed(2) + '%';
-
-            const concEl = document.getElementById('risk-concentration');
-            concEl.className = 'risk-metric-value ' + (maxPosition > 30 ? 'critical' : maxPosition > 20 ? 'warning' : 'healthy');
-            concEl.textContent = maxPosition.toFixed(1) + '%';
-
-            document.getElementById('risk-sector').textContent = 'Mixed';
-            document.getElementById('risk-cash').textContent = '5%';
-
-            updateRiskAlertBanner();
-            updateRiskPodsTable();
-        }
-
-        function updateRiskAlertBanner() {
-            const banner = document.getElementById('risk-alert-banner');
-            if (riskAlerts.length === 0) {
-                banner.innerHTML = '<span style="color: #00d9ff; font-size: 10px;">✓ All systems nominal</span>';
-            } else {
-                const critical = riskAlerts.filter(a => a.severity === 'critical');
-                const warnings = riskAlerts.filter(a => a.severity === 'warning');
-
-                let html = '';
-                if (critical.length > 0) {
-                    html += `<span class="risk-alert-badge critical">[${critical.length}] Critical</span>`;
-                }
-                if (warnings.length > 0) {
-                    html += `<span class="risk-alert-badge warning">[${warnings.length}] Warnings</span>`;
-                }
-                banner.innerHTML = html;
-            }
-        }
-
-        function updateRiskPodsTable() {
-            const tbody = document.getElementById('risk-pods-table');
-            const podIds = Object.keys(pods).sort();
-
-            if (podIds.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="4" class="empty-state"><div class="empty-state-text">Awaiting data...</div></td></tr>';
-                return;
-            }
-
-            const firmNav = Object.values(pods).reduce((a, b) => a + (b.nav || 0), 0);
-
-            tbody.innerHTML = podIds.map(pod_id => {
-                const podNav = pods[pod_id].nav || 0;
-                const riskPercent = (podNav / firmNav) * 100;
-                const leverage = 1.5;  // Simplified
-                const status = leverage > 2 ? 'CRITICAL' : leverage > 1.5 ? 'WARNING' : 'HEALTHY';
-                const statusColor = status === 'CRITICAL' ? '#ef4444' : status === 'WARNING' ? '#f39c12' : '#10b981';
-
-                return `
-                    <tr>
-                        <td>${pod_id.toUpperCase()}</td>
-                        <td>${riskPercent.toFixed(1)}%</td>
-                        <td>${leverage.toFixed(2)}x</td>
-                        <td><span class="trade-status ${status.toLowerCase()}">${status}</span></td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // ============================================
-        // EXECUTION HUB
-        // ============================================
-
-        let executedTrades = [];  // Array of { pod_id, symbol, side, qty, price, status, timestamp }
-
-        function addExecutedTrade(pod_id, symbol, side, qty, price, status = 'FILLED') {
-            executedTrades.unshift({
-                pod_id,
-                symbol,
-                side,
-                qty,
-                price,
-                status,
-                timestamp: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' })
-            });
-
-            if (executedTrades.length > 50) {
-                executedTrades.pop();
-            }
-
-            updateExecTradesTable();
-        }
-
-        function updateExecTradesTable() {
-            const tbody = document.getElementById('exec-trades-table');
-
-            if (executedTrades.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="empty-state"><div class="empty-state-text">No trades yet</div></td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = executedTrades.map(trade => {
-                const statusClass = trade.status === 'FILLED' ? 'filled' : trade.status === 'PENDING' ? 'pending' : 'failed';
-                const sideClass = trade.side === 'BUY' ? 'value-positive' : 'value-negative';
-
-                return `
-                    <tr>
-                        <td>${trade.symbol}</td>
-                        <td class="${sideClass}">${trade.side}</td>
-                        <td>${trade.qty.toFixed(2)}</td>
-                        <td>$${trade.price.toFixed(2)}</td>
-                        <td><span class="trade-status ${statusClass}">${trade.status}</span></td>
-                        <td>${trade.timestamp}</td>
-                    </tr>
-                `;
-            }).join('');
-        }
-
-        // ============================================
-        // GOVERNANCE HUB
-        // ============================================
-
-        let governanceDecisions = [];  // Array of { agent, decision, reasoning, weights, timestamp }
-
-        function recordGovernanceDecision(agent, decision, reasoning, weights = null) {
-            governanceDecisions.unshift({
-                agent,
-                decision,
-                reasoning,
-                weights,
-                timestamp: new Date().toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' })
-            });
-
-            if (governanceDecisions.length > 10) {
-                governanceDecisions.pop();
-            }
-
-            updateGovernanceHub();
-        }
-
-        function updateGovernanceHub() {
-            updateAllocationGrid();
-            updateGovernanceTranscript();
-        }
-
-        function updateAllocationGrid() {
-            const grid = document.getElementById('gov-allocation-grid');
-            const podIds = Object.keys(pods).sort();
-
-            if (podIds.length === 0) {
-                grid.innerHTML = '<div style="grid-column: 1/-1; color: #6b7280; font-size: 9px;">No pods active</div>';
-                return;
-            }
-
-            // Get latest allocation from governance decisions
-            const latestAllocation = governanceDecisions.find(d => d.weights);
-
-            grid.innerHTML = podIds.map(pod_id => {
-                const weight = latestAllocation && latestAllocation.weights[pod_id]
-                    ? (latestAllocation.weights[pod_id] * 100).toFixed(1)
-                    : '20.0';
-
-                return `
-                    <div class="gov-allocation-pod">
-                        <div class="gov-pod-name">${pod_id.toUpperCase()}</div>
-                        <div class="gov-pod-weight">${weight}%</div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        function updateGovernanceTranscript() {
-            const transcript = document.getElementById('gov-transcript');
-
-            if (governanceDecisions.length === 0) {
-                transcript.innerHTML = '<div style="color: #6b7280; font-size: 9px;">Awaiting governance decisions...</div>';
-                return;
-            }
-
-            transcript.innerHTML = governanceDecisions.map(decision => {
-                const agentClass = decision.agent === 'CEO' ? 'ceo' : decision.agent === 'CIO' ? 'cio' : 'cro';
-                const agentColor = decision.agent === 'CEO' ? '#ef4444' : decision.agent === 'CIO' ? '#2ecc71' : '#f39c12';
-
-                return `
-                    <div class="gov-message ${agentClass}">
-                        <div class="gov-message-sender">${decision.agent} • ${decision.timestamp}</div>
-                        <div class="gov-message-text">${decision.decision}</div>
-                    </div>
-                `;
-            }).join('');
-        }
-
-        // Update risk when pods change
-        function handleMessage(message) {
-            if (message.type === 'pod_summary') {
-                const data = message.data;
-                const pod_id = message.pod_id || data.pod_id;
-                if (pod_id) {
-                    pods[pod_id] = data;
-                    updatePodsTable();
-                    updateFirmMetrics();
-
-                    // Update performance data
-                    recordNavHistory();
-                    calculateMetrics();
-                    updatePerfPodsTable();
-
-                    // Update risk
-                    calculateRiskMetrics();
-                }
-            } else if (message.type === 'trade') {
-                const trade = message.data;
-                trades.unshift(trade);
-                if (trades.length > 20) trades.pop();
-
-                // Log to execution hub
-                if (trade.symbol && trade.side && trade.qty) {
-                    addExecutedTrade(trade.pod_id || 'unknown', trade.symbol, trade.side, trade.qty, trade.fill_price || 0);
-                }
-
-                // ANIMATION: Trigger execution floor pulse
-                triggerTradePulse();
-
-            } else if (message.type === 'governance') {
-                // Expected format: { agent: 'CEO'|'CIO'|'CRO', decision: '...', reasoning: '...', weights?: {...} }
-                const gov = message.data;
-                if (gov.agent && gov.decision) {
-                    recordGovernanceDecision(gov.agent, gov.decision, gov.reasoning || '', gov.weights || null);
-
-                    // ANIMATION: Trigger governance light flow
-                    triggerGovernanceLightFlow(gov.agent);
-                }
-            }
-        }
-
-        connectWebSocket();
-    </script>
+    <!-- PERFORMANCE -->
+    <div class="tab-pane" id="tab-performance">
+      <div class="chart-wrap"><canvas id="navChart"></canvas></div>
+      <div class="kpi-row">
+        <div class="kpi"><div class="kpi-lbl">Sharpe</div><div class="kpi-val" id="m-sharpe">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Volatility</div><div class="kpi-val" id="m-vol">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Max DD</div><div class="kpi-val" id="m-dd">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Win Rate</div><div class="kpi-val" id="m-wr">—</div></div>
+      </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Pod Returns</span></div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th><th class="r">NAV</th><th class="r">Return</th><th class="r">Daily P&amp;L</th>
+            </tr></thead>
+            <tbody id="perf-table"><tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- RISK -->
+    <div class="tab-pane" id="tab-risk">
+      <div id="risk-banner" class="risk-banner"></div>
+      <div class="kpi-row">
+        <div class="kpi"><div class="kpi-lbl">VaR 95%</div><div class="kpi-val" id="kpi-var">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Leverage</div><div class="kpi-val" id="kpi-lev">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Conc.</div><div class="kpi-val" id="kpi-conc">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Alerts</div><div class="kpi-val" id="kpi-alerts">0</div></div>
+      </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Pod Risk Breakdown</span></div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th><th class="r">VaR</th><th class="r">Positions</th><th class="r">Status</th>
+            </tr></thead>
+            <tbody id="risk-table"><tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- EXECUTION -->
+    <div class="tab-pane" id="tab-execution">
+      <div class="kpi-row">
+        <div class="kpi"><div class="kpi-lbl">Total Trades</div><div class="kpi-val" id="kpi-trades">0</div></div>
+        <div class="kpi"><div class="kpi-lbl">Filled</div><div class="kpi-val" id="kpi-filled">0</div></div>
+      </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Trade Log</span></div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th><th>Symbol</th><th>Side</th>
+              <th class="r">Qty</th><th class="r">Price</th><th class="r">Status</th>
+            </tr></thead>
+            <tbody id="exec-table"><tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- GOVERNANCE -->
+    <div class="tab-pane" id="tab-governance">
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Capital Allocations</span></div>
+        <div class="alloc-grid" id="alloc-grid"></div>
+      </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Decision Log</span>
+          <span class="sec-badge" id="gov-badge">0 decisions</span>
+        </div>
+        <div class="gov-list" id="gov-list">
+          <div class="empty">
+            <div class="empty-txt">Awaiting governance cycle…</div>
+            <div class="empty-hint">Governance runs every 5 iterations</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /right-panel -->
+</div><!-- /app -->
+
+<script>
+'use strict';
+
+// ================================================================
+//  CLOCK
+// ================================================================
+function tick() {
+  document.getElementById('clock').textContent =
+    new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+}
+tick(); setInterval(tick, 1000);
+
+// ================================================================
+//  DATA GLOBALS
+// ================================================================
+const WS_URL = `ws://${window.location.host}/ws`;
+let ws = null;
+let pods                = {};
+let trades              = [];
+let navHistory          = [];
+let riskAlerts          = [];
+let executedTrades      = [];
+let governanceDecisions = [];
+let navChart            = null;
+const MAX_HISTORY       = 100;
+let iterCount           = 0;
+
+// Three.js animation state
+const floorAnimState = {};
+let govLightLines    = [];   // tubes to fade out each frame
+
+// ================================================================
+//  THREE.JS SCENE
+// ================================================================
+const canvas   = document.getElementById('viewport');
+const scene    = new THREE.Scene();
+scene.fog      = new THREE.FogExp2(0x070b0e, 0.010);
+scene.background = new THREE.Color(0x070b0e);
+
+const camera   = new THREE.PerspectiveCamera(50, 1, 0.1, 300);
+camera.position.set(0, 5, 34);
+camera.lookAt(0, 5, 0);
+
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled   = true;
+renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
+renderer.toneMapping         = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 0.82;
+
+function onResize() {
+  const lp = document.getElementById('left-panel');
+  const w = lp.clientWidth, h = lp.clientHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener('resize', onResize);
+onResize();
+
+// ================================================================
+//  LIGHTING
+// ================================================================
+scene.add(new THREE.AmbientLight(0x0a1520, 1.0));
+
+const sun = new THREE.DirectionalLight(0xd0e8ff, 0.55);
+sun.position.set(10, 24, 14);
+sun.castShadow = true;
+sun.shadow.mapSize.width = sun.shadow.mapSize.height = 1024;
+scene.add(sun);
+
+const fill = new THREE.DirectionalLight(0x002244, 0.25);
+fill.position.set(-6, -4, 18);
+scene.add(fill);
+
+// ================================================================
+//  FLOOR DEFINITIONS
+// ================================================================
+const FLOOR_H = 3.6;
+const FLOOR_W = 13;
+const FLOOR_D = 7;
+const SLAB_T  = 0.08;
+
+const FLOORS = [
+  { id:'risk',       name:'RISK',       y: -9, accent:0xe84040, hex:'#e84040', label:'VAR · LIMITS · STRESS',    screens:3 },
+  { id:'execution',  name:'EXECUTION',  y: -4, accent:0x00cfe8, hex:'#00cfe8', label:'ORDERS · FILLS · LATENCY', screens:3 },
+  { id:'research',   name:'RESEARCH',   y:  1, accent:0x00c888, hex:'#00c888', label:'SIGNALS · ALPHA · MODELS', screens:2 },
+  { id:'ai_systems', name:'AI SYSTEMS', y:  6, accent:0x7c5cfc, hex:'#7c5cfc', label:'CEO · CIO · CRO',          screens:3 },
+  { id:'treasury',   name:'TREASURY',   y: 11, accent:0xf0a030, hex:'#f0a030', label:'CAPITAL · FLOW · ALLOC',   screens:2 },
+  { id:'governance', name:'GOVERNANCE', y: 16, accent:0xd0e4f0, hex:'#d0e4f0', label:'APPROVALS · AUDIT · CTRL', screens:2 },
+];
+
+// ================================================================
+//  SHARED BASE MATERIALS
+// ================================================================
+const matSlab = new THREE.MeshStandardMaterial({ color:0x121e2a, metalness:0.88, roughness:0.18 });
+const matWall = new THREE.MeshStandardMaterial({ color:0x0d1820, metalness:0.55, roughness:0.52 });
+const matCol  = new THREE.MeshStandardMaterial({ color:0x0a1420, metalness:0.82, roughness:0.28 });
+const matDesk = new THREE.MeshStandardMaterial({ color:0x0e1a26, metalness:0.65, roughness:0.42 });
+
+// ================================================================
+//  BUILD FLOOR (cross-section dollhouse view)
+// ================================================================
+function buildFloor(fd, idx) {
+  const g = new THREE.Group();
+  g.userData = { floorIndex: idx };
+  const acc = fd.accent;
+  const screenMats = [];
+
+  // Slab
+  const slab = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W, SLAB_T, FLOOR_D + 0.4), matSlab.clone());
+  slab.receiveShadow = true;
+  g.add(slab);
+
+  // Emissive trim strip at floor level
+  const trimMat = new THREE.MeshStandardMaterial({
+    color: 0x000000, emissive: new THREE.Color(acc), emissiveIntensity: 0.32,
+  });
+  const trim = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W + 0.08, 0.045, FLOOR_D + 0.5), trimMat);
+  trim.position.y = -(SLAB_T * 0.5 + 0.015);
+  g.add(trim);
+
+  // Rear wall
+  const rear = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W, FLOOR_H, 0.1), matWall.clone());
+  rear.position.set(0, FLOOR_H * 0.5, -(FLOOR_D * 0.5));
+  rear.castShadow = rear.receiveShadow = true;
+  g.add(rear);
+
+  // Side walls
+  const sideGeo = new THREE.BoxGeometry(0.1, FLOOR_H, FLOOR_D);
+  [-FLOOR_W * 0.5, FLOOR_W * 0.5].forEach(x => {
+    const s = new THREE.Mesh(sideGeo, matWall.clone());
+    s.position.set(x, FLOOR_H * 0.5, 0);
+    g.add(s);
+  });
+
+  // Columns
+  const colGeo = new THREE.BoxGeometry(0.22, FLOOR_H, 0.22);
+  [[-FLOOR_W*0.5+0.28, -FLOOR_D*0.47],
+   [ FLOOR_W*0.5-0.28, -FLOOR_D*0.47],
+   [-FLOOR_W*0.5+0.28,  FLOOR_D*0.22],
+   [ FLOOR_W*0.5-0.28,  FLOOR_D*0.22]].forEach(([cx, cz]) => {
+    const c = new THREE.Mesh(colGeo, matCol.clone());
+    c.position.set(cx, FLOOR_H * 0.5, cz);
+    c.castShadow = true;
+    g.add(c);
+  });
+
+  // Glass front panel
+  const glassMat = new THREE.MeshStandardMaterial({
+    color: 0x1a3852, transparent: true, opacity: 0.11,
+    roughness: 0.0, metalness: 0.96, side: THREE.DoubleSide,
+  });
+  const glass = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W - 0.35, FLOOR_H - 0.08, 0.04), glassMat);
+  glass.position.set(0, FLOOR_H * 0.5, FLOOR_D * 0.5);
+  g.add(glass);
+
+  // Screens on rear wall
+  const sw = 2.15, sh = 1.22;
+  const ncols   = fd.screens;
+  const spacing = (FLOOR_W - 1.5) / ncols;
+  for (let s = 0; s < ncols; s++) {
+    const sm = new THREE.MeshStandardMaterial({
+      color: 0x010508, emissive: new THREE.Color(acc), emissiveIntensity: 0.52,
+    });
+    screenMats.push(sm);
+    const screen = new THREE.Mesh(new THREE.BoxGeometry(sw, sh, 0.03), sm);
+    const sx = -FLOOR_W * 0.5 + 0.75 + spacing * (s + 0.5);
+    screen.position.set(sx, FLOOR_H * 0.65, -(FLOOR_D * 0.5) + 0.12);
+    g.add(screen);
+    // Screen border frame
+    const frameMat = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(acc), emissive: new THREE.Color(acc), emissiveIntensity: 0.12,
+    });
+    const fr = new THREE.Mesh(new THREE.BoxGeometry(sw + 0.09, sh + 0.07, 0.02), frameMat);
+    fr.position.copy(screen.position);
+    fr.position.z -= 0.01;
+    g.add(fr);
+  }
+
+  // Desk strip
+  const desk = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W * 0.72, 0.07, 1.6), matDesk.clone());
+  desk.position.set(0, 0.88, -0.4);
+  desk.castShadow = true;
+  g.add(desk);
+
+  // Terminal monitors on desk
+  const termGeo = new THREE.BoxGeometry(0.38, 0.28, 0.22);
+  const termMat = new THREE.MeshStandardMaterial({
+    color: 0x060d13, emissive: new THREE.Color(acc), emissiveIntensity: 0.18,
+  });
+  [-2.8, -1.2, 1.2, 2.8].slice(0, Math.min(ncols + 1, 4)).forEach(tx => {
+    const t = new THREE.Mesh(termGeo, termMat.clone());
+    t.position.set(tx, 1.05, -0.4);
+    g.add(t);
+  });
+
+  // Per-floor point light
+  const pt = new THREE.PointLight(acc, 1.3, 8.5, 2.0);
+  pt.position.set(0, FLOOR_H * 0.65, 0);
+  g.add(pt);
+
+  // Store for animation
+  floorAnimState[idx] = {
+    screens:         screenMats,
+    trimMat:         trimMat,
+    pointLight:      pt,
+    baseEmissive:    0.52,
+    baseTrimEmissive:0.32,
+    baseLightInt:    1.3,
+  };
+
+  g.position.y = fd.y + SLAB_T * 0.5;
+  return g;
+}
+
+// Build all 6 floors
+FLOORS.forEach((fd, i) => scene.add(buildFloor(fd, i)));
+
+// ================================================================
+//  BUILDING EXTERIOR WIREFRAME
+// ================================================================
+const extGeo   = new THREE.BoxGeometry(FLOOR_W + 0.55, 30.5, FLOOR_D + 0.55);
+const extEdges = new THREE.EdgesGeometry(extGeo);
+const extFrame = new THREE.LineSegments(
+  extEdges,
+  new THREE.LineBasicMaterial({ color:0x1a3550, transparent:true, opacity:0.32 })
+);
+extFrame.position.set(0, 5, 0);
+scene.add(extFrame);
+
+// ================================================================
+//  FLOOR LABELS (HTML OVERLAY)
+// ================================================================
+const strip = document.getElementById('floor-strip');
+FLOORS.forEach(fd => {
+  const el = document.createElement('div');
+  el.className = 'fl-item';
+  el.innerHTML = `<div class="fl-dot" style="background:${fd.hex};opacity:.5"></div><span>${fd.name}</span>`;
+  strip.appendChild(el);
+});
+
+// ================================================================
+//  ANIMATION LOOP
+// ================================================================
+const clock = new THREE.Clock();
+
+function animate() {
+  requestAnimationFrame(animate);
+  const t = clock.getElapsedTime();
+
+  // Idle camera micro-drift
+  camera.position.x = Math.sin(t * 0.11) * 0.38;
+  camera.position.y = 5 + Math.sin(t * 0.07) * 0.18;
+  camera.lookAt(camera.position.x * 0.25, 5, 0);
+
+  // Fade and dispose governance light tubes
+  govLightLines = govLightLines.filter(obj => {
+    obj.material.opacity -= 0.007;
+    if (obj.material.opacity <= 0) {
+      scene.remove(obj);
+      obj.geometry.dispose();
+      obj.material.dispose();
+      return false;
+    }
+    return true;
+  });
+
+  renderer.render(scene, camera);
+}
+animate();
+
+// ================================================================
+//  FLASH ANIMATION HELPERS
+// ================================================================
+function flashFloor(idx, peak, dur) {
+  const st = floorAnimState[idx];
+  if (!st) return;
+  gsap.killTweensOf(st);
+  gsap.to(st, {
+    baseEmissive: peak, duration: 0.18, ease: 'power3.out',
+    onUpdate: () => {
+      st.screens.forEach(m => { m.emissiveIntensity = st.baseEmissive; });
+      st.pointLight.intensity = st.baseLightInt * (st.baseEmissive / 0.52);
+    },
+    onComplete: () => {
+      gsap.to(st, {
+        baseEmissive: 0.52, duration: dur, ease: 'expo.out',
+        onUpdate: () => {
+          st.screens.forEach(m => { m.emissiveIntensity = st.baseEmissive; });
+          st.pointLight.intensity = st.baseLightInt * (st.baseEmissive / 0.52);
+        },
+      });
+    },
+  });
+}
+
+function triggerTradePulse()  { flashFloor(1, 2.8, 1.2); }
+function triggerRiskAlert()   { flashFloor(0, 3.8, 1.8); }
+
+function triggerGovernanceLightFlow(agentName) {
+  const agentMap = { CEO:5, CIO:3, CRO:4 };
+  const fi = (agentMap[agentName] !== undefined) ? agentMap[agentName] : 3;
+  flashFloor(fi, 2.2, 1.4);
+
+  const srcY = FLOORS[5].y + FLOOR_H;
+  const dstY = FLOORS[3].y + FLOOR_H * 0.5;
+  const mid  = (srcY + dstY) * 0.5;
+
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-0.8, srcY, 0.5),
+    new THREE.Vector3( 0,   mid,  2.5),
+    new THREE.Vector3( 0.8, dstY, 0.5),
+  ]);
+  const tubeGeo = new THREE.TubeGeometry(curve, 24, 0.045, 5, false);
+  const tubeMat = new THREE.MeshBasicMaterial({
+    color: FLOORS[fi].accent, transparent: true, opacity: 0.72, depthWrite: false,
+  });
+  const tube = new THREE.Mesh(tubeGeo, tubeMat);
+  scene.add(tube);
+  govLightLines.push(tube);
+}
+
+// ================================================================
+//  TAB SWITCHING
+// ================================================================
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+// ================================================================
+//  WEBSOCKET
+// ================================================================
+function setConn(on) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  dot.classList.toggle('on', on);
+  lbl.classList.toggle('on', on);
+  lbl.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen    = () => setConn(true);
+  ws.onclose   = () => { setConn(false); setTimeout(connect, 3000); };
+  ws.onerror   = () => ws.close();
+  ws.onmessage = ev => { try { handleMessage(JSON.parse(ev.data)); } catch(e) { console.error(e); } };
+}
+connect();
+
+// ================================================================
+//  MESSAGE HANDLER
+// ================================================================
+function handleMessage(msg) {
+  if (msg.type === 'pod_summary') {
+    const data   = msg.data;
+    const pod_id = msg.pod_id || data.pod_id;
+    if (pod_id) {
+      pods[pod_id] = data;
+      iterCount++;
+      document.getElementById('iter-ctr').textContent = iterCount;
+      updatePodsTable();
+      updateFirmMetrics();
+      recordNavHistory();
+      calculateMetrics();
+      updatePerfTable();
+      calculateRisk();
+    }
+  } else if (msg.type === 'trade') {
+    const t = msg.data;
+    trades.unshift(t);
+    if (trades.length > 20) trades.pop();
+    if (t.symbol && t.side && t.qty)
+      addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
+    triggerTradePulse();
+  } else if (msg.type === 'governance') {
+    const gv = msg.data;
+    if (gv.agent && gv.decision) {
+      recordGov(gv.agent, gv.decision, gv.reasoning || '', gv.weights || null);
+      triggerGovernanceLightFlow(gv.agent);
+    }
+  }
+}
+
+// ================================================================
+//  OPERATIONS
+// ================================================================
+function updatePodsTable() {
+  const ids = Object.keys(pods).sort();
+  document.getElementById('pod-badge').textContent = ids.length + ' pod' + (ids.length !== 1 ? 's' : '');
+  const tbody = document.getElementById('pods-table');
+  if (ids.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div><div class="empty-hint">Start a trading session to see live metrics</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = ids.map(id => {
+    const d   = pods[id];
+    const nav = d.nav || 0;
+    const pnl = d.daily_pnl || 0;
+    const st  = (d.status || 'UNKNOWN').toUpperCase();
+    const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
+    const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">$${nav.toFixed(2)}</td>
+      <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r"><span class="badge ${sc}">${st}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function updateFirmMetrics() {
+  const ids = Object.keys(pods);
+  const nav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
+  const pnl = ids.reduce((s,id) => s + (pods[id].daily_pnl || 0), 0);
+  const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
+  const pos = ids.reduce((s,id) => {
+    const p = pods[id].current_positions;
+    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
+  }, 0);
+
+  document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
+  document.getElementById('kpi-active').textContent = act > 0 ? act : '—';
+  document.getElementById('kpi-pos').textContent    = pos > 0 ? pos : '—';
+
+  const pnlEl = document.getElementById('kpi-pnl');
+  if (nav > 0) {
+    pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} today`;
+    pnlEl.className   = 'kpi-sub ' + (pnl >= 0 ? 'pos' : 'neg');
+  } else {
+    pnlEl.textContent = '—';
+    pnlEl.className   = 'kpi-sub';
+  }
+}
+
+// ================================================================
+//  PERFORMANCE
+// ================================================================
+function recordNavHistory() {
+  const ids = Object.keys(pods);
+  if (ids.length === 0) return;
+  const firmNav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
+  const podNavs = {};
+  ids.forEach(id => { podNavs[id] = pods[id].nav || 0; });
+  navHistory.push({ t: new Date().toLocaleTimeString(), firmNav, pods: podNavs });
+  if (navHistory.length > MAX_HISTORY) navHistory.shift();
+  updateNavChart();
+}
+
+function updateNavChart() {
+  const ctx    = document.getElementById('navChart').getContext('2d');
+  const labels = navHistory.map(h => h.t);
+  const ids    = Object.keys(pods).sort();
+  const COLORS = ['#00cfe8','#00c888','#7c5cfc','#f0a030','#3498db'];
+
+  const datasets = [
+    { label:'FIRM', data: navHistory.map(h => h.firmNav),
+      borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
+      borderWidth:2, pointRadius:0, tension:0.3, fill:false },
+    ...ids.map((id, i) => ({
+      label: id.toUpperCase(), data: navHistory.map(h => h.pods[id] || 0),
+      borderColor: COLORS[i % COLORS.length], borderWidth:1,
+      pointRadius:0, tension:0.3, fill:false,
+    })),
+  ];
+
+  if (navChart) {
+    navChart.data.labels   = labels;
+    navChart.data.datasets = datasets;
+    navChart.update('none');
+    return;
+  }
+  navChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display:true, position:'top',
+          labels:{ color:'#6a90aa', font:{size:9, family:"'IBM Plex Mono', monospace"}, padding:8, usePointStyle:true, pointStyle:'line' } },
+        tooltip: { backgroundColor:'#18232f', titleColor:'#00cfe8',
+          bodyColor:'#d8e8f0', borderColor:'#253547', borderWidth:1, padding:8 },
+      },
+      scales: {
+        x: { grid:{color:'#1c2c3c'}, ticks:{color:'#3a556a', font:{size:9, family:'IBM Plex Mono'}, maxRotation:0, maxTicksLimit:6} },
+        y: { grid:{color:'#1c2c3c'}, ticks:{color:'#3a556a', font:{size:9, family:'IBM Plex Mono'}, callback: v => '$'+v.toFixed(0)} },
+      },
+    },
+  });
+}
+
+function calculateMetrics() {
+  if (navHistory.length < 2) return;
+  const navs   = navHistory.map(h => h.firmNav);
+  const rets   = navs.slice(1).map((v,i) => (v - navs[i]) / (navs[i] || 1));
+  const mean   = rets.reduce((s,r) => s+r, 0) / rets.length;
+  const std    = Math.sqrt(rets.reduce((s,r) => s+(r-mean)**2, 0) / rets.length) || 1e-9;
+  const sharpe = mean / std * Math.sqrt(252);
+  const maxNav = Math.max(...navs);
+  const dd     = maxNav > 0 ? (navs[navs.length-1] - maxNav) / maxNav : 0;
+  const wr     = rets.length > 0 ? rets.filter(r => r>0).length / rets.length : 0;
+
+  document.getElementById('m-sharpe').textContent = isFinite(sharpe) ? sharpe.toFixed(2) : '—';
+  document.getElementById('m-vol').textContent    = (std * Math.sqrt(252) * 100).toFixed(1) + '%';
+  const ddEl = document.getElementById('m-dd');
+  ddEl.textContent = (dd * 100).toFixed(1) + '%';
+  ddEl.className   = 'kpi-val ' + (dd < -0.05 ? 'neg' : '');
+  document.getElementById('m-wr').textContent     = (wr * 100).toFixed(0) + '%';
+}
+
+function updatePerfTable() {
+  const ids = Object.keys(pods).sort();
+  if (ids.length === 0) return;
+  document.getElementById('perf-table').innerHTML = ids.map(id => {
+    const d   = pods[id];
+    const nav = d.nav || 0;
+    const ret = ((nav - 100) / 100 * 100);
+    const pnl = d.daily_pnl || 0;
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">$${nav.toFixed(2)}</td>
+      <td class="r ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</td>
+      <td class="r ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ================================================================
+//  RISK
+// ================================================================
+function calculateRisk() {
+  const ids = Object.keys(pods);
+  if (ids.length === 0) return;
+  const nav  = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
+  const pos  = ids.reduce((s,id) => {
+    const p = pods[id].current_positions;
+    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
+  }, 0);
+  const var95 = nav * 0.025;
+  const lev   = pos > 0 ? (pos * 10 / (nav || 1)) : 0;
+  const conc  = ids.length > 0 ? (100 / ids.length).toFixed(0) + '%' : '—';
+
+  document.getElementById('kpi-var').textContent    = nav > 0 ? `$${var95.toFixed(0)}` : '—';
+  document.getElementById('kpi-lev').textContent    = nav > 0 ? `${lev.toFixed(2)}x` : '—';
+  document.getElementById('kpi-conc').textContent   = conc;
+  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
+  updateRiskTable();
+}
+
+function updateRiskAlertBanner(severity, message) {
+  const el = document.getElementById('risk-banner');
+  el.className   = 'risk-banner ' + severity;
+  el.textContent = message;
+  riskAlerts.push({ severity, message, ts: new Date().toISOString() });
+  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
+  if (severity === 'critical') triggerRiskAlert();
+}
+
+function updateRiskTable() {
+  const ids = Object.keys(pods).sort();
+  if (ids.length === 0) return;
+  document.getElementById('risk-table').innerHTML = ids.map(id => {
+    const d     = pods[id];
+    const nav   = d.nav || 0;
+    const p     = d.current_positions;
+    const pos   = Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0;
+    const st    = (d.status || 'UNKNOWN').toUpperCase();
+    const sc    = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">$${(nav * 0.025).toFixed(0)}</td>
+      <td class="r">${pos}</td>
+      <td class="r"><span class="badge ${sc}">${st}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ================================================================
+//  EXECUTION
+// ================================================================
+function addTrade(podId, symbol, side, qty, price, status = 'FILLED') {
+  executedTrades.unshift({ podId, symbol, side: side.toUpperCase(), qty, price, status, ts: new Date().toISOString() });
+  if (executedTrades.length > 50) executedTrades.pop();
+  updateExecTable();
+}
+
+function updateExecTable() {
+  document.getElementById('kpi-trades').textContent = executedTrades.length;
+  document.getElementById('kpi-filled').textContent = executedTrades.filter(t => t.status === 'FILLED').length;
+  if (executedTrades.length === 0) return;
+  document.getElementById('exec-table').innerHTML = executedTrades.slice(0, 20).map(t => {
+    const sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
+    const ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
+    return `<tr>
+      <td>${t.podId.toUpperCase()}</td>
+      <td style="font-weight:600">${t.symbol}</td>
+      <td><span class="badge ${sc}">${t.side}</span></td>
+      <td class="r">${t.qty}</td>
+      <td class="r">$${(t.price || 0).toFixed(2)}</td>
+      <td class="r"><span class="badge ${ss}">${t.status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ================================================================
+//  GOVERNANCE
+// ================================================================
+function recordGov(agent, decision, reasoning, weights) {
+  governanceDecisions.unshift({ agent, decision, reasoning, weights, ts: new Date().toISOString() });
+  updateGovHub();
+}
+
+function updateGovHub() {
+  const ids   = Object.keys(pods).sort();
+  const names = ids.length > 0 ? ids : ['alpha','beta','gamma','delta','epsilon'];
+  document.getElementById('alloc-grid').innerHTML = names.map(id => {
+    const nav = pods[id] ? pods[id].nav || 0 : 0;
+    return `<div class="alloc-tile">
+      <div class="alloc-pod">${id.toUpperCase()}</div>
+      <div class="alloc-val">${nav > 0 ? '$'+nav.toFixed(0) : '—'}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('gov-badge').textContent = governanceDecisions.length + ' decisions';
+  const list = document.getElementById('gov-list');
+  if (governanceDecisions.length === 0) return;
+  list.innerHTML = governanceDecisions.slice(0, 10).map(d => {
+    const ac = d.agent ? 'b-' + d.agent.toLowerCase() : 'b-idle';
+    const tm = new Date(d.ts).toLocaleTimeString();
+    return `<div class="gov-card">
+      <div class="gov-card-hdr">
+        <span class="badge ${ac}">${d.agent}</span>
+        <span class="gov-time">${tm}</span>
+      </div>
+      <div class="gov-card-body">${d.decision}</div>
+      ${d.reasoning ? `<div class="gov-card-sub">${d.reasoning.slice(0,120)}${d.reasoning.length>120?'…':''}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// Init governance grid on load
+updateGovHub();
+</script>
 </body>
 </html>
