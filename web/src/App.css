@@ -1,0 +1,137 @@
+/* App-specific styles */
+
+.app {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+}
+
+.three-canvas {
+  width: 100%;
+  height: 100%;
+  position: relative;
+}
+
+.three-canvas canvas {
+  display: block;
+  width: 100% !important;
+  height: 100% !important;
+}
+
+.data-panel {
+  background: linear-gradient(135deg, var(--bg-primary) 0%, var(--bg-secondary) 100%);
+  border-left: 1px solid var(--border-color);
+}
+
+/* Responsive adjustments */
+@media (max-width: 1024px) {
+  .data-panel {
+    display: none;
+  }
+}
+
+/* Animation utilities */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideInRight {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+.animate-slide-in-right {
+  animation: slideInRight 0.3s ease-in-out;
+}
+
+.animate-pulse {
+  animation: pulse 1.5s ease-in-out infinite;
+}
+
+/* Glow effects */
+.glow-cyan {
+  box-shadow: 0 0 20px rgba(0, 217, 255, 0.3), inset 0 0 20px rgba(0, 217, 255, 0.05);
+}
+
+.glow-red {
+  box-shadow: 0 0 20px rgba(255, 71, 87, 0.3), inset 0 0 20px rgba(255, 71, 87, 0.05);
+}
+
+.glow-green {
+  box-shadow: 0 0 20px rgba(46, 213, 115, 0.3), inset 0 0 20px rgba(46, 213, 115, 0.05);
+}
+
+/* Glass morphism */
+.glass {
+  background: rgba(26, 31, 46, 0.6);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 217, 255, 0.1);
+}
+
+.glass-strong {
+  background: rgba(26, 31, 46, 0.85);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(0, 217, 255, 0.15);
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(11, 15, 20, 0.5);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(74, 85, 104, 0.8);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 217, 255, 0.6);
+}
+
+/* Smooth transitions */
+* {
+  transition: color 0.2s ease, background-color 0.2s ease, border-color 0.2s ease;
+}
+
+button,
+a {
+  transition: all 0.2s ease;
+}
+
+button:active {
+  transform: scale(0.98);
+}

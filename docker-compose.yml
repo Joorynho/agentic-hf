@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  mission-control:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: mission-control-web
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=8000
+      # API Keys (use .env file instead)
+      # - ALPACA_API_KEY=${ALPACA_API_KEY}
+      # - ALPACA_SECRET_KEY=${ALPACA_SECRET_KEY}
+    volumes:
+      # Optional: mount logs directory
+      - ./logs:/app/logs
+      # Optional: mount .env file for local development
+      # - ./.env:/app/.env:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Optional: Nginx reverse proxy for production
+  # nginx:
+  #   image: nginx:alpine
+  #   container_name: mission-control-nginx
+  #   ports:
+  #     - "80:80"
+  #     - "443:443"
+  #   volumes:
+  #     - ./nginx.conf:/etc/nginx/nginx.conf:ro
+  #     - ./ssl:/etc/nginx/ssl:ro
+  #   depends_on:
+  #     - mission-control
+  #   restart: unless-stopped

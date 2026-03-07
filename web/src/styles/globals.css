@@ -1,0 +1,151 @@
+@import "tailwindcss/base";
+@import "tailwindcss/components";
+@import "tailwindcss/utilities";
+
+:root {
+  --bg-primary: #0b0f14;
+  --bg-secondary: #1a1f2e;
+  --bg-tertiary: #2d3748;
+  --text-primary: #ffffff;
+  --text-secondary: #a0aec0;
+  --text-tertiary: #718096;
+  --accent-cyan: #00d9ff;
+  --accent-red: #ff4757;
+  --accent-green: #2ed573;
+  --steel-blue: #4a5568;
+  --border-color: #2d3748;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 14px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+.app {
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--steel-blue);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-cyan);
+}
+
+/* Utility classes */
+.flex-center {
+  @apply flex items-center justify-center;
+}
+
+.glass {
+  background: rgba(26, 31, 46, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(0, 217, 255, 0.1);
+}
+
+.glass-strong {
+  background: rgba(26, 31, 46, 0.95);
+  backdrop-filter: blur(20px);
+  border: 1px solid rgba(0, 217, 255, 0.2);
+}
+
+.glow-cyan {
+  text-shadow: 0 0 10px rgba(0, 217, 255, 0.5);
+  box-shadow: 0 0 20px rgba(0, 217, 255, 0.2);
+}
+
+.glow-red {
+  text-shadow: 0 0 10px rgba(255, 71, 87, 0.5);
+  box-shadow: 0 0 20px rgba(255, 71, 87, 0.2);
+}
+
+.glow-green {
+  text-shadow: 0 0 10px rgba(46, 213, 115, 0.5);
+  box-shadow: 0 0 20px rgba(46, 213, 115, 0.2);
+}
+
+.btn-primary {
+  @apply px-4 py-2 bg-accent-cyan text-bg-primary font-bold rounded hover:shadow-lg hover:shadow-accent-cyan/50 transition-all duration-200;
+}
+
+.btn-secondary {
+  @apply px-4 py-2 border border-accent-cyan text-accent-cyan rounded hover:bg-accent-cyan/10 transition-all duration-200;
+}
+
+.input-base {
+  @apply px-3 py-2 bg-bg-secondary border border-border-color rounded text-text-primary placeholder-text-tertiary focus:outline-none focus:border-accent-cyan transition-colors;
+}
+
+/* Animation definitions */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideIn {
+  from {
+    transform: translateY(20px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+@keyframes pulse-glow {
+  0%, 100% {
+    box-shadow: 0 0 20px rgba(0, 217, 255, 0.2);
+  }
+  50% {
+    box-shadow: 0 0 40px rgba(0, 217, 255, 0.4);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.3s ease-in-out;
+}
+
+.animate-slide-in {
+  animation: slideIn 0.3s ease-in-out;
+}
+
+.animate-pulse-glow {
+  animation: pulse-glow 2s ease-in-out infinite;
+}

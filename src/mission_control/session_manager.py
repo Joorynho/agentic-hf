@@ -49,6 +49,7 @@ from src.pods.templates.epsilon.pm_agent import EpsilonPMAgent
 from src.pods.templates.epsilon.risk_agent import EpsilonRiskAgent
 from src.pods.templates.epsilon.execution_trader import EpsilonExecutionTrader
 from src.pods.templates.epsilon.ops_agent import EpsilonOpsAgent
+from src.web.server import create_app
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,7 @@ class SessionManager:
         event_bus: Optional[EventBus] = None,
         audit_log: Optional[AuditLog] = None,
         session_dir: Optional[str] = None,
+        enable_web_server: bool = False,
     ):
         """Initialize session manager.
 
@@ -125,6 +127,7 @@ class SessionManager:
             event_bus: EventBus (default creates new with audit_log)
             audit_log: AuditLog for EventBus (default in-memory)
             session_dir: Directory for logging (default auto-generated)
+            enable_web_server: Enable FastAPI web server (default False)
         """
         self._alpaca = alpaca_adapter or AlpacaAdapter()
         self._audit_log = audit_log or AuditLog()
@@ -142,6 +145,11 @@ class SessionManager:
         self._latest_mandate: Optional[MandateUpdate] = None
         self._risk_halt: bool = False
         self._risk_halt_reason: Optional[str] = None
+
+        # Web server state
+        self._web_app = None
+        self._web_server_task = None
+        self._enable_web_server = enable_web_server
 
         self._session_active = False
         self._capital_per_pod = 0.0
@@ -321,6 +329,10 @@ class SessionManager:
             bars = await self._alpaca.fetch_bars(initial_symbols)
             logger.info("[session_manager] Fetched initial bars for %d symbols", len(bars))
 
+            # Initialize web server if enabled
+            if self._enable_web_server:
+                await self._start_web_server(capital_per_pod)
+
             self._session_active = True
             logger.info("[session_manager] Session started: %d pods × $%.2f = $%.2f total capital",
                        len(POD_IDS), capital_per_pod, total_capital)
@@ -328,6 +340,55 @@ class SessionManager:
         except Exception as exc:
             logger.error("[session_manager] Failed to start session: %s", exc)
             raise
+
+    async def _start_web_server(self, capital_per_pod: float) -> None:
+        """Start FastAPI web server for dashboard.
+
+        Args:
+            capital_per_pod: Initial capital per pod
+        """
+        try:
+            self._web_app = create_app(event_bus=self._event_bus, session_start_time=datetime.now(timezone.utc))
+
+            # Initialize session state in app
+            await self._web_app.state.update_session_state(
+                iteration=0,
+                capital_per_pod=capital_per_pod,
+                pod_summaries={},
+            )
+
+            logger.info("[session_manager] FastAPI web server created (listening on localhost:8000)")
+        except Exception as e:
+            logger.error("[session_manager] Failed to start web server: %s", e)
+            # Don't raise; allow session to continue without web server
+
+    async def _update_web_state(self, pod_summaries: dict[str, PodSummary]) -> None:
+        """Update web server state with latest pod summaries and governance info.
+
+        Args:
+            pod_summaries: Dictionary mapping pod_id to PodSummary
+        """
+        if not self._web_app:
+            return
+
+        try:
+            # Convert PodSummary objects to dicts for web serialization
+            pod_dicts = {}
+            for pod_id, summary in pod_summaries.items():
+                try:
+                    pod_dicts[pod_id] = summary.model_dump(mode="json")
+                except Exception:
+                    pod_dicts[pod_id] = {}
+
+            await self._web_app.state.update_session_state(
+                iteration=self._iteration,
+                capital_per_pod=self._capital_per_pod,
+                pod_summaries=pod_dicts,
+                risk_halt=self._risk_halt,
+                risk_halt_reason=self._risk_halt_reason,
+            )
+        except Exception as e:
+            logger.debug("[session_manager] Failed to update web state: %s", e)
 
     async def run_event_loop(
         self,
@@ -406,6 +467,10 @@ class SessionManager:
                                     "[session_manager] [iter %d] Failed to emit summary for %s: %s",
                                     self._iteration, pod_id, e
                                 )
+
+                    # 5.5. Update web server state with latest summaries
+                    if self._enable_web_server:
+                        await self._update_web_state(pod_summaries)
 
                     # 6. Every N iterations: run governance cycle
                     if self._iteration > 0 and self._iteration % governance_freq == 0:
@@ -553,6 +618,15 @@ class SessionManager:
                 closed_count += 1
             except Exception as exc:
                 logger.warning("[session_manager] Error stopping pod %s: %s", pod_id, exc)
+
+        # Stop web server if running
+        if self._web_server_task:
+            try:
+                self._web_server_task.cancel()
+                await asyncio.sleep(0.1)
+                logger.info("[session_manager] Web server task cancelled")
+            except Exception as e:
+                logger.warning("[session_manager] Error stopping web server: %s", e)
 
         # Close session logger
         try:
