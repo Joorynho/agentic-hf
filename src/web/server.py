@@ -138,7 +138,7 @@ class EventBusListener:
         try:
             await self.manager.broadcast(
                 {
-                    "type": "governance_event",
+                    "type": "governance",
                     "timestamp": message.timestamp.isoformat(),
                     "data": message.payload,
                 }
