@@ -841,7 +841,7 @@ function buildFloor(fd, idx) {
 
   podsOnFloor.forEach((podId, i) => {
     const xPos = -2.5 + (i * 5 / Math.max(1, podsOnFloor.length - 1));
-    const capsuleGeo = new THREE.CapsuleGeometry(0.15, 1.2, 8, 6);
+    const capsuleGeo = new THREE.CylinderGeometry(0.15, 0.12, 1.2, 8);
     const capsuleMat = podStatusMaterials.ACTIVE.clone();
     const silhouette = new THREE.Mesh(capsuleGeo, capsuleMat);
 
