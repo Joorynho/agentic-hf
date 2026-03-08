@@ -969,8 +969,7 @@ function hashPodId(podId) {
 
 function findPodById(podId) {
   // Search through all floors for the pod
-  for (let i = 0; i < floorAnimState.length; i++) {
-    const st = floorAnimState[i];
+  for (const st of Object.values(floorAnimState)) {
     if (st && st.podSilhouettes && st.podSilhouettes[podId]) {
       return st.podSilhouettes[podId];
     }
@@ -1049,7 +1048,7 @@ function animate() {
   // M4: Pod Y-bob animation with per-pod phase offset
   const bobFrequency = 1.2;  // Hz
   const bobAmplitude = 0.15;  // units
-  floorAnimState.forEach((st, idx) => {
+  Object.values(floorAnimState).forEach(st => {
     if (st && st.podSilhouettes) {
       Object.entries(st.podSilhouettes).forEach(([podId, pod]) => {
         const phase = hashPodId(podId);
