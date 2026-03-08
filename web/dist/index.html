@@ -702,6 +702,36 @@ const matCol  = new THREE.MeshStandardMaterial({ color:0x0a1420, metalness:0.82,
 const matDesk = new THREE.MeshStandardMaterial({ color:0x0e1a26, metalness:0.65, roughness:0.42 });
 
 // ================================================================
+//  M4: POD STATUS MATERIALS
+// ================================================================
+const podStatusMaterials = {
+  ACTIVE: new THREE.MeshStandardMaterial({
+    color:             0x00c888,
+    metalness:         0.7,
+    roughness:         0.3,
+    emissive:          0x003322,
+    emissiveIntensity: 0.2,
+  }),
+  HALTED: new THREE.MeshStandardMaterial({
+    color:             0xf0a030,
+    metalness:         0.7,
+    roughness:         0.3,
+    emissive:          0x664400,
+    emissiveIntensity: 0.15,
+  }),
+  IDLE: new THREE.MeshStandardMaterial({
+    color:             0x555555,
+    metalness:         0.7,
+    roughness:         0.3,
+    emissive:          0x222222,
+    emissiveIntensity: 0.1,
+  }),
+};
+
+// Pod-to-floor mapping
+const podFloorMap = { alpha: 0, beta: 2, gamma: 1, delta: 3, epsilon: 4 };
+
+// ================================================================
 //  BUILD FLOOR (cross-section dollhouse view)
 // ================================================================
 function buildFloor(fd, idx) {
@@ -803,16 +833,41 @@ function buildFloor(fd, idx) {
   pt.position.set(0, FLOOR_H * 0.65, 0);
   g.add(pt);
 
+  // M4: Create pod silhouettes on this floor
+  const podSilhouettes = {};
+  const podsOnFloor = Object.entries(podFloorMap)
+    .filter(([_, floorIdx]) => floorIdx === idx)
+    .map(([podId]) => podId);
+
+  podsOnFloor.forEach((podId, i) => {
+    const xPos = -2.5 + (i * 5 / Math.max(1, podsOnFloor.length - 1));
+    const capsuleGeo = new THREE.CapsuleGeometry(0.15, 1.2, 8, 6);
+    const capsuleMat = podStatusMaterials.ACTIVE.clone();
+    const silhouette = new THREE.Mesh(capsuleGeo, capsuleMat);
+
+    silhouette.position.set(xPos, fd.y, 0);
+    silhouette.userData = {
+      podId,
+      floorIndex: idx,
+      baseY: fd.y,
+      status: 'ACTIVE',
+    };
+
+    g.add(silhouette);
+    podSilhouettes[podId] = silhouette;
+  });
+
   // Store for animation
   floorAnimState[idx] = {
-    screens:         screenMats,
-    trimMat:         trimMat,
-    pointLight:      pt,
-    baseEmissive:    0.52,
-    baseTrimEmissive:0.32,
-    baseLightInt:    1.3,
+    screens:            screenMats,
+    trimMat:            trimMat,
+    pointLight:         pt,
+    baseEmissive:       0.52,
+    baseTrimEmissive:   0.32,
+    baseLightInt:       1.3,
     hoverGlowIntensity: 0.52,  // M3: hover glow intensity
-    hovering:        false,     // M3: is floor currently hovered
+    hovering:           false,  // M3: is floor currently hovered
+    podSilhouettes:     podSilhouettes,  // M4: pod meshes on this floor
   };
 
   g.position.y = fd.y + SLAB_T * 0.5;
@@ -901,6 +956,83 @@ function scrollToFloor(floorIdx) {
 }
 
 // ================================================================
+//  M4: POD SILHOUETTE FUNCTIONS
+// ================================================================
+function hashPodId(podId) {
+  // Simple deterministic hash: sum ASCII values mod 2π
+  let hash = 0;
+  for (let i = 0; i < podId.length; i++) {
+    hash += podId.charCodeAt(i);
+  }
+  return (hash % 628) / 100;  // maps to 0-2π
+}
+
+function findPodById(podId) {
+  // Search through all floors for the pod
+  for (let i = 0; i < floorAnimState.length; i++) {
+    const st = floorAnimState[i];
+    if (st && st.podSilhouettes && st.podSilhouettes[podId]) {
+      return st.podSilhouettes[podId];
+    }
+  }
+  return null;
+}
+
+function updatePodSilhouetteColor(podId, status) {
+  const pod = findPodById(podId);
+  if (!pod) return;
+
+  const newMaterial = podStatusMaterials[status];
+  if (!newMaterial) return;
+
+  // Transition color over 0.5s
+  const oldColor = new THREE.Color(pod.material.color);
+  const newColor = new THREE.Color(newMaterial.color);
+
+  gsap.to(oldColor, {
+    r: newColor.r,
+    g: newColor.g,
+    b: newColor.b,
+    duration: 0.5,
+    onUpdate: () => {
+      pod.material.color.copy(oldColor);
+    },
+  });
+
+  // Update emissive intensity
+  gsap.to(pod.material, {
+    emissiveIntensity: newMaterial.emissiveIntensity,
+    duration: 0.5,
+  });
+}
+
+function triggerPodHeartbeat(podId) {
+  const pod = findPodById(podId);
+  if (!pod) return;
+
+  const state = { emissiveIntensity: pod.material.emissiveIntensity };
+  gsap.killTweensOf(state);
+  gsap.to(state, {
+    emissiveIntensity: 0.8,
+    duration: 0.3,
+    ease: 'power2.out',
+    onUpdate: () => {
+      pod.material.emissiveIntensity = state.emissiveIntensity;
+    },
+  });
+
+  gsap.to(state, {
+    emissiveIntensity: pod.material.emissiveIntensity * 0.4,
+    duration: 0.3,
+    delay: 0.3,
+    ease: 'power2.in',
+    onUpdate: () => {
+      pod.material.emissiveIntensity = state.emissiveIntensity;
+    },
+  });
+}
+
+// ================================================================
 //  ANIMATION LOOP
 // ================================================================
 const clock = new THREE.Clock();
@@ -913,6 +1045,19 @@ function animate() {
   camera.position.x = Math.sin(t * 0.11) * 0.38;
   camera.position.y = 5 + Math.sin(t * 0.07) * 0.18;
   camera.lookAt(camera.position.x * 0.25, 5, 0);
+
+  // M4: Pod Y-bob animation with per-pod phase offset
+  const bobFrequency = 1.2;  // Hz
+  const bobAmplitude = 0.15;  // units
+  floorAnimState.forEach((st, idx) => {
+    if (st && st.podSilhouettes) {
+      Object.entries(st.podSilhouettes).forEach(([podId, pod]) => {
+        const phase = hashPodId(podId);
+        const offset = Math.sin(t * bobFrequency + phase) * bobAmplitude;
+        pod.position.y = pod.userData.baseY + offset;
+      });
+    }
+  });
 
   // Fade and dispose governance light tubes
   govLightLines = govLightLines.filter(obj => {
@@ -1166,6 +1311,10 @@ function handleMessage(msg) {
       calculateMetrics();
       updatePerfTable();
       calculateRisk();
+      // M4: Update pod silhouette color based on status
+      if (data.status) {
+        updatePodSilhouetteColor(pod_id, data.status);
+      }
     }
   } else if (msg.type === 'trade') {
     const t = msg.data;
@@ -1174,8 +1323,11 @@ function handleMessage(msg) {
     if (t.symbol && t.side && t.qty)
       addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
     triggerTradePulse();
+    // M4: Trigger pod heartbeat on trade
+    if (t.pod_id) {
+      triggerPodHeartbeat(t.pod_id);
+    }
     // M3: Create data route visualization on trade
-    const podFloorMap = { alpha: 0, beta: 2, gamma: 1, delta: 3, epsilon: 4 };
     const srcFloor = podFloorMap[t.pod_id] ?? 0;
     createDataRoute(srcFloor, 1, 0x00cfe8);  // to Execution floor (cyan)
   } else if (msg.type === 'governance') {
