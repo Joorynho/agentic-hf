@@ -852,9 +852,15 @@ function animateCameraToFloor(floorIdx) {
   const floor = FLOORS[floorIdx];
   const targetY = floor.y + 5;
 
+  // Zoom based on floor: higher floors zoom in, lower floors zoom out
+  // Risk (y=-9) → z=38 (far), Governance (y=16) → z=24 (close)
+  const zoomFactor = 1 - (floor.y + 9) / 25 * 0.37;  // Maps -9 to 16 → 1.0 to 0.63
+  const targetZ = 34 * zoomFactor;
+
   gsap.killTweensOf(camera.position);
   gsap.to(camera.position, {
     y: targetY,
+    z: targetZ,
     duration: 1.0,
     ease: 'power2.inOut',
     overwrite: 'auto',
