@@ -127,7 +127,8 @@
     .left-panel:active {
       cursor: grabbing;
     }
-    #viewport { display: block; width: 100%; height: 100%; }
+    #viewport { display: block; width: 100%; height: 100%; cursor: default; }
+    #viewport.hovering { cursor: pointer; }
 
     /* Floor label strip (bottom-left overlay) */
     .floor-strip {
@@ -623,6 +624,10 @@ let currentFloor = 0;
 let isScrolling = false;
 let scrollTimeout = null;
 
+// M3: Hover/click state
+let hoveredFloor = null;
+let lastHoveredFloor = null;
+
 // ================================================================
 //  THREE.JS SCENE
 // ================================================================
@@ -641,6 +646,10 @@ renderer.shadowMap.enabled   = true;
 renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
 renderer.toneMapping         = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 0.82;
+
+// M3: Raycaster for hover/click detection
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
 
 function onResize() {
   const lp = document.getElementById('left-panel');
@@ -802,6 +811,8 @@ function buildFloor(fd, idx) {
     baseEmissive:    0.52,
     baseTrimEmissive:0.32,
     baseLightInt:    1.3,
+    hoverGlowIntensity: 0.52,  // M3: hover glow intensity
+    hovering:        false,     // M3: is floor currently hovered
   };
 
   g.position.y = fd.y + SLAB_T * 0.5;
@@ -914,6 +925,73 @@ function animate() {
 animate();
 
 // ================================================================
+//  M3: HOVER GLOW ANIMATION & RAYCASTER
+// ================================================================
+function addFloorHoverGlow(floorIdx) {
+  const st = floorAnimState[floorIdx];
+  if (!st) return;
+  st.hovering = true;
+
+  gsap.killTweensOf(st);
+  gsap.to(st, {
+    hoverGlowIntensity: 1.2,
+    duration: 0.15,
+    ease: 'power2.out',
+    onUpdate: () => {
+      st.screens.forEach(m => {
+        m.emissiveIntensity = st.hoverGlowIntensity;
+      });
+    },
+  });
+}
+
+function removeFloorHoverGlow(floorIdx) {
+  const st = floorAnimState[floorIdx];
+  if (!st) return;
+  st.hovering = false;
+
+  gsap.killTweensOf(st);
+  gsap.to(st, {
+    hoverGlowIntensity: 0.52,
+    duration: 0.25,
+    ease: 'power2.in',
+    onUpdate: () => {
+      st.screens.forEach(m => {
+        m.emissiveIntensity = st.hoverGlowIntensity;
+      });
+    },
+  });
+}
+
+function createDataRoute(srcFloorIdx, dstFloorIdx, color) {
+  const srcFloor = FLOORS[srcFloorIdx];
+  const dstFloor = FLOORS[dstFloorIdx];
+
+  const srcY = srcFloor.y;
+  const dstY = dstFloor.y;
+  const midY = (srcY + dstY) / 2;
+
+  // Curve path with arc offset
+  const curve = new THREE.CatmullRomCurve3([
+    new THREE.Vector3(-1.2, srcY, 0.5),
+    new THREE.Vector3(0, midY, 3.5),
+    new THREE.Vector3(1.2, dstY, 0.5),
+  ]);
+
+  const tubeGeo = new THREE.TubeGeometry(curve, 24, 0.055, 5, false);
+  const tubeMat = new THREE.MeshBasicMaterial({
+    color: color,
+    transparent: true,
+    opacity: 0.65,
+    depthWrite: false,
+  });
+
+  const tube = new THREE.Mesh(tubeGeo, tubeMat);
+  scene.add(tube);
+  govLightLines.push(tube);
+}
+
+// ================================================================
 //  M2: WHEEL EVENT & INITIALIZATION
 // ================================================================
 const leftPanel = document.querySelector('.left-panel');
@@ -937,6 +1015,50 @@ leftPanel.addEventListener('wheel', (e) => {
 
 leftPanel.style.overflowY = 'hidden'; // Prevent browser scroll
 updateFloorContext(0); // Initialize on load
+
+// ================================================================
+//  M3: RAYCASTER & CLICK HANDLERS
+// ================================================================
+canvas.addEventListener('mousemove', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - rect.left) / rect.width * 2 - 1;
+  mouse.y = -(e.clientY - rect.top) / rect.height * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(scene.children, true);
+
+  let newHovered = null;
+  for (const hit of intersects) {
+    let obj = hit.object;
+    while (obj.parent && obj.userData.floorIndex === undefined) {
+      obj = obj.parent;
+    }
+    if (obj.userData.floorIndex !== undefined) {
+      newHovered = obj.userData.floorIndex;
+      break;
+    }
+  }
+
+  // Handle hover state change
+  if (newHovered !== hoveredFloor) {
+    if (hoveredFloor !== null) {
+      removeFloorHoverGlow(hoveredFloor);
+    }
+    hoveredFloor = newHovered;
+    if (hoveredFloor !== null) {
+      addFloorHoverGlow(hoveredFloor);
+    }
+  }
+
+  // Update cursor
+  canvas.classList.toggle('hovering', hoveredFloor !== null);
+});
+
+canvas.addEventListener('click', () => {
+  if (hoveredFloor !== null && hoveredFloor !== currentFloor) {
+    scrollToFloor(hoveredFloor);
+  }
+});
 
 // ================================================================
 //  FLASH ANIMATION HELPERS
@@ -1046,6 +1168,10 @@ function handleMessage(msg) {
     if (t.symbol && t.side && t.qty)
       addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
     triggerTradePulse();
+    // M3: Create data route visualization on trade
+    const podFloorMap = { alpha: 0, beta: 2, gamma: 1, delta: 3, epsilon: 4 };
+    const srcFloor = podFloorMap[t.pod_id] ?? 0;
+    createDataRoute(srcFloor, 1, 0x00cfe8);  // to Execution floor (cyan)
   } else if (msg.type === 'governance') {
     const gv = msg.data;
     if (gv.agent && gv.decision) {
