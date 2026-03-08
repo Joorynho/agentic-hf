@@ -121,6 +121,11 @@
       background: var(--bg-void);
       border-right: 1px solid var(--border-dim);
       overflow: hidden;
+      overflow-y: hidden;
+      cursor: grab;
+    }
+    .left-panel:active {
+      cursor: grabbing;
     }
     #viewport { display: block; width: 100%; height: 100%; }
 
@@ -155,6 +160,52 @@
       flex-direction: column;
       background: var(--bg-base);
       overflow: hidden;
+    }
+
+    /* Floor header (M2) */
+    .floor-header {
+      padding: 12px 16px;
+      background: linear-gradient(90deg, var(--bg-surface) 0%, rgba(0,0,0,0) 100%);
+      border-bottom: 1px solid var(--border-dim);
+      margin-bottom: 8px;
+    }
+    .floor-title {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: 2px;
+      font-family: var(--font-ui);
+      margin-bottom: 4px;
+      text-transform: uppercase;
+    }
+    .floor-label {
+      font-size: 11px;
+      font-family: var(--font-mono);
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      text-transform: uppercase;
+    }
+
+    /* Floor breadcrumb (M2) */
+    .floor-breadcrumb {
+      display: flex;
+      gap: 8px;
+      justify-content: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--border-dim);
+      margin-bottom: 12px;
+    }
+    .crumb {
+      cursor: pointer;
+      font-size: 12px;
+      color: var(--text-muted);
+      transition: color 0.3s;
+    }
+    .crumb:hover {
+      color: var(--text-primary);
+    }
+    .crumb.active {
+      color: var(--cyan);
+      text-shadow: 0 0 8px var(--cyan);
     }
 
     /* Tab bar */
@@ -385,6 +436,21 @@
   <!-- RIGHT PANEL — MISSION CONTROL -->
   <div class="right-panel">
 
+    <!-- FLOOR HEADER + BREADCRUMB (M2) -->
+    <div class="floor-header">
+      <div class="floor-title">RISK</div>
+      <div class="floor-label">VAR · LIMITS · STRESS</div>
+    </div>
+
+    <div class="floor-breadcrumb">
+      <span class="crumb active" onclick="scrollToFloor(0)">●</span>
+      <span class="crumb" onclick="scrollToFloor(1)">○</span>
+      <span class="crumb" onclick="scrollToFloor(2)">○</span>
+      <span class="crumb" onclick="scrollToFloor(3)">○</span>
+      <span class="crumb" onclick="scrollToFloor(4)">○</span>
+      <span class="crumb" onclick="scrollToFloor(5)">○</span>
+    </div>
+
     <nav class="tab-bar">
       <button class="tab-btn active" data-tab="operations">Operations</button>
       <button class="tab-btn" data-tab="performance">Performance</button>
@@ -551,6 +617,11 @@ let iterCount           = 0;
 // Three.js animation state
 const floorAnimState = {};
 let govLightLines    = [];   // tubes to fade out each frame
+
+// M2: Scroll traversal state
+let currentFloor = 0;
+let isScrolling = false;
+let scrollTimeout = null;
 
 // ================================================================
 //  THREE.JS SCENE
@@ -764,6 +835,55 @@ FLOORS.forEach(fd => {
 });
 
 // ================================================================
+//  M2: SCROLL TRAVERSAL FUNCTIONS
+// ================================================================
+function animateCameraToFloor(floorIdx) {
+  const floor = FLOORS[floorIdx];
+  const targetY = floor.y + 5;
+
+  gsap.killTweensOf(camera.position);
+  gsap.to(camera.position, {
+    y: targetY,
+    duration: 1.0,
+    ease: 'power2.inOut',
+    overwrite: 'auto',
+  });
+}
+
+function updateFloorContext(floorIdx) {
+  const floor = FLOORS[floorIdx];
+
+  // Update floor header
+  const floorHeader = document.querySelector('.floor-header');
+  floorHeader.innerHTML = `
+    <div class="floor-title" style="color: ${floor.hex}">
+      ${floor.name}
+    </div>
+    <div class="floor-label">${floor.label}</div>
+  `;
+
+  // Update breadcrumb
+  const breadcrumb = document.querySelector('.floor-breadcrumb');
+  breadcrumb.innerHTML = Array.from({length: 6}, (_, i) =>
+    `<span class="crumb ${i === floorIdx ? 'active' : ''}" onclick="scrollToFloor(${i})">●</span>`
+  ).join('');
+
+  // Update floor labels in left panel
+  document.querySelectorAll('.floor-label-item').forEach((el, i) => {
+    el.classList.toggle('active', i === floorIdx);
+  });
+}
+
+function scrollToFloor(floorIdx) {
+  if (isScrolling || floorIdx === currentFloor) return;
+  currentFloor = floorIdx;
+  animateCameraToFloor(currentFloor);
+  updateFloorContext(currentFloor);
+  isScrolling = true;
+  setTimeout(() => { isScrolling = false; }, 200);
+}
+
+// ================================================================
 //  ANIMATION LOOP
 // ================================================================
 const clock = new THREE.Clock();
@@ -792,6 +912,31 @@ function animate() {
   renderer.render(scene, camera);
 }
 animate();
+
+// ================================================================
+//  M2: WHEEL EVENT & INITIALIZATION
+// ================================================================
+const leftPanel = document.querySelector('.left-panel');
+leftPanel.addEventListener('wheel', (e) => {
+  e.preventDefault();
+
+  if (isScrolling) return; // Debounce
+  isScrolling = true;
+
+  const direction = e.deltaY > 0 ? 1 : -1;
+  const nextFloor = Math.max(0, Math.min(5, currentFloor + direction));
+
+  if (nextFloor !== currentFloor) {
+    currentFloor = nextFloor;
+    animateCameraToFloor(currentFloor);
+    updateFloorContext(currentFloor);
+  }
+
+  scrollTimeout = setTimeout(() => { isScrolling = false; }, 200);
+});
+
+leftPanel.style.overflowY = 'hidden'; // Prevent browser scroll
+updateFloorContext(0); // Initialize on load
 
 // ================================================================
 //  FLASH ANIMATION HELPERS
