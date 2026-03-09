@@ -60,3 +60,6 @@ data_cache/
 # Logs
 *.log
 logs/
+
+# Git worktrees
+.worktrees/
