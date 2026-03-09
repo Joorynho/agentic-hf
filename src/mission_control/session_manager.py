@@ -22,6 +22,7 @@ from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.core.models.allocation import MandateUpdate
 from src.core.models.config import PodConfig, RiskBudget, ExecutionConfig, BacktestConfig
 from src.core.models.enums import TimeHorizon, AgentType
@@ -261,9 +262,19 @@ class SessionManager:
 
                 # Instantiate the 6 pod agents using pod-specific factories
                 agent_classes = POD_AGENTS[pod_id]
-                researcher = agent_classes["researcher"](
-                    agent_id=f"{pod_id}.researcher", pod_id=pod_id, namespace=namespace, bus=self._event_bus
-                )
+
+                # For Gamma pod, create and inject PolymarketAdapter
+                researcher_kwargs = {
+                    "agent_id": f"{pod_id}.researcher",
+                    "pod_id": pod_id,
+                    "namespace": namespace,
+                    "bus": self._event_bus,
+                }
+                if pod_id == "gamma":
+                    poly_adapter = PolymarketAdapter()
+                    researcher_kwargs["polymarket_adapter"] = poly_adapter
+
+                researcher = agent_classes["researcher"](**researcher_kwargs)
                 signal = agent_classes["signal"](
                     agent_id=f"{pod_id}.signal", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )
