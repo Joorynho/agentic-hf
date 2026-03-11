@@ -39,21 +39,21 @@ async def test_data_provider_receives_pod_summary():
     # Publish pod summary
     msg = AgentMessage(
         timestamp=datetime.now(timezone.utc),
-        sender="pod.alpha.gateway",
+        sender="pod.equities.gateway",
         recipient="*",
-        topic="pod.alpha.gateway",
+        topic="pod.equities.gateway",
         payload={
-            "pod_id": "alpha",
+            "pod_id": "equities",
             "risk_metrics": {"nav": 100000.0, "daily_pnl": 5000.0}
         },
     )
-    await bus.publish("pod.alpha.gateway", msg, publisher_id="pod.alpha")
+    await bus.publish("pod.equities.gateway", msg, publisher_id="pod.equities")
 
     # Allow async processing
     await asyncio.sleep(0.05)
 
     # Verify DataProvider has the summary
-    assert "alpha" in provider.pod_summaries
+    assert "equities" in provider.pod_summaries
     assert provider.firm_nav == 100000.0
     assert provider.firm_daily_pnl == 5000.0
 
@@ -64,7 +64,7 @@ def test_firm_dashboard_widget_renders_with_provider():
     provider = DataProvider(bus=bus)
 
     # Manually add pod summary to provider
-    provider._pod_summaries["alpha"] = {
+    provider._pod_summaries["equities"] = {
         "risk_metrics": {
             "nav": 100000.0,
             "daily_pnl": 5000.0,
@@ -90,7 +90,7 @@ def test_pod_table_widget_renders_with_provider():
     provider = DataProvider(bus=bus)
 
     # Add multiple pods
-    for pod_id in ["alpha", "beta"]:
+    for pod_id in ["equities", "fx"]:
         provider._pod_summaries[pod_id] = {
             "pod_id": pod_id,
             "status": "ACTIVE",
@@ -107,8 +107,8 @@ def test_pod_table_widget_renders_with_provider():
     output_str = _render_to_string(output)
 
     assert "POD TABLE" in output_str
-    assert "alpha" in output_str
-    assert "beta" in output_str
+    assert "equities" in output_str
+    assert "fx" in output_str
     assert "ACTIVE" in output_str
 
 
@@ -118,7 +118,7 @@ def test_risk_limits_widget_color_codes():
     provider = DataProvider(bus=bus)
 
     # Add pod with healthy risk
-    provider._pod_summaries["alpha"] = {
+    provider._pod_summaries["equities"] = {
         "risk_metrics": {
             "drawdown_from_hwm": 0.05,  # <7% = green
             "gross_leverage": 1.0,       # <1.4x = green
@@ -132,7 +132,7 @@ def test_risk_limits_widget_color_codes():
     output_str = _render_to_string(output)
 
     assert "RISK LIMITS" in output_str
-    assert "5.00%" in output_str or "alpha" in output_str
+    assert "5.00%" in output_str or "equities" in output_str
 
 
 def test_session_manager_has_data_provider():
@@ -156,8 +156,8 @@ async def test_session_manager_publishes_to_eventbus():
     await manager.data_provider.subscribe_to_updates()
 
     # Publish pod summary
-    await manager.publish_pod_summary("alpha", {
-        "pod_id": "alpha",
+    await manager.publish_pod_summary("equities", {
+        "pod_id": "equities",
         "risk_metrics": {
             "nav": 150000.0,
             "daily_pnl": 7500.0,
@@ -168,7 +168,7 @@ async def test_session_manager_publishes_to_eventbus():
     await asyncio.sleep(0.05)
 
     # Verify DataProvider received it
-    assert "alpha" in manager.data_provider.pod_summaries
+    assert "equities" in manager.data_provider.pod_summaries
     assert manager.data_provider.firm_nav == 150000.0
 
 
@@ -205,12 +205,12 @@ async def test_full_pipeline_data_to_ui():
     await provider.subscribe_to_updates()
 
     # Publish pod summaries via SessionManager
-    for pod_id in ["alpha", "beta", "gamma"]:
+    for pod_id in ["equities", "fx", "crypto"]:
         await manager.publish_pod_summary(pod_id, {
             "pod_id": pod_id,
             "status": "ACTIVE",
             "risk_metrics": {
-                "nav": 100000.0 + (10000 if pod_id == "beta" else 0),
+                "nav": 100000.0 + (10000 if pod_id == "fx" else 0),
                 "daily_pnl": 5000.0,
                 "drawdown_from_hwm": 0.02,
                 "current_vol_ann": 0.08,

@@ -10,405 +10,15 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 
+  <!-- Stylesheet -->
+  <link rel="stylesheet" href="styles.css">
+
   <!-- Three.js r128 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
   <!-- GSAP -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.2/gsap.min.js"></script>
   <!-- Chart.js -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/3.9.1/chart.min.js"></script>
-
-  <style>
-    /* ============================================================
-       DESIGN TOKENS
-    ============================================================ */
-    :root {
-      --bg-void:      #070b0e;
-      --bg-base:      #0c1118;
-      --bg-surface:   #101820;
-      --bg-elevated:  #18232f;
-      --border-dim:   #1c2c3c;
-      --border-base:  #253547;
-      --text-primary: #d8e8f0;
-      --text-muted:   #6a90aa;
-      --text-dim:     #3a556a;
-      --cyan:         #00cfe8;
-      --cyan-glow:    rgba(0,207,232,0.10);
-      --amber:        #f0a030;
-      --red:          #e84040;
-      --green:        #00c888;
-      --purple:       #7c5cfc;
-      --font-ui:      'Plus Jakarta Sans', system-ui, sans-serif;
-      --font-mono:    'IBM Plex Mono', 'Courier New', monospace;
-    }
-
-    /* ============================================================
-       RESET
-    ============================================================ */
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body { width: 100%; height: 100%; overflow: hidden; background: var(--bg-void); color: var(--text-primary); font-family: var(--font-ui); }
-    button { font-family: inherit; cursor: pointer; }
-
-    /* ============================================================
-       APP SHELL
-    ============================================================ */
-    .app {
-      display: grid;
-      grid-template-rows: 36px 1fr;
-      grid-template-columns: 62% 38%;
-      height: 100vh;
-      width: 100vw;
-    }
-
-    /* ============================================================
-       STATUS BAR
-    ============================================================ */
-    .status-bar {
-      grid-column: 1 / 3;
-      grid-row: 1;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 0 16px;
-      background: var(--bg-void);
-      border-bottom: 1px solid var(--border-dim);
-      font-family: var(--font-mono);
-      font-size: 10px;
-      letter-spacing: 0.06em;
-      user-select: none;
-      flex-shrink: 0;
-    }
-    .sb-brand {
-      font-size: 11px;
-      font-weight: 600;
-      letter-spacing: 0.22em;
-      color: var(--text-primary);
-      padding-right: 14px;
-      margin-right: 6px;
-      border-right: 1px solid var(--border-dim);
-    }
-    .sb-pill {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-      padding: 3px 9px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-dim);
-      border-radius: 2px;
-    }
-    .sb-dot {
-      width: 5px; height: 5px;
-      border-radius: 50%;
-      background: var(--text-dim);
-    }
-    .sb-dot.on {
-      background: var(--green);
-      box-shadow: 0 0 7px rgba(0,200,136,0.55);
-      animation: blink 2.4s ease-in-out infinite;
-    }
-    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.35} }
-    .sb-label { color: var(--text-muted); }
-    .sb-label.on { color: var(--green); }
-    .sb-spacer { flex: 1; }
-    .sb-clock { color: var(--text-dim); font-size: 10px; }
-
-    /* ============================================================
-       LEFT PANEL — 3D VIEWPORT
-    ============================================================ */
-    .left-panel {
-      grid-column: 1;
-      grid-row: 2;
-      position: relative;
-      background: var(--bg-void);
-      border-right: 1px solid var(--border-dim);
-      overflow: hidden;
-      overflow-y: hidden;
-      cursor: grab;
-    }
-    .left-panel:active {
-      cursor: grabbing;
-    }
-    #viewport { display: block; width: 100%; height: 100%; cursor: default; }
-    #viewport.hovering { cursor: pointer; }
-
-    /* Floor label strip (bottom-left overlay) */
-    .floor-strip {
-      position: absolute;
-      left: 18px;
-      bottom: 20px;
-      display: flex;
-      flex-direction: column-reverse;
-      gap: 5px;
-      pointer-events: none;
-    }
-    .fl-item {
-      display: flex;
-      align-items: center;
-      gap: 7px;
-      font-family: var(--font-mono);
-      font-size: 9px;
-      letter-spacing: 0.14em;
-      color: var(--text-dim);
-    }
-    .fl-dot { width: 4px; height: 4px; border-radius: 50%; }
-
-    /* ============================================================
-       RIGHT PANEL — MISSION CONTROL
-    ============================================================ */
-    .right-panel {
-      grid-column: 2;
-      grid-row: 2;
-      display: flex;
-      flex-direction: column;
-      background: var(--bg-base);
-      overflow: hidden;
-    }
-
-    /* Floor header (M2) */
-    .floor-header {
-      padding: 12px 16px;
-      background: linear-gradient(90deg, var(--bg-surface) 0%, rgba(0,0,0,0) 100%);
-      border-bottom: 1px solid var(--border-dim);
-      margin-bottom: 8px;
-    }
-    .floor-title {
-      font-size: 16px;
-      font-weight: 600;
-      letter-spacing: 2px;
-      font-family: var(--font-ui);
-      margin-bottom: 4px;
-      text-transform: uppercase;
-    }
-    .floor-label {
-      font-size: 11px;
-      font-family: var(--font-mono);
-      letter-spacing: 1px;
-      color: var(--text-muted);
-      text-transform: uppercase;
-    }
-
-    /* Floor breadcrumb (M2) */
-    .floor-breadcrumb {
-      display: flex;
-      gap: 8px;
-      justify-content: center;
-      padding: 8px 0;
-      border-bottom: 1px solid var(--border-dim);
-      margin-bottom: 12px;
-    }
-    .crumb {
-      cursor: pointer;
-      font-size: 12px;
-      color: var(--text-muted);
-      transition: color 0.3s;
-    }
-    .crumb:hover {
-      color: var(--text-primary);
-    }
-    .crumb.active {
-      color: var(--cyan);
-      text-shadow: 0 0 8px var(--cyan);
-    }
-
-    /* Tab bar */
-    .tab-bar {
-      display: flex;
-      align-items: stretch;
-      background: var(--bg-void);
-      border-bottom: 1px solid var(--border-dim);
-      flex-shrink: 0;
-    }
-    .tab-btn {
-      padding: 0 14px;
-      height: 38px;
-      font-family: var(--font-ui);
-      font-size: 10px;
-      font-weight: 600;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      background: none;
-      border: none;
-      border-bottom: 2px solid transparent;
-      transition: color 0.18s, border-color 0.18s;
-      white-space: nowrap;
-    }
-    .tab-btn:hover { color: var(--text-muted); }
-    .tab-btn.active { color: var(--cyan); border-bottom-color: var(--cyan); }
-
-    /* Tab pane */
-    .tab-pane {
-      display: none;
-      flex-direction: column;
-      flex: 1;
-      overflow-y: auto;
-      padding: 14px;
-      gap: 12px;
-    }
-    .tab-pane.active { display: flex; }
-    .tab-pane::-webkit-scrollbar { width: 3px; }
-    .tab-pane::-webkit-scrollbar-track { background: transparent; }
-    .tab-pane::-webkit-scrollbar-thumb { background: var(--border-base); border-radius: 2px; }
-
-    /* ============================================================
-       KPI TILES
-    ============================================================ */
-    .kpi-row {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
-      gap: 7px;
-    }
-    .kpi {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-dim);
-      border-radius: 3px;
-      padding: 10px 11px;
-    }
-    .kpi-lbl {
-      font-size: 9px;
-      font-weight: 600;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      margin-bottom: 5px;
-    }
-    .kpi-val {
-      font-family: var(--font-mono);
-      font-size: 19px;
-      font-weight: 400;
-      color: var(--text-primary);
-      line-height: 1;
-    }
-    .kpi-sub {
-      font-family: var(--font-mono);
-      font-size: 10px;
-      color: var(--text-muted);
-      margin-top: 3px;
-    }
-    .pos { color: var(--green) !important; }
-    .neg { color: var(--red) !important; }
-    .neu { color: var(--text-muted) !important; }
-
-    /* ============================================================
-       SECTION HEADER
-    ============================================================ */
-    .sec-hdr {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      padding-bottom: 8px;
-      border-bottom: 1px solid var(--border-dim);
-      margin-bottom: 1px;
-    }
-    .sec-title {
-      font-size: 9px;
-      font-weight: 700;
-      letter-spacing: 0.14em;
-      text-transform: uppercase;
-      color: var(--text-muted);
-    }
-    .sec-badge { font-family: var(--font-mono); font-size: 9px; color: var(--text-dim); }
-
-    /* ============================================================
-       DATA TABLES
-    ============================================================ */
-    .tbl-wrap {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-dim);
-      border-radius: 3px;
-      overflow: hidden;
-    }
-    .dtbl { width: 100%; border-collapse: collapse; }
-    .dtbl thead th {
-      padding: 7px 10px;
-      font-family: var(--font-mono);
-      font-size: 9px;
-      font-weight: 500;
-      letter-spacing: 0.1em;
-      text-transform: uppercase;
-      color: var(--text-dim);
-      background: var(--bg-elevated);
-      border-bottom: 1px solid var(--border-dim);
-      text-align: left;
-      white-space: nowrap;
-    }
-    .dtbl thead th.r { text-align: right; }
-    .dtbl tbody td {
-      padding: 8px 10px;
-      font-family: var(--font-mono);
-      font-size: 11px;
-      color: var(--text-primary);
-      border-bottom: 1px solid var(--border-dim);
-    }
-    .dtbl tbody td.r { text-align: right; }
-    .dtbl tbody tr:last-child td { border-bottom: none; }
-    .dtbl tbody tr:hover td { background: var(--bg-elevated); }
-    .pod-name { font-weight: 600; letter-spacing: 0.06em; }
-
-    /* Badges */
-    .badge {
-      display: inline-block;
-      padding: 2px 7px;
-      border-radius: 2px;
-      font-family: var(--font-mono);
-      font-size: 9px;
-      font-weight: 500;
-      letter-spacing: 0.07em;
-      text-transform: uppercase;
-    }
-    .b-active  { background:rgba(0,200,136,.1);   color:var(--green);      border:1px solid rgba(0,200,136,.25); }
-    .b-halted  { background:rgba(232,64,64,.1);    color:var(--red);        border:1px solid rgba(232,64,64,.25); }
-    .b-idle    { background:rgba(106,144,170,.08); color:var(--text-muted); border:1px solid var(--border-dim); }
-    .b-buy     { background:rgba(0,200,136,.1);   color:var(--green);      border:1px solid rgba(0,200,136,.25); }
-    .b-sell    { background:rgba(232,64,64,.1);    color:var(--red);        border:1px solid rgba(232,64,64,.25); }
-    .b-filled  { background:rgba(0,207,232,.1);    color:var(--cyan);       border:1px solid rgba(0,207,232,.2); }
-    .b-pending { background:rgba(240,160,48,.1);   color:var(--amber);      border:1px solid rgba(240,160,48,.2); }
-    .b-ceo     { background:rgba(232,64,64,.08);   color:var(--red);        border:1px solid rgba(232,64,64,.2); }
-    .b-cio     { background:rgba(0,200,136,.08);   color:var(--green);      border:1px solid rgba(0,200,136,.2); }
-    .b-cro     { background:rgba(240,160,48,.08);  color:var(--amber);      border:1px solid rgba(240,160,48,.2); }
-
-    /* Empty state */
-    .empty { padding: 28px 16px; text-align: center; }
-    .empty-txt  { font-family:var(--font-mono); font-size:11px; color:var(--text-dim); }
-    .empty-hint { font-size:10px; color:var(--text-dim); margin-top:4px; opacity:.6; }
-
-    /* ============================================================
-       CHART WRAPPER
-    ============================================================ */
-    .chart-wrap {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-dim);
-      border-radius: 3px;
-      padding: 12px;
-      height: 175px;
-      position: relative;
-    }
-
-    /* ============================================================
-       RISK ALERT BANNER
-    ============================================================ */
-    .risk-banner { display:none; padding:8px 12px; border-radius:3px; font-size:10px; font-weight:500; margin-bottom:2px; }
-    .risk-banner.critical { display:block; background:rgba(232,64,64,.1);  border:1px solid rgba(232,64,64,.3);  color:var(--red); }
-    .risk-banner.warning  { display:block; background:rgba(240,160,48,.1); border:1px solid rgba(240,160,48,.3); color:var(--amber); }
-    .risk-banner.info     { display:block; background:rgba(0,207,232,.07); border:1px solid rgba(0,207,232,.2);  color:var(--cyan); }
-
-    /* ============================================================
-       GOVERNANCE
-    ============================================================ */
-    .gov-list { display:flex; flex-direction:column; gap:6px; }
-    .gov-card { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:3px; padding:10px 12px; }
-    .gov-card-hdr { display:flex; align-items:center; justify-content:space-between; margin-bottom:5px; }
-    .gov-card-body { font-size:11px; color:var(--text-muted); line-height:1.5; }
-    .gov-card-sub  { font-size:10px; color:var(--text-dim); margin-top:4px; }
-    .gov-time { font-family:var(--font-mono); font-size:9px; color:var(--text-dim); }
-
-    /* ============================================================
-       ALLOCATION GRID
-    ============================================================ */
-    .alloc-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
-    .alloc-tile { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:3px; padding:8px 6px; text-align:center; }
-    .alloc-pod  { font-size:9px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); }
-    .alloc-val  { font-family:var(--font-mono); font-size:14px; color:var(--text-primary); margin-top:3px; }
-  </style>
 </head>
 <body>
 <div class="app">
@@ -432,15 +42,23 @@
   <div class="left-panel" id="left-panel">
     <canvas id="viewport"></canvas>
     <div class="floor-strip" id="floor-strip"></div>
+    <button id="back-to-building" onclick="backToBuilding()">&#9664; BUILDING</button>
+    <div id="agent-tooltip">
+      <div class="tt-name"></div>
+      <div class="tt-strategy"></div>
+      <div class="tt-divider"></div>
+      <div class="tt-stats"></div>
+      <div class="tt-reasoning"></div>
+    </div>
   </div>
 
   <!-- RIGHT PANEL — MISSION CONTROL -->
   <div class="right-panel">
 
-    <!-- FLOOR HEADER + BREADCRUMB (M2) -->
+    <!-- FLOOR HEADER + BREADCRUMB -->
     <div class="floor-header">
-      <div class="floor-title">RISK</div>
-      <div class="floor-label">VAR · LIMITS · STRESS</div>
+      <div class="floor-title">EQUITIES</div>
+      <div class="floor-label">STOCKS · ETFs · SECTORS</div>
     </div>
 
     <div class="floor-breadcrumb">
@@ -449,7 +67,6 @@
       <span class="crumb" onclick="scrollToFloor(2)">○</span>
       <span class="crumb" onclick="scrollToFloor(3)">○</span>
       <span class="crumb" onclick="scrollToFloor(4)">○</span>
-      <span class="crumb" onclick="scrollToFloor(5)">○</span>
     </div>
 
     <nav class="tab-bar">
@@ -458,6 +75,7 @@
       <button class="tab-btn" data-tab="risk">Risk</button>
       <button class="tab-btn" data-tab="execution">Execution</button>
       <button class="tab-btn" data-tab="governance">Governance</button>
+      <button class="tab-btn" data-tab="research">Research</button>
     </nav>
 
     <!-- OPERATIONS -->
@@ -471,7 +89,7 @@
         <div class="kpi">
           <div class="kpi-lbl">Active Pods</div>
           <div class="kpi-val" id="kpi-active">—</div>
-          <div class="kpi-sub">of 5</div>
+          <div class="kpi-sub">of 4</div>
         </div>
         <div class="kpi">
           <div class="kpi-lbl">Positions</div>
@@ -489,13 +107,29 @@
             <thead><tr>
               <th>Pod</th>
               <th class="r">NAV</th>
+              <th class="r">Trend</th>
               <th class="r">Daily P&amp;L</th>
               <th class="r">Status</th>
             </tr></thead>
-            <tbody id="pods-table"><tr><td colspan="4" class="empty">
+            <tbody id="pods-table"><tr><td colspan="5" class="empty">
               <div class="empty-txt">Awaiting data…</div>
               <div class="empty-hint">Start a trading session to see live metrics</div>
             </td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Top Holdings</span>
+          <span class="sec-badge" id="holdings-badge">0 positions</span>
+        </div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th><th>Symbol</th><th class="r">Qty</th>
+              <th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th>
+            </tr></thead>
+            <tbody id="holdings-table"><tr><td colspan="6" class="empty"><div class="empty-txt">No positions yet</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -504,6 +138,7 @@
     <!-- PERFORMANCE -->
     <div class="tab-pane" id="tab-performance">
       <div class="chart-wrap"><canvas id="navChart"></canvas></div>
+      <div class="chart-wrap dd-chart-wrap"><canvas id="ddChart"></canvas></div>
       <div class="kpi-row">
         <div class="kpi"><div class="kpi-lbl">Sharpe</div><div class="kpi-val" id="m-sharpe">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Volatility</div><div class="kpi-val" id="m-vol">—</div></div>
@@ -529,7 +164,8 @@
       <div class="kpi-row">
         <div class="kpi"><div class="kpi-lbl">VaR 95%</div><div class="kpi-val" id="kpi-var">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Leverage</div><div class="kpi-val" id="kpi-lev">—</div></div>
-        <div class="kpi"><div class="kpi-lbl">Conc.</div><div class="kpi-val" id="kpi-conc">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Drawdown</div><div class="kpi-val" id="kpi-dd">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Volatility</div><div class="kpi-val" id="kpi-vol">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Alerts</div><div class="kpi-val" id="kpi-alerts">0</div></div>
       </div>
       <div>
@@ -537,9 +173,9 @@
         <div class="tbl-wrap">
           <table class="dtbl">
             <thead><tr>
-              <th>Pod</th><th class="r">VaR</th><th class="r">Positions</th><th class="r">Status</th>
+              <th>Pod</th><th class="r">VaR 95%</th><th class="r">Leverage</th><th class="r">Drawdown</th><th class="r">Positions</th><th class="r">Status</th>
             </tr></thead>
-            <tbody id="risk-table"><tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+            <tbody id="risk-table"><tr><td colspan="6" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -583,1019 +219,303 @@
           </div>
         </div>
       </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Decision Timeline</span>
+          <span class="sec-badge" id="timeline-badge">0 events</span>
+        </div>
+        <div id="decision-timeline" class="decision-timeline">
+          <div class="empty">
+            <div class="empty-txt">Waiting for agent decisions…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RESEARCH -->
+    <div class="tab-pane" id="tab-research">
+      <div class="kpi-row" id="research-kpi">
+        <div class="kpi">
+          <div class="kpi-lbl">MARKETS</div>
+          <div class="kpi-val" id="kpi-market-count">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-lbl">AVG PROB</div>
+          <div class="kpi-val" id="kpi-avg-prob">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-lbl">MACRO CONF</div>
+          <div class="kpi-val" id="kpi-macro-conf">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-lbl">SENTIMENT</div>
+          <div class="kpi-val" id="kpi-macro-score">—</div>
+        </div>
+        <div class="kpi">
+          <div class="kpi-lbl">VIX</div>
+          <div class="kpi-val" id="kpi-vix">—</div>
+        </div>
+      </div>
+
+      <div class="sub-tab-bar">
+        <button class="sub-tab-btn active" data-subtab="current">Current</button>
+        <button class="sub-tab-btn" data-subtab="historical">Historical</button>
+        <button class="sub-tab-btn" data-subtab="contributing">Contributing</button>
+        <button class="sub-tab-btn" data-subtab="macro">Macro Indicators</button>
+        <button class="sub-tab-btn" data-subtab="social">News Feed <span id="social-badge" style="font-size:9px;color:var(--cyan);margin-left:3px;"></span></button>
+      </div>
+
+      <!-- Sub-tab: Current Markets -->
+      <div class="sub-tab-pane active" id="subtab-current">
+        <div class="research-header" id="current-header">
+          POLYMARKET SNAPSHOT · <span id="market-count">0</span> MARKETS
+          · Last fetch: <span id="last-fetch-time" class="mono">—</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="current-markets-table">
+            <thead>
+              <tr>
+                <th>Question</th>
+                <th class="num">Status</th>
+                <th class="num">Yes</th>
+                <th class="num">No</th>
+                <th class="num accent">Prob</th>
+                <th class="num">Delta</th>
+                <th class="num">24h Vol</th>
+                <th class="num">End Date</th>
+              </tr>
+            </thead>
+            <tbody id="current-markets-body">
+              <tr class="empty-row"><td colspan="8">No Polymarket data — check POLYMARKET_API_KEY in .env</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Sub-tab: Historical -->
+      <div class="sub-tab-pane" id="subtab-historical">
+        <div class="research-header">IMPLIED PROBABILITY TRENDS · Rolling 7-Day View (4h intervals) · <span id="history-data-count" style="color:var(--cyan);">0</span> data points stored</div>
+        <div class="chart-wrap" style="height:280px;">
+          <canvas id="research-history-chart"></canvas>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table" id="history-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Market</th>
+                <th class="num accent">Implied Prob</th>
+              </tr>
+            </thead>
+            <tbody id="history-body">
+              <tr class="empty-row"><td colspan="3">No history yet — waiting for first cycle</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Sub-tab: Contributing -->
+      <div class="sub-tab-pane" id="subtab-contributing">
+        <div class="research-header">MACRO SCORE — CROSS-POD RESEARCH SIGNALS</div>
+
+        <div style="padding:10px 14px; background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:4px; margin-bottom:8px; font-size:11px; line-height:1.6; color:var(--text-muted);">
+          <div style="font-weight:600; color:var(--text-primary); font-size:10px; letter-spacing:1px; text-transform:uppercase; margin-bottom:6px;">How this works</div>
+          All pods blend three independent macro signals into a single <span style="color:var(--cyan)">macro score</span>:
+          <br>
+          <b style="color:var(--text-primary)">1. Polymarket Sentiment (50%)</b> — volume-weighted confidence from prediction markets, scaled to [-1, +1].
+          <br>
+          <b style="color:var(--text-primary)">2. FRED Score (30%)</b> — composite of yield curve slope, VIX stress, and credit spread from the Federal Reserve.
+          <br>
+          <b style="color:var(--text-primary)">3. News Score (20%)</b> — average sentiment from macro news RSS feeds across all asset classes (Yahoo Finance, CNBC, Bloomberg, WSJ, ForexLive, CoinDesk, Kitco, etc.).
+          <br><br>
+          <span style="color:var(--text-primary); font-family:var(--font-mono); font-size:10px;">
+            macro_score = 0.5 × poly_sentiment + 0.3 × fred_score + 0.2 × news_score
+          </span>
+          <br><br>
+          <span style="color:var(--green)">Score &gt; 0</span> = risk-on environment.
+          <span style="color:var(--amber)">Near 0</span> = uncertainty.
+          <span style="color:var(--red)">Score &lt; 0</span> = risk-off.
+        </div>
+
+        <div class="signal-composition" id="signal-composition">
+          <div class="sc-source">
+            <div class="sc-label">Polymarket Sentiment</div>
+            <div class="sc-val" id="sc-poly-val">—</div>
+            <div class="sc-weight">50% weight</div>
+          </div>
+          <div class="sc-arrow">+</div>
+          <div class="sc-source">
+            <div class="sc-label">FRED Score</div>
+            <div class="sc-val" id="sc-fred-val">—</div>
+            <div class="sc-weight">30% weight</div>
+          </div>
+          <div class="sc-arrow">+</div>
+          <div class="sc-source">
+            <div class="sc-label">News Score</div>
+            <div class="sc-val" id="sc-social-val">—</div>
+            <div class="sc-weight">20% weight</div>
+          </div>
+          <div class="sc-arrow">→</div>
+          <div class="sc-result">
+            <div class="sc-label">Blended Macro Score</div>
+            <div class="sc-val" id="sc-blend-val">—</div>
+          </div>
+        </div>
+
+        <div class="calc-display" id="calc-display">
+          <span class="calc-label">confidence</span>
+          <span class="calc-val cyan" id="calc-confidence">—</span>
+          <span class="calc-op">→</span>
+          <span class="calc-label">sentiment</span>
+          <span class="calc-val green" id="calc-result">—</span>
+          <span class="calc-op">|</span>
+          <span class="calc-label">markets</span>
+          <span class="calc-val" id="calc-market-ct">—</span>
+          <span class="calc-op">|</span>
+          <span class="calc-label">total vol</span>
+          <span class="calc-val" id="calc-total-vol">—</span>
+        </div>
+
+        <div class="table-wrap">
+          <table class="data-table" id="contributors-table">
+            <thead>
+              <tr>
+                <th>Market Question</th>
+                <th class="num accent">Prob</th>
+                <th class="num">24h Vol</th>
+                <th class="num">Weight</th>
+                <th>Contribution</th>
+              </tr>
+            </thead>
+            <tbody id="contributors-body">
+              <tr class="empty-row"><td colspan="5">No Polymarket signals this cycle — macro_confidence defaulted to 0.50</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="calc-footer" id="calc-footer">
+          Volume-weighted average of <span id="contrib-count">0</span> markets = <span id="contrib-avg" class="cyan">—</span> confidence → <span id="contrib-sentiment">—</span> sentiment
+        </div>
+      </div>
+
+      <!-- Sub-tab: Macro Indicators -->
+      <div class="sub-tab-pane" id="subtab-macro">
+        <div class="research-header" id="macro-header">
+          FRED MACRO INDICATORS · Last update: <span id="fred-update-time" class="mono">—</span>
+        </div>
+
+        <div class="indicator-grid" id="indicator-grid">
+
+          <div class="indicator-section-label">Rates &amp; Yields</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">FED FUNDS RATE</span><span class="ic-dot neutral" id="dot-DFF"></span></div><div class="ic-value" id="val-DFF">—</div><div class="ic-unit">Effective Rate % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">2Y TREASURY</span><span class="ic-dot neutral" id="dot-DGS2"></span></div><div class="ic-value" id="val-DGS2">—</div><div class="ic-unit">2-Year Yield % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">10Y TREASURY</span><span class="ic-dot neutral" id="dot-DGS10"></span></div><div class="ic-value" id="val-DGS10">—</div><div class="ic-unit">10-Year Yield % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">30Y TREASURY</span><span class="ic-dot neutral" id="dot-DGS30"></span></div><div class="ic-value" id="val-DGS30">—</div><div class="ic-unit">30-Year Yield % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">YIELD CURVE 10Y-2Y</span><span class="ic-dot neutral" id="dot-T10Y2Y"></span></div><div class="ic-value" id="val-T10Y2Y">—</div><div class="ic-unit">Spread % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">YIELD CURVE 10Y-3M</span><span class="ic-dot neutral" id="dot-T10Y3M"></span></div><div class="ic-value" id="val-T10Y3M">—</div><div class="ic-unit">Recession predictor · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">30Y MORTGAGE</span><span class="ic-dot neutral" id="dot-MORTGAGE30US"></span></div><div class="ic-value" id="val-MORTGAGE30US">—</div><div class="ic-unit">Fixed Rate % · weekly</div></div>
+
+          <div class="indicator-section-label">Inflation</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">5Y BREAKEVEN</span><span class="ic-dot neutral" id="dot-T5YIE"></span></div><div class="ic-value" id="val-T5YIE">—</div><div class="ic-unit">Inflation Expectations % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">10Y BREAKEVEN</span><span class="ic-dot neutral" id="dot-T10YIE"></span></div><div class="ic-value" id="val-T10YIE">—</div><div class="ic-unit">Inflation Expectations % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">CPI</span><span class="ic-dot neutral" id="dot-CPIAUCSL"></span></div><div class="ic-value" id="val-CPIAUCSL">—</div><div class="ic-unit">All Urban Consumers Index · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">CORE PCE</span><span class="ic-dot neutral" id="dot-PCEPILFE"></span></div><div class="ic-value" id="val-PCEPILFE">—</div><div class="ic-unit">Fed's preferred gauge · monthly</div></div>
+
+          <div class="indicator-section-label">Volatility &amp; Risk</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">CBOE VIX</span><span class="ic-dot neutral" id="dot-VIXCLS"></span></div><div class="ic-value" id="val-VIXCLS">—</div><div class="ic-unit">Volatility Index · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">HY CREDIT SPREAD</span><span class="ic-dot neutral" id="dot-BAMLH0A0HYM2"></span></div><div class="ic-value" id="val-BAMLH0A0HYM2">—</div><div class="ic-unit">ICE BofA OAS % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">NFCI</span><span class="ic-dot neutral" id="dot-NFCI"></span></div><div class="ic-value" id="val-NFCI">—</div><div class="ic-unit">Chicago Fed Financial Conditions · weekly</div></div>
+
+          <div class="indicator-section-label">Labor Market</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">UNEMPLOYMENT</span><span class="ic-dot neutral" id="dot-UNRATE"></span></div><div class="ic-value" id="val-UNRATE">—</div><div class="ic-unit">U-3 Rate % · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">INITIAL CLAIMS</span><span class="ic-dot neutral" id="dot-ICSA"></span></div><div class="ic-value" id="val-ICSA">—</div><div class="ic-unit">Weekly Jobless Claims · weekly</div></div>
+
+          <div class="indicator-section-label">Growth &amp; Activity</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">INDUSTRIAL PROD</span><span class="ic-dot neutral" id="dot-INDPRO"></span></div><div class="ic-value" id="val-INDPRO">—</div><div class="ic-unit">Index (2017=100) · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">RETAIL SALES</span><span class="ic-dot neutral" id="dot-RSAFS"></span></div><div class="ic-value" id="val-RSAFS">—</div><div class="ic-unit">Advance $M · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">CONSUMER SENTIMENT</span><span class="ic-dot neutral" id="dot-UMCSENT"></span></div><div class="ic-value" id="val-UMCSENT">—</div><div class="ic-unit">UMich Index · monthly</div></div>
+
+          <div class="indicator-section-label">Commodities &amp; FX</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">WTI CRUDE OIL</span><span class="ic-dot neutral" id="dot-DCOILWTICO"></span></div><div class="ic-value" id="val-DCOILWTICO">—</div><div class="ic-unit">$/barrel · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">USD INDEX</span><span class="ic-dot neutral" id="dot-DTWEXBGS"></span></div><div class="ic-value" id="val-DTWEXBGS">—</div><div class="ic-unit">Trade-Weighted Broad · daily</div></div>
+
+          <div class="indicator-section-label">Liquidity</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">M2 MONEY SUPPLY</span><span class="ic-dot neutral" id="dot-M2SL"></span></div><div class="ic-value" id="val-M2SL">—</div><div class="ic-unit">$B · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">FED BALANCE SHEET</span><span class="ic-dot neutral" id="dot-WALCL"></span></div><div class="ic-value" id="val-WALCL">—</div><div class="ic-unit">Total Assets $M · weekly</div></div>
+        </div>
+
+        <div class="fred-composite" id="fred-composite">
+          <div class="fc-header">
+            <span class="fc-label">FRED Composite Score</span>
+            <span class="fc-value" id="fc-score-val">—</span>
+          </div>
+          <div class="gauge-track">
+            <div class="gauge-fill" id="gauge-fill" style="left:50%;width:0%;background:var(--text-dim);"></div>
+            <div class="gauge-marker" id="gauge-marker" style="left:50%;"></div>
+          </div>
+          <div class="gauge-labels">
+            <span>-1.0 Risk-Off</span>
+            <span>0 Neutral</span>
+            <span>+1.0 Risk-On</span>
+          </div>
+        </div>
+
+        <div style="padding:8px 14px; font-size:10px; color:var(--text-dim); font-family:var(--font-mono); line-height:1.6;">
+          23 series across rates, inflation, volatility, labor, growth, commodities, and liquidity.
+          Composite score derived from yield curve (T10Y2Y), VIX (VIXCLS), and credit spread (BAMLH0A0HYM2).
+          Cached hourly. Score carries 30% weight in the blended macro_score.
+        </div>
+      </div>
+
+      <!-- Sub-tab: News Feed -->
+      <div class="sub-tab-pane" id="subtab-social">
+        <div class="social-header-bar">
+          <div class="social-kpi">
+            <span class="sk-label">Sentiment</span>
+            <span class="sk-val" id="social-sentiment-val" style="color:var(--text-dim);">—</span>
+          </div>
+          <div class="social-kpi">
+            <span class="sk-label">Headlines</span>
+            <span class="sk-val" id="social-tweet-count" style="color:var(--text-primary);">0</span>
+          </div>
+          <div class="social-kpi">
+            <span class="sk-label">Sources</span>
+            <span class="sk-val" id="social-sources-count" style="color:var(--text-primary);">0/25</span>
+          </div>
+          <div class="social-kpi" style="margin-left:auto;">
+            <span class="sk-label">Last Refresh</span>
+            <span class="sk-val" id="social-last-refresh" style="font-size:10px;color:var(--text-dim);">—</span>
+          </div>
+        </div>
+
+        <div class="social-feed-container" id="social-feed-container">
+          <div class="social-empty" id="social-empty-state">
+            <div style="font-size:18px;">Macro News Feed</div>
+            <div>Waiting for RSS data...</div>
+            <div style="font-size:9px;margin-top:4px;">25 news sources across all asset classes · Refreshes every 5 min · Showing latest 100</div>
+          </div>
+        </div>
+
+        <div class="social-footer">
+          25 RSS sources: Macro (Yahoo, CNBC, Bloomberg, WSJ, FT, Reuters, ZeroHedge) · FX (ForexLive, DailyFX) · Crypto (CoinDesk, CoinTelegraph, The Block, Decrypt) · Commodities (OilPrice, Kitco, Gold & Energy news) · Central Banks & Geopolitics · Full history stored for agents · Dashboard shows latest 100
+        </div>
+      </div>
+
+    </div>
+
+    <!-- INTELLIGENCE FEED -->
+    <div id="activity-feed">
+      <div class="feed-header">INTELLIGENCE FEED</div>
+      <div id="feed-list">
+        <div class="feed-empty">Waiting for agent activity&hellip;</div>
+      </div>
     </div>
 
   </div><!-- /right-panel -->
 </div><!-- /app -->
 
-<script>
-'use strict';
-
-// ================================================================
-//  CLOCK
-// ================================================================
-function tick() {
-  document.getElementById('clock').textContent =
-    new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
-}
-tick(); setInterval(tick, 1000);
-
-// ================================================================
-//  DATA GLOBALS
-// ================================================================
-const WS_URL = `ws://${window.location.host}/ws`;
-let ws = null;
-let pods                = {};
-let trades              = [];
-let navHistory          = [];
-let riskAlerts          = [];
-let executedTrades      = [];
-let governanceDecisions = [];
-let navChart            = null;
-const MAX_HISTORY       = 100;
-let iterCount           = 0;
-
-// Three.js animation state
-const floorAnimState = {};
-let govLightLines    = [];   // tubes to fade out each frame
-
-// M2: Scroll traversal state
-let currentFloor = 0;
-let isScrolling = false;
-let scrollTimeout = null;
-
-// M3: Hover/click state
-let hoveredFloor = null;
-let lastHoveredFloor = null;
-
-// ================================================================
-//  THREE.JS SCENE
-// ================================================================
-const canvas   = document.getElementById('viewport');
-const scene    = new THREE.Scene();
-scene.fog      = new THREE.FogExp2(0x070b0e, 0.010);
-scene.background = new THREE.Color(0x070b0e);
-
-const camera   = new THREE.PerspectiveCamera(50, 1, 0.1, 300);
-camera.position.set(0, 5, 34);
-camera.lookAt(0, 5, 0);
-
-const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-renderer.shadowMap.enabled   = true;
-renderer.shadowMap.type      = THREE.PCFSoftShadowMap;
-renderer.toneMapping         = THREE.ACESFilmicToneMapping;
-renderer.toneMappingExposure = 0.82;
-
-// M3: Raycaster for hover/click detection
-const raycaster = new THREE.Raycaster();
-const mouse = new THREE.Vector2();
-
-function onResize() {
-  const lp = document.getElementById('left-panel');
-  const w = lp.clientWidth, h = lp.clientHeight;
-  renderer.setSize(w, h);
-  camera.aspect = w / h;
-  camera.updateProjectionMatrix();
-}
-window.addEventListener('resize', onResize);
-onResize();
-
-// ================================================================
-//  LIGHTING
-// ================================================================
-scene.add(new THREE.AmbientLight(0x0a1520, 1.0));
-
-const sun = new THREE.DirectionalLight(0xd0e8ff, 0.55);
-sun.position.set(10, 24, 14);
-sun.castShadow = true;
-sun.shadow.mapSize.width = sun.shadow.mapSize.height = 1024;
-scene.add(sun);
-
-const fill = new THREE.DirectionalLight(0x002244, 0.25);
-fill.position.set(-6, -4, 18);
-scene.add(fill);
-
-// ================================================================
-//  FLOOR DEFINITIONS
-// ================================================================
-const FLOOR_H = 3.6;
-const FLOOR_W = 13;
-const FLOOR_D = 7;
-const SLAB_T  = 0.08;
-
-const FLOORS = [
-  { id:'risk',       name:'RISK',       y: -9, accent:0xe84040, hex:'#e84040', label:'VAR · LIMITS · STRESS',    screens:3 },
-  { id:'execution',  name:'EXECUTION',  y: -4, accent:0x00cfe8, hex:'#00cfe8', label:'ORDERS · FILLS · LATENCY', screens:3 },
-  { id:'research',   name:'RESEARCH',   y:  1, accent:0x00c888, hex:'#00c888', label:'SIGNALS · ALPHA · MODELS', screens:2 },
-  { id:'ai_systems', name:'AI SYSTEMS', y:  6, accent:0x7c5cfc, hex:'#7c5cfc', label:'CEO · CIO · CRO',          screens:3 },
-  { id:'treasury',   name:'TREASURY',   y: 11, accent:0xf0a030, hex:'#f0a030', label:'CAPITAL · FLOW · ALLOC',   screens:2 },
-  { id:'governance', name:'GOVERNANCE', y: 16, accent:0xd0e4f0, hex:'#d0e4f0', label:'APPROVALS · AUDIT · CTRL', screens:2 },
-];
-
-// ================================================================
-//  SHARED BASE MATERIALS
-// ================================================================
-const matSlab = new THREE.MeshStandardMaterial({ color:0x121e2a, metalness:0.88, roughness:0.18 });
-const matWall = new THREE.MeshStandardMaterial({ color:0x0d1820, metalness:0.55, roughness:0.52 });
-const matCol  = new THREE.MeshStandardMaterial({ color:0x0a1420, metalness:0.82, roughness:0.28 });
-const matDesk = new THREE.MeshStandardMaterial({ color:0x0e1a26, metalness:0.65, roughness:0.42 });
-
-// ================================================================
-//  M4: POD STATUS MATERIALS
-// ================================================================
-const podStatusMaterials = {
-  ACTIVE: new THREE.MeshStandardMaterial({
-    color:             0x00c888,
-    metalness:         0.7,
-    roughness:         0.3,
-    emissive:          0x003322,
-    emissiveIntensity: 0.2,
-  }),
-  HALTED: new THREE.MeshStandardMaterial({
-    color:             0xf0a030,
-    metalness:         0.7,
-    roughness:         0.3,
-    emissive:          0x664400,
-    emissiveIntensity: 0.15,
-  }),
-  IDLE: new THREE.MeshStandardMaterial({
-    color:             0x555555,
-    metalness:         0.7,
-    roughness:         0.3,
-    emissive:          0x222222,
-    emissiveIntensity: 0.1,
-  }),
-};
-
-// Pod-to-floor mapping
-const podFloorMap = { alpha: 0, beta: 2, gamma: 1, delta: 3, epsilon: 4 };
-
-// ================================================================
-//  BUILD FLOOR (cross-section dollhouse view)
-// ================================================================
-function buildFloor(fd, idx) {
-  const g = new THREE.Group();
-  g.userData = { floorIndex: idx };
-  const acc = fd.accent;
-  const screenMats = [];
-
-  // Slab
-  const slab = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W, SLAB_T, FLOOR_D + 0.4), matSlab.clone());
-  slab.receiveShadow = true;
-  g.add(slab);
-
-  // Emissive trim strip at floor level
-  const trimMat = new THREE.MeshStandardMaterial({
-    color: 0x000000, emissive: new THREE.Color(acc), emissiveIntensity: 0.32,
-  });
-  const trim = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W + 0.08, 0.045, FLOOR_D + 0.5), trimMat);
-  trim.position.y = -(SLAB_T * 0.5 + 0.015);
-  g.add(trim);
-
-  // Rear wall
-  const rear = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W, FLOOR_H, 0.1), matWall.clone());
-  rear.position.set(0, FLOOR_H * 0.5, -(FLOOR_D * 0.5));
-  rear.castShadow = rear.receiveShadow = true;
-  g.add(rear);
-
-  // Side walls
-  const sideGeo = new THREE.BoxGeometry(0.1, FLOOR_H, FLOOR_D);
-  [-FLOOR_W * 0.5, FLOOR_W * 0.5].forEach(x => {
-    const s = new THREE.Mesh(sideGeo, matWall.clone());
-    s.position.set(x, FLOOR_H * 0.5, 0);
-    g.add(s);
-  });
-
-  // Columns
-  const colGeo = new THREE.BoxGeometry(0.22, FLOOR_H, 0.22);
-  [[-FLOOR_W*0.5+0.28, -FLOOR_D*0.47],
-   [ FLOOR_W*0.5-0.28, -FLOOR_D*0.47],
-   [-FLOOR_W*0.5+0.28,  FLOOR_D*0.22],
-   [ FLOOR_W*0.5-0.28,  FLOOR_D*0.22]].forEach(([cx, cz]) => {
-    const c = new THREE.Mesh(colGeo, matCol.clone());
-    c.position.set(cx, FLOOR_H * 0.5, cz);
-    c.castShadow = true;
-    g.add(c);
-  });
-
-  // Glass front panel
-  const glassMat = new THREE.MeshStandardMaterial({
-    color: 0x1a3852, transparent: true, opacity: 0.11,
-    roughness: 0.0, metalness: 0.96, side: THREE.DoubleSide,
-  });
-  const glass = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W - 0.35, FLOOR_H - 0.08, 0.04), glassMat);
-  glass.position.set(0, FLOOR_H * 0.5, FLOOR_D * 0.5);
-  g.add(glass);
-
-  // Screens on rear wall
-  const sw = 2.15, sh = 1.22;
-  const ncols   = fd.screens;
-  const spacing = (FLOOR_W - 1.5) / ncols;
-  for (let s = 0; s < ncols; s++) {
-    const sm = new THREE.MeshStandardMaterial({
-      color: 0x010508, emissive: new THREE.Color(acc), emissiveIntensity: 0.52,
-    });
-    screenMats.push(sm);
-    const screen = new THREE.Mesh(new THREE.BoxGeometry(sw, sh, 0.03), sm);
-    const sx = -FLOOR_W * 0.5 + 0.75 + spacing * (s + 0.5);
-    screen.position.set(sx, FLOOR_H * 0.65, -(FLOOR_D * 0.5) + 0.12);
-    g.add(screen);
-    // Screen border frame
-    const frameMat = new THREE.MeshStandardMaterial({
-      color: new THREE.Color(acc), emissive: new THREE.Color(acc), emissiveIntensity: 0.12,
-    });
-    const fr = new THREE.Mesh(new THREE.BoxGeometry(sw + 0.09, sh + 0.07, 0.02), frameMat);
-    fr.position.copy(screen.position);
-    fr.position.z -= 0.01;
-    g.add(fr);
-  }
-
-  // Desk strip
-  const desk = new THREE.Mesh(new THREE.BoxGeometry(FLOOR_W * 0.72, 0.07, 1.6), matDesk.clone());
-  desk.position.set(0, 0.88, -0.4);
-  desk.castShadow = true;
-  g.add(desk);
-
-  // Terminal monitors on desk
-  const termGeo = new THREE.BoxGeometry(0.38, 0.28, 0.22);
-  const termMat = new THREE.MeshStandardMaterial({
-    color: 0x060d13, emissive: new THREE.Color(acc), emissiveIntensity: 0.18,
-  });
-  [-2.8, -1.2, 1.2, 2.8].slice(0, Math.min(ncols + 1, 4)).forEach(tx => {
-    const t = new THREE.Mesh(termGeo, termMat.clone());
-    t.position.set(tx, 1.05, -0.4);
-    g.add(t);
-  });
-
-  // Per-floor point light
-  const pt = new THREE.PointLight(acc, 1.3, 8.5, 2.0);
-  pt.position.set(0, FLOOR_H * 0.65, 0);
-  g.add(pt);
-
-  // M4: Create pod silhouettes on this floor
-  const podSilhouettes = {};
-  const podsOnFloor = Object.entries(podFloorMap)
-    .filter(([_, floorIdx]) => floorIdx === idx)
-    .map(([podId]) => podId);
-
-  podsOnFloor.forEach((podId, i) => {
-    const xPos = -2.5 + (i * 5 / Math.max(1, podsOnFloor.length - 1));
-    const capsuleGeo = new THREE.CylinderGeometry(0.15, 0.12, 1.2, 8);
-    const capsuleMat = podStatusMaterials.ACTIVE.clone();
-    const silhouette = new THREE.Mesh(capsuleGeo, capsuleMat);
-
-    silhouette.position.set(xPos, fd.y, 0);
-    silhouette.userData = {
-      podId,
-      floorIndex: idx,
-      baseY: fd.y,
-      status: 'ACTIVE',
-    };
-
-    g.add(silhouette);
-    podSilhouettes[podId] = silhouette;
-  });
-
-  // Store for animation
-  floorAnimState[idx] = {
-    screens:            screenMats,
-    trimMat:            trimMat,
-    pointLight:         pt,
-    baseEmissive:       0.52,
-    baseTrimEmissive:   0.32,
-    baseLightInt:       1.3,
-    hoverGlowIntensity: 0.52,  // M3: hover glow intensity
-    hovering:           false,  // M3: is floor currently hovered
-    podSilhouettes:     podSilhouettes,  // M4: pod meshes on this floor
-  };
-
-  g.position.y = fd.y + SLAB_T * 0.5;
-  return g;
-}
-
-// Build all 6 floors
-FLOORS.forEach((fd, i) => scene.add(buildFloor(fd, i)));
-
-// ================================================================
-//  BUILDING EXTERIOR WIREFRAME
-// ================================================================
-const extGeo   = new THREE.BoxGeometry(FLOOR_W + 0.55, 30.5, FLOOR_D + 0.55);
-const extEdges = new THREE.EdgesGeometry(extGeo);
-const extFrame = new THREE.LineSegments(
-  extEdges,
-  new THREE.LineBasicMaterial({ color:0x1a3550, transparent:true, opacity:0.32 })
-);
-extFrame.position.set(0, 5, 0);
-scene.add(extFrame);
-
-// ================================================================
-//  FLOOR LABELS (HTML OVERLAY)
-// ================================================================
-const strip = document.getElementById('floor-strip');
-FLOORS.forEach(fd => {
-  const el = document.createElement('div');
-  el.className = 'fl-item';
-  el.innerHTML = `<div class="fl-dot" style="background:${fd.hex};opacity:.5"></div><span>${fd.name}</span>`;
-  strip.appendChild(el);
-});
-
-// ================================================================
-//  M2: SCROLL TRAVERSAL FUNCTIONS
-// ================================================================
-function animateCameraToFloor(floorIdx) {
-  const floor = FLOORS[floorIdx];
-  const targetY = floor.y + 5;
-
-  // Zoom based on floor: higher floors zoom in, lower floors zoom out
-  // Risk (y=-9) → z=38 (far), Governance (y=16) → z=24 (close)
-  const zoomFactor = 1 - (floor.y + 9) / 25 * 0.37;  // Maps -9 to 16 → 1.0 to 0.63
-  const targetZ = 34 * zoomFactor;
-
-  gsap.killTweensOf(camera.position);
-  gsap.to(camera.position, {
-    y: targetY,
-    z: targetZ,
-    duration: 1.0,
-    ease: 'power2.inOut',
-    overwrite: 'auto',
-  });
-}
-
-function updateFloorContext(floorIdx) {
-  const floor = FLOORS[floorIdx];
-
-  // Update floor header
-  const floorHeader = document.querySelector('.floor-header');
-  floorHeader.innerHTML = `
-    <div class="floor-title" style="color: ${floor.hex}">
-      ${floor.name}
-    </div>
-    <div class="floor-label">${floor.label}</div>
-  `;
-
-  // Update breadcrumb
-  const breadcrumb = document.querySelector('.floor-breadcrumb');
-  breadcrumb.innerHTML = Array.from({length: 6}, (_, i) =>
-    `<span class="crumb ${i === floorIdx ? 'active' : ''}" onclick="scrollToFloor(${i})">●</span>`
-  ).join('');
-
-  // Update floor labels in left panel
-  document.querySelectorAll('.floor-label-item').forEach((el, i) => {
-    el.classList.toggle('active', i === floorIdx);
-  });
-}
-
-function scrollToFloor(floorIdx) {
-  if (isScrolling || floorIdx === currentFloor) return;
-  currentFloor = floorIdx;
-  animateCameraToFloor(currentFloor);
-  updateFloorContext(currentFloor);
-  isScrolling = true;
-  setTimeout(() => { isScrolling = false; }, 200);
-}
-
-// ================================================================
-//  M4: POD SILHOUETTE FUNCTIONS
-// ================================================================
-function hashPodId(podId) {
-  // Simple deterministic hash: sum ASCII values mod 2π
-  let hash = 0;
-  for (let i = 0; i < podId.length; i++) {
-    hash += podId.charCodeAt(i);
-  }
-  return (hash % 628) / 100;  // maps to 0-2π
-}
-
-function findPodById(podId) {
-  // Search through all floors for the pod
-  for (const st of Object.values(floorAnimState)) {
-    if (st && st.podSilhouettes && st.podSilhouettes[podId]) {
-      return st.podSilhouettes[podId];
-    }
-  }
-  return null;
-}
-
-function updatePodSilhouetteColor(podId, status) {
-  const pod = findPodById(podId);
-  if (!pod) return;
-
-  const newMaterial = podStatusMaterials[status];
-  if (!newMaterial) return;
-
-  // Transition color over 0.5s
-  const oldColor = new THREE.Color(pod.material.color);
-  const newColor = new THREE.Color(newMaterial.color);
-
-  gsap.to(oldColor, {
-    r: newColor.r,
-    g: newColor.g,
-    b: newColor.b,
-    duration: 0.5,
-    onUpdate: () => {
-      pod.material.color.copy(oldColor);
-    },
-  });
-
-  // Update emissive intensity
-  gsap.to(pod.material, {
-    emissiveIntensity: newMaterial.emissiveIntensity,
-    duration: 0.5,
-  });
-}
-
-function triggerPodHeartbeat(podId) {
-  const pod = findPodById(podId);
-  if (!pod) return;
-
-  const state = { emissiveIntensity: pod.material.emissiveIntensity };
-  gsap.killTweensOf(state);
-  gsap.to(state, {
-    emissiveIntensity: 0.8,
-    duration: 0.3,
-    ease: 'power2.out',
-    onUpdate: () => {
-      pod.material.emissiveIntensity = state.emissiveIntensity;
-    },
-  });
-
-  gsap.to(state, {
-    emissiveIntensity: pod.material.emissiveIntensity * 0.4,
-    duration: 0.3,
-    delay: 0.3,
-    ease: 'power2.in',
-    onUpdate: () => {
-      pod.material.emissiveIntensity = state.emissiveIntensity;
-    },
-  });
-}
-
-// ================================================================
-//  ANIMATION LOOP
-// ================================================================
-const clock = new THREE.Clock();
-
-function animate() {
-  requestAnimationFrame(animate);
-  const t = clock.getElapsedTime();
-
-  // Idle camera micro-drift
-  camera.position.x = Math.sin(t * 0.11) * 0.38;
-  camera.position.y = 5 + Math.sin(t * 0.07) * 0.18;
-  camera.lookAt(camera.position.x * 0.25, 5, 0);
-
-  // M4: Pod Y-bob animation with per-pod phase offset
-  const bobFrequency = 1.2;  // Hz
-  const bobAmplitude = 0.15;  // units
-  Object.values(floorAnimState).forEach(st => {
-    if (st && st.podSilhouettes) {
-      Object.entries(st.podSilhouettes).forEach(([podId, pod]) => {
-        const phase = hashPodId(podId);
-        const offset = Math.sin(t * bobFrequency + phase) * bobAmplitude;
-        pod.position.y = pod.userData.baseY + offset;
-      });
-    }
-  });
-
-  // Fade and dispose governance light tubes
-  govLightLines = govLightLines.filter(obj => {
-    obj.material.opacity -= 0.007;
-    if (obj.material.opacity <= 0) {
-      scene.remove(obj);
-      obj.geometry.dispose();
-      obj.material.dispose();
-      return false;
-    }
-    return true;
-  });
-
-  renderer.render(scene, camera);
-}
-animate();
-
-// ================================================================
-//  M3: HOVER GLOW ANIMATION & RAYCASTER
-// ================================================================
-function addFloorHoverGlow(floorIdx) {
-  const st = floorAnimState[floorIdx];
-  if (!st) return;
-  st.hovering = true;
-
-  gsap.killTweensOf(st);
-  gsap.to(st, {
-    hoverGlowIntensity: 1.2,
-    duration: 0.15,
-    ease: 'power2.out',
-    onUpdate: () => {
-      st.screens.forEach(m => {
-        m.emissiveIntensity = st.hoverGlowIntensity;
-      });
-    },
-  });
-}
-
-function removeFloorHoverGlow(floorIdx) {
-  const st = floorAnimState[floorIdx];
-  if (!st) return;
-  st.hovering = false;
-
-  gsap.killTweensOf(st);
-  gsap.to(st, {
-    hoverGlowIntensity: 0.52,
-    duration: 0.25,
-    ease: 'power2.in',
-    onUpdate: () => {
-      st.screens.forEach(m => {
-        m.emissiveIntensity = st.hoverGlowIntensity;
-      });
-    },
-  });
-}
-
-function createDataRoute(srcFloorIdx, dstFloorIdx, color) {
-  const srcFloor = FLOORS[srcFloorIdx];
-  const dstFloor = FLOORS[dstFloorIdx];
-
-  const srcY = srcFloor.y;
-  const dstY = dstFloor.y;
-  const midY = (srcY + dstY) / 2;
-
-  // Curve path with arc offset
-  const curve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(-1.2, srcY, 0.5),
-    new THREE.Vector3(0, midY, 3.5),
-    new THREE.Vector3(1.2, dstY, 0.5),
-  ]);
-
-  const tubeGeo = new THREE.TubeGeometry(curve, 24, 0.055, 5, false);
-  const tubeMat = new THREE.MeshBasicMaterial({
-    color: color,
-    transparent: true,
-    opacity: 0.65,
-    depthWrite: false,
-  });
-
-  const tube = new THREE.Mesh(tubeGeo, tubeMat);
-  scene.add(tube);
-  govLightLines.push(tube);
-}
-
-// ================================================================
-//  M2: WHEEL EVENT & INITIALIZATION
-// ================================================================
-const leftPanel = document.querySelector('.left-panel');
-leftPanel.addEventListener('wheel', (e) => {
-  e.preventDefault();
-
-  if (isScrolling) return; // Debounce
-  isScrolling = true;
-
-  const direction = e.deltaY > 0 ? 1 : -1;
-  const nextFloor = Math.max(0, Math.min(5, currentFloor + direction));
-
-  if (nextFloor !== currentFloor) {
-    currentFloor = nextFloor;
-    animateCameraToFloor(currentFloor);
-    updateFloorContext(currentFloor);
-  }
-
-  scrollTimeout = setTimeout(() => { isScrolling = false; }, 200);
-});
-
-leftPanel.style.overflowY = 'hidden'; // Prevent browser scroll
-updateFloorContext(0); // Initialize on load
-
-// ================================================================
-//  M3: RAYCASTER & CLICK HANDLERS
-// ================================================================
-canvas.addEventListener('mousemove', (e) => {
-  const rect = canvas.getBoundingClientRect();
-  mouse.x = (e.clientX - rect.left) / rect.width * 2 - 1;
-  mouse.y = -(e.clientY - rect.top) / rect.height * 2 + 1;
-
-  raycaster.setFromCamera(mouse, camera);
-  const intersects = raycaster.intersectObjects(scene.children, true);
-
-  let newHovered = null;
-  for (const hit of intersects) {
-    let obj = hit.object;
-    while (obj.parent && obj.userData.floorIndex === undefined) {
-      obj = obj.parent;
-    }
-    if (obj.userData.floorIndex !== undefined) {
-      newHovered = obj.userData.floorIndex;
-      break;
-    }
-  }
-
-  // Handle hover state change
-  if (newHovered !== hoveredFloor) {
-    if (hoveredFloor !== null) {
-      removeFloorHoverGlow(hoveredFloor);
-    }
-    hoveredFloor = newHovered;
-    if (hoveredFloor !== null) {
-      addFloorHoverGlow(hoveredFloor);
-    }
-  }
-
-  // Update cursor
-  canvas.classList.toggle('hovering', hoveredFloor !== null);
-});
-
-canvas.addEventListener('click', () => {
-  if (hoveredFloor !== null && hoveredFloor !== currentFloor) {
-    scrollToFloor(hoveredFloor);
-  }
-});
-
-// ================================================================
-//  FLASH ANIMATION HELPERS
-// ================================================================
-function flashFloor(idx, peak, dur) {
-  const st = floorAnimState[idx];
-  if (!st) return;
-  gsap.killTweensOf(st);
-  gsap.to(st, {
-    baseEmissive: peak, duration: 0.18, ease: 'power3.out',
-    onUpdate: () => {
-      st.screens.forEach(m => { m.emissiveIntensity = st.baseEmissive; });
-      st.pointLight.intensity = st.baseLightInt * (st.baseEmissive / 0.52);
-    },
-    onComplete: () => {
-      gsap.to(st, {
-        baseEmissive: 0.52, duration: dur, ease: 'expo.out',
-        onUpdate: () => {
-          st.screens.forEach(m => { m.emissiveIntensity = st.baseEmissive; });
-          st.pointLight.intensity = st.baseLightInt * (st.baseEmissive / 0.52);
-        },
-      });
-    },
-  });
-}
-
-function triggerTradePulse()  { flashFloor(1, 2.8, 1.2); }
-function triggerRiskAlert()   { flashFloor(0, 3.8, 1.8); }
-
-function triggerGovernanceLightFlow(agentName) {
-  const agentMap = { CEO:5, CIO:3, CRO:4 };
-  const fi = (agentMap[agentName] !== undefined) ? agentMap[agentName] : 3;
-  flashFloor(fi, 2.2, 1.4);
-
-  const srcY = FLOORS[5].y + FLOOR_H;
-  const dstY = FLOORS[3].y + FLOOR_H * 0.5;
-  const mid  = (srcY + dstY) * 0.5;
-
-  const curve = new THREE.CatmullRomCurve3([
-    new THREE.Vector3(-0.8, srcY, 0.5),
-    new THREE.Vector3( 0,   mid,  2.5),
-    new THREE.Vector3( 0.8, dstY, 0.5),
-  ]);
-  const tubeGeo = new THREE.TubeGeometry(curve, 24, 0.045, 5, false);
-  const tubeMat = new THREE.MeshBasicMaterial({
-    color: FLOORS[fi].accent, transparent: true, opacity: 0.72, depthWrite: false,
-  });
-  const tube = new THREE.Mesh(tubeGeo, tubeMat);
-  scene.add(tube);
-  govLightLines.push(tube);
-}
-
-// ================================================================
-//  TAB SWITCHING
-// ================================================================
-document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-  });
-});
-
-// ================================================================
-//  WEBSOCKET
-// ================================================================
-function setConn(on) {
-  const dot = document.getElementById('conn-dot');
-  const lbl = document.getElementById('conn-label');
-  dot.classList.toggle('on', on);
-  lbl.classList.toggle('on', on);
-  lbl.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
-}
-
-function connect() {
-  ws = new WebSocket(WS_URL);
-  ws.onopen    = () => setConn(true);
-  ws.onclose   = () => { setConn(false); setTimeout(connect, 3000); };
-  ws.onerror   = () => ws.close();
-  ws.onmessage = ev => { try { handleMessage(JSON.parse(ev.data)); } catch(e) { console.error(e); } };
-}
-connect();
-
-// ================================================================
-//  MESSAGE HANDLER
-// ================================================================
-function handleMessage(msg) {
-  if (msg.type === 'pod_summary') {
-    const data   = msg.data;
-    const pod_id = msg.pod_id || data.pod_id;
-    if (pod_id) {
-      pods[pod_id] = data;
-      iterCount++;
-      document.getElementById('iter-ctr').textContent = iterCount;
-      updatePodsTable();
-      updateFirmMetrics();
-      recordNavHistory();
-      calculateMetrics();
-      updatePerfTable();
-      calculateRisk();
-      // M4: Update pod silhouette color based on status
-      if (data.status) {
-        updatePodSilhouetteColor(pod_id, data.status);
-      }
-    }
-  } else if (msg.type === 'trade') {
-    const t = msg.data;
-    trades.unshift(t);
-    if (trades.length > 20) trades.pop();
-    if (t.symbol && t.side && t.qty)
-      addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
-    triggerTradePulse();
-    // M4: Trigger pod heartbeat on trade
-    if (t.pod_id) {
-      triggerPodHeartbeat(t.pod_id);
-    }
-    // M3: Create data route visualization on trade
-    const srcFloor = podFloorMap[t.pod_id] ?? 0;
-    createDataRoute(srcFloor, 1, 0x00cfe8);  // to Execution floor (cyan)
-  } else if (msg.type === 'governance') {
-    const gv = msg.data;
-    if (gv.agent && gv.decision) {
-      recordGov(gv.agent, gv.decision, gv.reasoning || '', gv.weights || null);
-      triggerGovernanceLightFlow(gv.agent);
-    }
-  }
-}
-
-// ================================================================
-//  OPERATIONS
-// ================================================================
-function updatePodsTable() {
-  const ids = Object.keys(pods).sort();
-  document.getElementById('pod-badge').textContent = ids.length + ' pod' + (ids.length !== 1 ? 's' : '');
-  const tbody = document.getElementById('pods-table');
-  if (ids.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div><div class="empty-hint">Start a trading session to see live metrics</div></td></tr>';
-    return;
-  }
-  tbody.innerHTML = ids.map(id => {
-    const d   = pods[id];
-    const nav = d.nav || 0;
-    const pnl = d.daily_pnl || 0;
-    const st  = (d.status || 'UNKNOWN').toUpperCase();
-    const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
-    const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
-    return `<tr>
-      <td class="pod-name">${id.toUpperCase()}</td>
-      <td class="r">$${nav.toFixed(2)}</td>
-      <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
-      <td class="r"><span class="badge ${sc}">${st}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-function updateFirmMetrics() {
-  const ids = Object.keys(pods);
-  const nav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
-  const pnl = ids.reduce((s,id) => s + (pods[id].daily_pnl || 0), 0);
-  const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
-  const pos = ids.reduce((s,id) => {
-    const p = pods[id].current_positions;
-    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
-  }, 0);
-
-  document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
-  document.getElementById('kpi-active').textContent = act > 0 ? act : '—';
-  document.getElementById('kpi-pos').textContent    = pos > 0 ? pos : '—';
-
-  const pnlEl = document.getElementById('kpi-pnl');
-  if (nav > 0) {
-    pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} today`;
-    pnlEl.className   = 'kpi-sub ' + (pnl >= 0 ? 'pos' : 'neg');
-  } else {
-    pnlEl.textContent = '—';
-    pnlEl.className   = 'kpi-sub';
-  }
-}
-
-// ================================================================
-//  PERFORMANCE
-// ================================================================
-function recordNavHistory() {
-  const ids = Object.keys(pods);
-  if (ids.length === 0) return;
-  const firmNav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
-  const podNavs = {};
-  ids.forEach(id => { podNavs[id] = pods[id].nav || 0; });
-  navHistory.push({ t: new Date().toLocaleTimeString(), firmNav, pods: podNavs });
-  if (navHistory.length > MAX_HISTORY) navHistory.shift();
-  updateNavChart();
-}
-
-function updateNavChart() {
-  const ctx    = document.getElementById('navChart').getContext('2d');
-  const labels = navHistory.map(h => h.t);
-  const ids    = Object.keys(pods).sort();
-  const COLORS = ['#00cfe8','#00c888','#7c5cfc','#f0a030','#3498db'];
-
-  const datasets = [
-    { label:'FIRM', data: navHistory.map(h => h.firmNav),
-      borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
-      borderWidth:2, pointRadius:0, tension:0.3, fill:false },
-    ...ids.map((id, i) => ({
-      label: id.toUpperCase(), data: navHistory.map(h => h.pods[id] || 0),
-      borderColor: COLORS[i % COLORS.length], borderWidth:1,
-      pointRadius:0, tension:0.3, fill:false,
-    })),
-  ];
-
-  if (navChart) {
-    navChart.data.labels   = labels;
-    navChart.data.datasets = datasets;
-    navChart.update('none');
-    return;
-  }
-  navChart = new Chart(ctx, {
-    type: 'line',
-    data: { labels, datasets },
-    options: {
-      responsive: true, maintainAspectRatio: false, animation: false,
-      plugins: {
-        legend: { display:true, position:'top',
-          labels:{ color:'#6a90aa', font:{size:9, family:"'IBM Plex Mono', monospace"}, padding:8, usePointStyle:true, pointStyle:'line' } },
-        tooltip: { backgroundColor:'#18232f', titleColor:'#00cfe8',
-          bodyColor:'#d8e8f0', borderColor:'#253547', borderWidth:1, padding:8 },
-      },
-      scales: {
-        x: { grid:{color:'#1c2c3c'}, ticks:{color:'#3a556a', font:{size:9, family:'IBM Plex Mono'}, maxRotation:0, maxTicksLimit:6} },
-        y: { grid:{color:'#1c2c3c'}, ticks:{color:'#3a556a', font:{size:9, family:'IBM Plex Mono'}, callback: v => '$'+v.toFixed(0)} },
-      },
-    },
-  });
-}
-
-function calculateMetrics() {
-  if (navHistory.length < 2) return;
-  const navs   = navHistory.map(h => h.firmNav);
-  const rets   = navs.slice(1).map((v,i) => (v - navs[i]) / (navs[i] || 1));
-  const mean   = rets.reduce((s,r) => s+r, 0) / rets.length;
-  const std    = Math.sqrt(rets.reduce((s,r) => s+(r-mean)**2, 0) / rets.length) || 1e-9;
-  const sharpe = mean / std * Math.sqrt(252);
-  const maxNav = Math.max(...navs);
-  const dd     = maxNav > 0 ? (navs[navs.length-1] - maxNav) / maxNav : 0;
-  const wr     = rets.length > 0 ? rets.filter(r => r>0).length / rets.length : 0;
-
-  document.getElementById('m-sharpe').textContent = isFinite(sharpe) ? sharpe.toFixed(2) : '—';
-  document.getElementById('m-vol').textContent    = (std * Math.sqrt(252) * 100).toFixed(1) + '%';
-  const ddEl = document.getElementById('m-dd');
-  ddEl.textContent = (dd * 100).toFixed(1) + '%';
-  ddEl.className   = 'kpi-val ' + (dd < -0.05 ? 'neg' : '');
-  document.getElementById('m-wr').textContent     = (wr * 100).toFixed(0) + '%';
-}
-
-function updatePerfTable() {
-  const ids = Object.keys(pods).sort();
-  if (ids.length === 0) return;
-  document.getElementById('perf-table').innerHTML = ids.map(id => {
-    const d   = pods[id];
-    const nav = d.nav || 0;
-    const ret = ((nav - 100) / 100 * 100);
-    const pnl = d.daily_pnl || 0;
-    return `<tr>
-      <td class="pod-name">${id.toUpperCase()}</td>
-      <td class="r">$${nav.toFixed(2)}</td>
-      <td class="r ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</td>
-      <td class="r ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
-    </tr>`;
-  }).join('');
-}
-
-// ================================================================
-//  RISK
-// ================================================================
-function calculateRisk() {
-  const ids = Object.keys(pods);
-  if (ids.length === 0) return;
-  const nav  = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
-  const pos  = ids.reduce((s,id) => {
-    const p = pods[id].current_positions;
-    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
-  }, 0);
-  const var95 = nav * 0.025;
-  const lev   = pos > 0 ? (pos * 10 / (nav || 1)) : 0;
-  const conc  = ids.length > 0 ? (100 / ids.length).toFixed(0) + '%' : '—';
-
-  document.getElementById('kpi-var').textContent    = nav > 0 ? `$${var95.toFixed(0)}` : '—';
-  document.getElementById('kpi-lev').textContent    = nav > 0 ? `${lev.toFixed(2)}x` : '—';
-  document.getElementById('kpi-conc').textContent   = conc;
-  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
-  updateRiskTable();
-}
-
-function updateRiskAlertBanner(severity, message) {
-  const el = document.getElementById('risk-banner');
-  el.className   = 'risk-banner ' + severity;
-  el.textContent = message;
-  riskAlerts.push({ severity, message, ts: new Date().toISOString() });
-  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
-  if (severity === 'critical') triggerRiskAlert();
-}
-
-function updateRiskTable() {
-  const ids = Object.keys(pods).sort();
-  if (ids.length === 0) return;
-  document.getElementById('risk-table').innerHTML = ids.map(id => {
-    const d     = pods[id];
-    const nav   = d.nav || 0;
-    const p     = d.current_positions;
-    const pos   = Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0;
-    const st    = (d.status || 'UNKNOWN').toUpperCase();
-    const sc    = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
-    return `<tr>
-      <td class="pod-name">${id.toUpperCase()}</td>
-      <td class="r">$${(nav * 0.025).toFixed(0)}</td>
-      <td class="r">${pos}</td>
-      <td class="r"><span class="badge ${sc}">${st}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-// ================================================================
-//  EXECUTION
-// ================================================================
-function addTrade(podId, symbol, side, qty, price, status = 'FILLED') {
-  executedTrades.unshift({ podId, symbol, side: side.toUpperCase(), qty, price, status, ts: new Date().toISOString() });
-  if (executedTrades.length > 50) executedTrades.pop();
-  updateExecTable();
-}
-
-function updateExecTable() {
-  document.getElementById('kpi-trades').textContent = executedTrades.length;
-  document.getElementById('kpi-filled').textContent = executedTrades.filter(t => t.status === 'FILLED').length;
-  if (executedTrades.length === 0) return;
-  document.getElementById('exec-table').innerHTML = executedTrades.slice(0, 20).map(t => {
-    const sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
-    const ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
-    return `<tr>
-      <td>${t.podId.toUpperCase()}</td>
-      <td style="font-weight:600">${t.symbol}</td>
-      <td><span class="badge ${sc}">${t.side}</span></td>
-      <td class="r">${t.qty}</td>
-      <td class="r">$${(t.price || 0).toFixed(2)}</td>
-      <td class="r"><span class="badge ${ss}">${t.status}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-// ================================================================
-//  GOVERNANCE
-// ================================================================
-function recordGov(agent, decision, reasoning, weights) {
-  governanceDecisions.unshift({ agent, decision, reasoning, weights, ts: new Date().toISOString() });
-  updateGovHub();
-}
-
-function updateGovHub() {
-  const ids   = Object.keys(pods).sort();
-  const names = ids.length > 0 ? ids : ['alpha','beta','gamma','delta','epsilon'];
-  document.getElementById('alloc-grid').innerHTML = names.map(id => {
-    const nav = pods[id] ? pods[id].nav || 0 : 0;
-    return `<div class="alloc-tile">
-      <div class="alloc-pod">${id.toUpperCase()}</div>
-      <div class="alloc-val">${nav > 0 ? '$'+nav.toFixed(0) : '—'}</div>
-    </div>`;
-  }).join('');
-
-  document.getElementById('gov-badge').textContent = governanceDecisions.length + ' decisions';
-  const list = document.getElementById('gov-list');
-  if (governanceDecisions.length === 0) return;
-  list.innerHTML = governanceDecisions.slice(0, 10).map(d => {
-    const ac = d.agent ? 'b-' + d.agent.toLowerCase() : 'b-idle';
-    const tm = new Date(d.ts).toLocaleTimeString();
-    return `<div class="gov-card">
-      <div class="gov-card-hdr">
-        <span class="badge ${ac}">${d.agent}</span>
-        <span class="gov-time">${tm}</span>
-      </div>
-      <div class="gov-card-body">${d.decision}</div>
-      ${d.reasoning ? `<div class="gov-card-sub">${d.reasoning.slice(0,120)}${d.reasoning.length>120?'…':''}</div>` : ''}
-    </div>`;
-  }).join('');
-}
-
-// Init governance grid on load
-updateGovHub();
-</script>
+<!-- JS modules: order matters (tower → motion → dashboard) -->
+<script src="tower.js"></script>
+<script src="motion.js"></script>
+<script src="dashboard.js"></script>
 </body>
 </html>

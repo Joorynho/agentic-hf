@@ -6,8 +6,7 @@ node_modules/
 # Testing
 coverage/
 
-# Production
-dist/
+# Production (web/dist is tracked — contains hand-written dashboard files)
 build/
 
 # Misc

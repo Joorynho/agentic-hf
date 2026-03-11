@@ -187,7 +187,7 @@ class TestEventBusListener:
 
         ws.send_json.assert_called_once()
         broadcast_msg = ws.send_json.call_args[0][0]
-        assert broadcast_msg["type"] == "governance_event"
+        assert broadcast_msg["type"] == "governance"
 
 
 class TestRESTEndpoints:
@@ -207,7 +207,7 @@ class TestRESTEndpoints:
         assert response.status_code == 200
         data = response.json()
         assert data["session_id"] == "live-session-1"
-        assert data["num_pods"] == 5
+        assert data["num_pods"] == 4
         assert data["capital_per_pod"] == 0.0
         assert "iteration" in data
         assert "uptime_seconds" in data
@@ -233,8 +233,8 @@ class TestRESTEndpoints:
                     "daily_pnl": 5.0,
                 },
             },
-            "beta": {
-                "pod_id": "beta",
+            "fx": {
+                "pod_id": "fx",
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "status": "ACTIVE",
                 "risk_metrics": {
@@ -253,7 +253,7 @@ class TestRESTEndpoints:
         # Check pod data
         pods = {p["pod_id"]: p for p in data["pods"]}
         assert pods["alpha"]["nav"] == 105.0
-        assert pods["beta"]["nav"] == 102.0
+        assert pods["fx"]["nav"] == 102.0
 
     def test_get_pod_detail(self, client, app):
         """Test get individual pod detail endpoint."""
@@ -386,7 +386,7 @@ class TestEndToEnd:
         data = response.json()
         assert data["capital_per_pod"] == 50.0
         assert data["iteration"] == 25
-        assert data["total_capital"] == 50.0 * 5  # 5 pods
+        assert data["total_capital"] == 50.0 * 4  # 4 pods
 
     def test_pods_endpoint_reflects_summaries(self, client, app):
         """Test that pods endpoint reflects app state."""

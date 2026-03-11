@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 
 from src.core.bus.event_bus import EventBus
+from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import EventType
-from src.core.models.messages import AgentMessage, Event
+from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
 from src.mission_control.session_logger import SessionLogger
 
@@ -30,15 +30,14 @@ _DEFAULT_CONSTRAINTS = {
 class CEOAgent:
     """Firm-level CEO: approves mandates, sets objectives, participates in Loop 6/7.
 
-    LLM mode: uses gpt-4o-mini to generate narrative + approve mandate.
+    LLM mode: uses Qwen 3 32B via OpenRouter (falls back to OpenAI if no OpenRouter key).
     Fallback: auto-approves static mandate from defaults when no API key.
     """
 
     def __init__(self, bus: EventBus, session_logger: SessionLogger | None = None) -> None:
         self._bus = bus
         self._session_logger = session_logger
-        self._api_key = os.getenv("OPENAI_API_KEY", "")
-        self._has_llm = bool(self._api_key)
+        self._has_llm = has_llm_key()
         self._current_mandate: MandateUpdate | None = None
 
     @property
@@ -87,6 +86,27 @@ class CEOAgent:
             msg,
             publisher_id=_AGENT_ID,
         )
+
+        # Publish agent activity for live intelligence feed
+        activity_msg = AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender=_AGENT_ID,
+            recipient="dashboard",
+            topic="agent.activity",
+            payload={
+                "agent_id": "ceo",
+                "agent_role": "CEO",
+                "pod_id": "firm",
+                "action": "mandate_update",
+                "summary": (mandate.narrative or "Mandate updated")[:200],
+                "detail": (mandate.rationale or "")[:500],
+            },
+        )
+        try:
+            await self._bus.publish("agent.activity", activity_msg, publisher_id=_AGENT_ID)
+        except Exception:
+            pass
+
         logger.info("[ceo] Mandate approved (llm=%s): %s", self._has_llm, mandate.narrative[:80])
         return mandate
 
@@ -158,8 +178,6 @@ class CEOAgent:
         cro_constraints: dict,
     ) -> MandateUpdate:
         try:
-            import openai
-
             summaries_text = "\n".join(
                 f"- {s.pod_id}: status={s.status} pnl={s.risk_metrics.daily_pnl:.2f} "
                 f"dd={s.risk_metrics.drawdown_from_hwm:.3f}"
@@ -175,24 +193,18 @@ class CEOAgent:
                 "Keep it concise and actionable."
             )
 
-            # Log prompt before LLM call
             if self._session_logger:
                 self._session_logger.log_reasoning("ceo", "prompt", prompt)
 
-            client = openai.OpenAI(api_key=self._api_key)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+            response_text = llm_chat(
+                [{"role": "user", "content": prompt + " Respond with valid JSON only."}],
                 max_tokens=400,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            response_text = resp.choices[0].message.content
 
-            # Log response after LLM call
             if self._session_logger:
                 self._session_logger.log_reasoning("ceo", "response", response_text)
 
-            data = json.loads(response_text)
+            data = extract_json(response_text)
             return MandateUpdate(
                 timestamp=datetime.now(timezone.utc),
                 narrative=data.get("narrative", "LLM mandate"),

@@ -1,7 +1,7 @@
 """MVP3 Batch 4 tests — Pod initialization in SessionManager.
 
 Tests cover:
-1. Initialization of 5 pods with correct IDs
+1. Initialization of 4 pods with correct IDs (equities, fx, crypto, commodities)
 2. Capital allocation across pods
 3. Agent setup in each pod runtime
 """
@@ -20,17 +20,17 @@ from src.pods.runtime.pod_runtime import PodRuntime
 
 
 # ============================================================================
-# Test 1: Session Manager Initializes 5 Pods
+# Test 1: Session Manager Initializes 4 Pods
 # ============================================================================
 
 
 @pytest.mark.asyncio
 async def test_session_manager_initializes_5_pods():
-    """SessionManager.start_live_session initializes exactly 5 pods with correct IDs.
+    """SessionManager.start_live_session initializes exactly 4 pods with correct IDs.
 
     Verifies:
-    - len(self._pod_gateways) == 5
-    - Pod IDs are ["alpha", "beta", "gamma", "delta", "epsilon"]
+    - len(self._pod_gateways) == 4
+    - Pod IDs are ["equities", "fx", "crypto", "commodities"]
     - Each pod gateway is a PodGateway instance
     - No runtime errors
     """
@@ -51,11 +51,11 @@ async def test_session_manager_initializes_5_pods():
         # Start live session
         await manager.start_live_session(capital_per_pod=100.0)
 
-        # Verify 5 pods initialized
-        assert len(manager._pod_gateways) == 5, f"Expected 5 pods, got {len(manager._pod_gateways)}"
+        # Verify 4 pods initialized
+        assert len(manager._pod_gateways) == 4, f"Expected 4 pods, got {len(manager._pod_gateways)}"
 
         # Verify pod IDs are correct
-        expected_pod_ids = ["alpha", "beta", "gamma", "delta", "epsilon"]
+        expected_pod_ids = ["equities", "fx", "crypto", "commodities"]
         actual_pod_ids = list(manager._pod_gateways.keys())
         assert sorted(actual_pod_ids) == sorted(expected_pod_ids), \
             f"Expected pod IDs {expected_pod_ids}, got {actual_pod_ids}"
@@ -81,13 +81,13 @@ async def test_session_manager_initializes_5_pods():
 
 @pytest.mark.asyncio
 async def test_session_manager_pod_capital_allocation():
-    """SessionManager allocates capital equally across 5 pods.
+    """SessionManager allocates capital equally across 4 pods.
 
     Verifies:
     - CapitalAllocator initialized
-    - Total capital = 5 × capital_per_pod
-    - Each pod gets 20% allocation (1.0 / 5 = 0.20)
-    - Capital dict has exactly 5 entries
+    - Total capital = 4 × capital_per_pod
+    - Each pod gets 25% allocation (1.0 / 4 = 0.25)
+    - Capital dict has exactly 4 entries
     """
     # Mock Alpaca adapter
     mock_adapter = AsyncMock(spec=AlpacaAdapter)
@@ -97,7 +97,7 @@ async def test_session_manager_pod_capital_allocation():
     mock_adapter.fetch_bars = AsyncMock(return_value={"AAPL": [], "MSFT": []})
 
     capital_per_pod = 50.0
-    expected_total = 5 * capital_per_pod  # $250
+    expected_total = 4 * capital_per_pod  # $200
 
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = SessionManager(
@@ -111,9 +111,9 @@ async def test_session_manager_pod_capital_allocation():
         # Verify CapitalAllocator was initialized
         assert manager._allocator is not None, "CapitalAllocator not initialized"
 
-        # Verify capital dict has 5 entries
-        assert len(manager._pod_capital) == 5, \
-            f"Expected 5 capital entries, got {len(manager._pod_capital)}"
+        # Verify capital dict has 4 entries
+        assert len(manager._pod_capital) == 4, \
+            f"Expected 4 capital entries, got {len(manager._pod_capital)}"
 
         # Verify each pod has correct capital amount
         for pod_id, capital in manager._pod_capital.items():
@@ -122,11 +122,11 @@ async def test_session_manager_pod_capital_allocation():
 
         # Verify allocations sum to 1.0 (equal distribution)
         allocations = manager._allocator.current_allocations()
-        assert len(allocations) == 5, f"Expected 5 allocations, got {len(allocations)}"
+        assert len(allocations) == 4, f"Expected 4 allocations, got {len(allocations)}"
 
-        # Each pod should get 20% (1.0 / 5 = 0.20)
+        # Each pod should get 25% (1.0 / 4 = 0.25)
         for pod_id, alloc in allocations.items():
-            expected_alloc = round(1.0 / 5, 6)
+            expected_alloc = round(1.0 / 4, 6)
             assert abs(alloc - expected_alloc) < 0.0001, \
                 f"Pod {pod_id} allocation {alloc} != expected {expected_alloc}"
 

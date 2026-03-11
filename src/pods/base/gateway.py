@@ -14,6 +14,7 @@ class PodGateway:
         self._pod_id = pod_id
         self._bus = bus
         self._config = config
+        self._universe = set(self._config.universe) if self._config and self._config.universe else set()
         self._mandate_queue: asyncio.Queue = asyncio.Queue()
         self._bar_queues: list[asyncio.Queue] = []
         self._news_queues: list[asyncio.Queue] = []
@@ -42,8 +43,12 @@ class PodGateway:
         self._bar_queues.append(q)
         return q
 
+    def set_universe(self, symbols: list[str]) -> None:
+        """Update the tradeable universe dynamically."""
+        self._universe = set(symbols)
+
     async def push_bar(self, bar: Bar) -> None:
-        if bar.symbol in self._config.universe:
+        if bar.symbol in self._universe:
             for q in self._bar_queues:
                 await q.put(bar)
 

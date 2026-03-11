@@ -11,7 +11,7 @@ class PodDrilldownWidget(Static):
     """Detailed pod metrics: exposure, agent status, risk."""
 
     data: Reactive[DataProvider | None] = Reactive(None)
-    selected_pod: str = "alpha"
+    selected_pod: str = "equities"
 
     def __init__(self, data_provider: DataProvider | None = None, **kwargs):
         super().__init__(**kwargs)

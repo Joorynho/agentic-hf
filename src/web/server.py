@@ -87,6 +87,12 @@ class EventBusListener:
         self.bus = event_bus
         self.manager = connection_manager
         self._subscribed = False
+        self._app_state = {
+            'last_pod_summaries': {},
+            'recent_trades': [],
+            'recent_governance': [],
+            'recent_activity': [],
+        }
 
     async def subscribe(self):
         """Subscribe to all relevant EventBus topics."""
@@ -95,19 +101,24 @@ class EventBusListener:
 
         try:
             # Subscribe to pod gateway topics (pod summaries)
-            await self.bus.subscribe("pod.alpha.gateway", self._on_pod_update)
-            await self.bus.subscribe("pod.beta.gateway", self._on_pod_update)
-            await self.bus.subscribe("pod.gamma.gateway", self._on_pod_update)
-            await self.bus.subscribe("pod.delta.gateway", self._on_pod_update)
-            await self.bus.subscribe("pod.epsilon.gateway", self._on_pod_update)
+            await self.bus.subscribe("pod.equities.gateway", self._on_pod_update)
+            await self.bus.subscribe("pod.fx.gateway", self._on_pod_update)
+            await self.bus.subscribe("pod.crypto.gateway", self._on_pod_update)
+            await self.bus.subscribe("pod.commodities.gateway", self._on_pod_update)
 
             # Subscribe to governance topics
             await self.bus.subscribe("governance.ceo", self._on_governance)
             await self.bus.subscribe("governance.cio", self._on_governance)
             await self.bus.subscribe("governance.cro", self._on_governance)
 
+            # Subscribe to execution fill events
+            await self.bus.subscribe("execution.fill", self._on_trade)
+
             # Subscribe to risk alerts
             await self.bus.subscribe("risk.alert", self._on_risk_alert)
+
+            # Subscribe to agent activity feed
+            await self.bus.subscribe("agent.activity", self._on_agent_activity)
 
             self._subscribed = True
             logger.info("[web] EventBusListener subscribed to all topics")
@@ -119,32 +130,74 @@ class EventBusListener:
         """Handle pod summary update from EventBus."""
         try:
             payload = message.payload
-            # PodSummary is passed as dict; extract pod_id if available
             pod_id = payload.get("pod_id") or message.topic.split(".")[1]
 
-            await self.manager.broadcast(
-                {
-                    "type": "pod_summary",
-                    "pod_id": pod_id,
-                    "timestamp": message.timestamp.isoformat(),
-                    "data": payload,
-                }
-            )
+            # Flatten risk_metrics to top level so dashboard can read directly
+            rm = payload.get("risk_metrics", {})
+            payload["nav"] = payload.get("nav") or rm.get("nav", 0)
+            payload["daily_pnl"] = payload.get("daily_pnl") or rm.get("daily_pnl", 0)
+            payload["drawdown"] = rm.get("drawdown_from_hwm", 0)
+            payload["vol_ann"] = rm.get("current_vol_ann", 0)
+            payload["gross_leverage"] = rm.get("gross_leverage", 0)
+            payload["net_leverage"] = rm.get("net_leverage", 0)
+            payload["var_95"] = rm.get("var_95_1d", 0)
+            payload["es_95"] = rm.get("es_95_1d", 0)
+            # Map positions array for frontend compatibility
+            payload["current_positions"] = payload.get("positions", payload.get("current_positions", []))
+            payload["exposure_buckets"] = payload.get("exposure_buckets", [])
+
+            broadcast_data = {
+                "type": "pod_summary",
+                "pod_id": pod_id,
+                "timestamp": message.timestamp.isoformat(),
+                "data": payload,
+            }
+            await self.manager.broadcast(broadcast_data)
+
+            # Store for snapshot on reconnect
+            if hasattr(self, '_app_state'):
+                self._app_state['last_pod_summaries'][pod_id] = broadcast_data
         except Exception as e:
             logger.error("[web] Error broadcasting pod update: %s", e)
 
     async def _on_governance(self, message: AgentMessage):
         """Handle governance event from EventBus."""
         try:
-            await self.manager.broadcast(
-                {
-                    "type": "governance",
-                    "timestamp": message.timestamp.isoformat(),
-                    "data": message.payload,
-                }
-            )
+            payload = message.payload
+            mandate = payload.get("mandate", {})
+            msg = {
+                "type": "governance",
+                "timestamp": message.timestamp.isoformat(),
+                "data": {
+                    "agent": payload.get("authorized_by", mandate.get("authorized_by", "CEO")).upper().replace("_LLM", "").replace("_RULE_BASED", ""),
+                    "decision": payload.get("event_type", "MANDATE_UPDATE"),
+                    "reasoning": mandate.get("rationale", mandate.get("narrative", "")),
+                    "weights": mandate.get("pod_allocations", {}),
+                    "narrative": mandate.get("narrative", ""),
+                    "objectives": mandate.get("objectives", []),
+                },
+            }
+            await self.manager.broadcast(msg)
+            self._app_state['recent_governance'].insert(0, msg)
+            if len(self._app_state['recent_governance']) > 20:
+                self._app_state['recent_governance'] = self._app_state['recent_governance'][:20]
         except Exception as e:
             logger.error("[web] Error broadcasting governance event: %s", e)
+
+    async def _on_trade(self, message: AgentMessage):
+        """Handle execution fill event from EventBus."""
+        try:
+            msg = {
+                "type": "trade",
+                "timestamp": message.timestamp.isoformat(),
+                "data": message.payload,
+            }
+            await self.manager.broadcast(msg)
+            self._app_state['recent_trades'].insert(0, msg)
+            if len(self._app_state['recent_trades']) > 50:
+                self._app_state['recent_trades'] = self._app_state['recent_trades'][:50]
+        except Exception as e:
+            logger.error("[web] Error broadcasting trade event: %s", e)
 
     async def _on_risk_alert(self, message: AgentMessage):
         """Handle risk alert from EventBus."""
@@ -158,6 +211,33 @@ class EventBusListener:
             )
         except Exception as e:
             logger.error("[web] Error broadcasting risk alert: %s", e)
+
+    async def _on_agent_activity(self, message: AgentMessage):
+        """Handle agent activity from EventBus -- forward to WebSocket clients."""
+        try:
+            msg = {
+                "type": "agent_activity",
+                "timestamp": message.timestamp.isoformat(),
+                "data": message.payload,
+            }
+            await self.manager.broadcast(msg)
+            self._app_state['recent_activity'].insert(0, msg)
+            if len(self._app_state['recent_activity']) > 50:
+                self._app_state['recent_activity'] = self._app_state['recent_activity'][:50]
+        except Exception as e:
+            logger.error("[web] Error broadcasting agent activity: %s", e)
+
+    def get_snapshot(self) -> dict:
+        """Build a session snapshot for new WebSocket clients."""
+        return {
+            "type": "session_snapshot",
+            "data": {
+                "pod_summaries": self._app_state.get('last_pod_summaries', {}),
+                "recent_trades": self._app_state.get('recent_trades', [])[:20],
+                "recent_governance": self._app_state.get('recent_governance', [])[:10],
+                "recent_activity": self._app_state.get('recent_activity', [])[:20],
+            },
+        }
 
 
 # Response models for REST endpoints
@@ -268,10 +348,10 @@ def create_app(
         return SessionInfoResponse(
             session_id="live-session-1",
             capital_per_pod=app.state.capital_per_pod,
-            total_capital=app.state.capital_per_pod * 5,  # 5 pods
+            total_capital=app.state.capital_per_pod * 4,  # 4 pods
             iteration=app.state.iteration,
             uptime_seconds=uptime,
-            num_pods=5,
+            num_pods=4,
         )
 
     @app.get("/api/pods", response_model=dict)
@@ -336,9 +416,12 @@ def create_app(
         """WebSocket endpoint for real-time updates."""
         await manager.connect(websocket)
         try:
+            # Send session snapshot on connect so client recovers state
+            if listener:
+                snapshot = listener.get_snapshot()
+                snapshot["data"]["iteration"] = app.state.iteration
+                await websocket.send_json(snapshot)
             while True:
-                # Keep connection alive, wait for client messages
-                # (in this simple implementation, we don't process incoming messages)
                 data = await websocket.receive_text()
                 logger.debug("[web] Received from WebSocket: %s", data)
         except WebSocketDisconnect:
@@ -374,7 +457,11 @@ def create_app(
         async def serve_root():
             """Serve the dashboard index.html at the root path."""
             if _index_html.is_file():
-                return FileResponse(str(_index_html), media_type="text/html")
+                return FileResponse(
+                    str(_index_html),
+                    media_type="text/html",
+                    headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+                )
             raise HTTPException(status_code=404, detail="index.html not found in web/dist/")
 
         # Mount static files LAST so API routes (/api/*, /ws, /health) take priority

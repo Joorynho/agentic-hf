@@ -24,6 +24,7 @@ class NewsItem(BaseModel):
     timestamp: datetime
     source: str
     headline: str
+    url: str = ""
     body_snippet: str = Field(max_length=500)
     entities: list[str] = Field(default_factory=list)
     sentiment: float = Field(ge=-1.0, le=1.0, default=0.0)

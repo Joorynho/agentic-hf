@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from unittest.mock import patch
 import pytest
 
 from src.core.bus.event_bus import EventBus
@@ -52,7 +53,9 @@ def allocator(bus):
 
 # --- CEO ---
 
-async def test_ceo_rule_based_mandate(bus):
+async def test_ceo_rule_based_mandate(bus, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     ceo = CEOAgent(bus)
     summaries = [_summary(pid) for pid in POD_IDS]
     mandate = await ceo.approve_mandate(summaries)
@@ -86,7 +89,9 @@ async def test_ceo_unknown_message_returns_none(bus):
 
 # --- CIO ---
 
-async def test_cio_rule_based_no_drift(bus, allocator):
+async def test_cio_rule_based_no_drift(bus, allocator, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cio = CIOAgent(bus, allocator)
     summaries = [_summary(pid) for pid in POD_IDS]
     records = await cio.rebalance(summaries)
@@ -94,9 +99,10 @@ async def test_cio_rule_based_no_drift(bus, allocator):
     assert all(abs(r.new_pct - 0.2) < 0.01 for r in records)
 
 
-async def test_cio_rule_based_corrects_drift(bus, allocator):
+async def test_cio_rule_based_corrects_drift(bus, allocator, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     from src.core.models.allocation import AllocationRecord
-    # Force a drift: manually skew alpha to 40%
     now = datetime.now(timezone.utc)
     skew = [
         AllocationRecord(timestamp=now, pod_id="alpha", old_pct=0.2, new_pct=0.4,

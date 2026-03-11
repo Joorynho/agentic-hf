@@ -78,6 +78,59 @@ class AlpacaAdapter:
             logger.error("[alpaca] fetch_account failed: %s", exc)
             raise
 
+    @staticmethod
+    def _is_crypto_symbol(symbol: str) -> bool:
+        """Return True if symbol is crypto (e.g., BTC/USD, ETH/USD)."""
+        return "/" in symbol and symbol.upper().endswith("/USD")
+
+    def _barset_to_bar_list(
+        self, barset, symbols: list[str], source: str = "alpaca"
+    ) -> dict[str, list[Bar]]:
+        """Convert Alpaca BarsV2 or dict mock to dict[symbol] -> list[Bar]."""
+        results = {s: [] for s in symbols}
+        if hasattr(barset, "df") and not barset.df.empty:
+            df = barset.df
+            for symbol in symbols:
+                if "symbol" in df.columns:
+                    sym_df = df[df["symbol"] == symbol]
+                else:
+                    sym_df = df
+                for idx, row in sym_df.iterrows():
+                    ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                    vol = row.get("volume", 0)
+                    results[symbol].append(
+                        Bar(
+                            symbol=symbol,
+                            timestamp=ts,
+                            open=float(row["open"]),
+                            high=float(row["high"]),
+                            low=float(row["low"]),
+                            close=float(row["close"]),
+                            volume=float(vol) if vol is not None else 0.0,
+                            source=source,
+                        )
+                    )
+        elif isinstance(barset, dict):
+            for symbol in symbols:
+                if symbol in barset:
+                    df = barset[symbol]
+                    for idx, row in df.iterrows():
+                        ts = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                        vol = row.get("volume", row.get("v", 0))
+                        results[symbol].append(
+                            Bar(
+                                symbol=symbol,
+                                timestamp=ts,
+                                open=float(row["open"]),
+                                high=float(row["high"]),
+                                low=float(row["low"]),
+                                close=float(row["close"]),
+                                volume=float(vol) if vol is not None else 0.0,
+                                source=source,
+                            )
+                        )
+        return results
+
     async def fetch_bars(
         self,
         symbols: list[str],
@@ -86,17 +139,22 @@ class AlpacaAdapter:
     ) -> dict[str, list[Bar]]:
         """Fetch latest bars for symbols.
 
+        Supports both equity tickers (e.g., AAPL, SPY) and crypto pairs (e.g., BTC/USD).
+        Routes crypto symbols to get_crypto_bars and equities to get_bars.
+
         Args:
-            symbols: List of tickers (e.g., ['AAPL', 'MSFT'])
+            symbols: List of tickers (e.g., ['AAPL', 'MSFT', 'BTC/USD'])
             timeframe: '1Min', '5Min', '15Min', '1H', '1D' (default '1Min')
             limit: Max bars per symbol (default 1000, max 10000)
 
         Returns:
             dict[symbol] -> list[Bar] ordered by timestamp ascending
         """
-        results = {}
+        results: dict[str, list[Bar]] = {s: [] for s in symbols}
+        if not symbols:
+            return results
+
         try:
-            # Map string timeframe to alpaca TimeFrame objects
             tf_map = {
                 "1Min": TimeFrame.Minute,
                 "5Min": TimeFrame(5, TimeFrameUnit.Minute),
@@ -106,35 +164,37 @@ class AlpacaAdapter:
             }
             tf = tf_map.get(timeframe, TimeFrame.Minute)
 
-            # Fetch bars for all symbols
-            barset = self._client.get_bars(
-                symbols,
-                timeframe=tf,
-                limit=limit,
-            )
+            stock_symbols = [s for s in symbols if not self._is_crypto_symbol(s)]
+            crypto_symbols = [s for s in symbols if self._is_crypto_symbol(s)]
 
-            # Convert to Bar objects (compatible with BacktestRunner)
-            for symbol in symbols:
-                bars = []
-                if symbol in barset:
-                    df = barset[symbol]
-                    for idx, row in df.iterrows():
-                        bar = Bar(
-                            symbol=symbol,
-                            timestamp=pd.Timestamp(idx).to_pydatetime() if hasattr(idx, 'to_pydatetime') else idx,
-                            open=float(row["open"]),
-                            high=float(row["high"]),
-                            low=float(row["low"]),
-                            close=float(row["close"]),
-                            volume=int(row["volume"]),
-                            source="alpaca",
-                        )
-                        bars.append(bar)
-                results[symbol] = bars
+            if stock_symbols:
+                barset = self._client.get_bars(
+                    stock_symbols,
+                    timeframe=tf,
+                    limit=limit,
+                )
+                stock_bars = self._barset_to_bar_list(barset, stock_symbols, source="alpaca")
+                for k, v in stock_bars.items():
+                    results[k] = v
+
+            if crypto_symbols:
+                crypto_barset = self._client.get_crypto_bars(
+                    crypto_symbols,
+                    timeframe=tf,
+                    limit=limit,
+                    loc="us",
+                )
+                crypto_bars = self._barset_to_bar_list(
+                    crypto_barset, crypto_symbols, source="alpaca"
+                )
+                for k, v in crypto_bars.items():
+                    results[k] = v
 
             logger.debug(
-                "[alpaca] fetch_bars: %d symbols, %s timeframe",
+                "[alpaca] fetch_bars: %d symbols (%d equity, %d crypto), %s timeframe",
                 len(symbols),
+                len(stock_symbols),
+                len(crypto_symbols),
                 timeframe,
             )
             return results
@@ -151,8 +211,9 @@ class AlpacaAdapter:
         order_type: str = "market",
         limit_price: Optional[float] = None,
         timeout_seconds: int = 30,
+        max_retries: int = 3,
     ) -> dict:
-        """Place an order with fill polling.
+        """Place an order with fill polling and retry on transient errors.
 
         Args:
             symbol: Ticker (e.g., 'AAPL')
@@ -161,6 +222,7 @@ class AlpacaAdapter:
             order_type: 'market' or 'limit' (default 'market')
             limit_price: Required if order_type='limit'
             timeout_seconds: Max seconds to wait for fill (default 30)
+            max_retries: Max submit attempts on transient errors (default 3)
 
         Returns:
             dict with keys: order_id, symbol, qty, side, status, filled_qty, filled_avg_price, filled_at
@@ -168,15 +230,34 @@ class AlpacaAdapter:
             - filled_at: timestamp if filled, else None
         """
         try:
-            # Submit order to Alpaca
-            order = self._client.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=side,
-                type=order_type,
-                time_in_force="day",
-                limit_price=limit_price if order_type == "limit" else None,
-            )
+            # Submit order with retry on transient network errors
+            order = None
+            last_submit_err = None
+            for attempt in range(max_retries):
+                try:
+                    order = self._client.submit_order(
+                        symbol=symbol,
+                        qty=qty,
+                        side=side,
+                        type=order_type,
+                        time_in_force="day",
+                        limit_price=limit_price if order_type == "limit" else None,
+                    )
+                    break
+                except Exception as exc:
+                    err_msg = str(exc).lower()
+                    if "insufficient" in err_msg or "invalid" in err_msg or "forbidden" in err_msg:
+                        raise
+                    last_submit_err = exc
+                    if attempt < max_retries - 1:
+                        wait = 2 ** attempt
+                        logger.warning(
+                            "[alpaca] Order submit attempt %d/%d failed, retrying in %ds: %s",
+                            attempt + 1, max_retries, wait, exc,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        raise last_submit_err
 
             logger.info(
                 "[alpaca] Order placed: %s %s %s@%s (id=%s)",

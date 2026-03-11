@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -22,8 +21,18 @@ from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.data.adapters.fred_adapter import FredAdapter
+from src.data.adapters.gdelt_adapter import GdeltAdapter
+from src.data.adapters.market_tracker import MarketTracker
 from src.data.adapters.polymarket_adapter import PolymarketAdapter
+from src.data.adapters.rss_adapter import RssAdapter
+from src.data.adapters.x_adapter import XAdapter
+from src.data.adapters.price_service import PriceService
+from src.data.adapters.stockprices_adapter import StockPricesAdapter
+from src.data.adapters.coinmarketcap_adapter import CoinMarketCapAdapter
+from src.data.adapters.alphavantage_adapter import AlphaVantageAdapter
 from src.core.models.allocation import MandateUpdate
+from src.core.models.market import Bar
 from src.core.models.config import PodConfig, RiskBudget, ExecutionConfig, BacktestConfig
 from src.core.models.enums import TimeHorizon, AgentType
 from src.core.models.messages import AgentMessage
@@ -34,77 +43,69 @@ from src.mission_control.session_logger import SessionLogger
 from src.pods.base.gateway import PodGateway
 from src.pods.base.namespace import PodNamespace
 from src.pods.runtime.pod_runtime import PodRuntime
-from src.pods.templates.beta.researcher import BetaResearcher
-from src.pods.templates.beta.signal_agent import BetaSignalAgent
-from src.pods.templates.beta.pm_agent import BetaPMAgent
-from src.pods.templates.beta.risk_agent import BetaRiskAgent
-from src.pods.templates.beta.execution_trader import BetaExecutionTrader
-from src.pods.templates.beta.ops_agent import BetaOpsAgent
-from src.pods.templates.gamma.researcher import GammaResearcher
-from src.pods.templates.gamma.signal_agent import GammaSignalAgent
-from src.pods.templates.gamma.pm_agent import GammaPMAgent
-from src.pods.templates.gamma.risk_agent import GammaRiskAgent
-from src.pods.templates.gamma.execution_trader import GammaExecutionTrader
-from src.pods.templates.gamma.ops_agent import GammaOpsAgent
-from src.pods.templates.delta.researcher import DeltaResearcher
-from src.pods.templates.delta.signal_agent import DeltaSignalAgent
-from src.pods.templates.delta.pm_agent import DeltaPMAgent
-from src.pods.templates.delta.risk_agent import DeltaRiskAgent
-from src.pods.templates.delta.execution_trader import DeltaExecutionTrader
-from src.pods.templates.delta.ops_agent import DeltaOpsAgent
-from src.pods.templates.epsilon.researcher import EpsilonResearcher
-from src.pods.templates.epsilon.signal_agent import EpsilonSignalAgent
-from src.pods.templates.epsilon.pm_agent import EpsilonPMAgent
-from src.pods.templates.epsilon.risk_agent import EpsilonRiskAgent
-from src.pods.templates.epsilon.execution_trader import EpsilonExecutionTrader
-from src.pods.templates.epsilon.ops_agent import EpsilonOpsAgent
+from src.core.config.universes import POD_UNIVERSES
+from src.pods.templates.equities.researcher import EquitiesResearcher
+from src.pods.templates.equities.signal_agent import EquitiesSignalAgent
+from src.pods.templates.equities.pm_agent import EquitiesPMAgent
+from src.pods.templates.equities.risk_agent import EquitiesRiskAgent
+from src.pods.templates.equities.execution_trader import EquitiesExecutionTrader
+from src.pods.templates.equities.ops_agent import EquitiesOpsAgent
+from src.pods.templates.fx.researcher import FXResearcher
+from src.pods.templates.fx.signal_agent import FXSignalAgent
+from src.pods.templates.fx.pm_agent import FXPMAgent
+from src.pods.templates.fx.risk_agent import FXRiskAgent
+from src.pods.templates.fx.execution_trader import FXExecutionTrader
+from src.pods.templates.fx.ops_agent import FXOpsAgent
+from src.pods.templates.crypto.researcher import CryptoResearcher
+from src.pods.templates.crypto.signal_agent import CryptoSignalAgent
+from src.pods.templates.crypto.pm_agent import CryptoPMAgent
+from src.pods.templates.crypto.risk_agent import CryptoRiskAgent
+from src.pods.templates.crypto.execution_trader import CryptoExecutionTrader
+from src.pods.templates.crypto.ops_agent import CryptoOpsAgent
+from src.pods.templates.commodities.researcher import CommoditiesResearcher
+from src.pods.templates.commodities.signal_agent import CommoditiesSignalAgent
+from src.pods.templates.commodities.pm_agent import CommoditiesPMAgent
+from src.pods.templates.commodities.risk_agent import CommoditiesRiskAgent
+from src.pods.templates.commodities.execution_trader import CommoditiesExecutionTrader
+from src.pods.templates.commodities.ops_agent import CommoditiesOpsAgent
 from src.web.server import create_app
 
 logger = logging.getLogger(__name__)
 
-POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+POD_IDS = ["equities", "fx", "crypto", "commodities"]
 
-# Pod agent factories keyed by pod_id
 POD_AGENTS = {
-    "alpha": {
-        "researcher": BetaResearcher,  # Reuse Beta agents for Alpha (placeholder)
-        "signal": BetaSignalAgent,
-        "pm": BetaPMAgent,
-        "risk": BetaRiskAgent,
-        "exec_trader": BetaExecutionTrader,
-        "ops": BetaOpsAgent,
+    "equities": {
+        "researcher": EquitiesResearcher,
+        "signal": EquitiesSignalAgent,
+        "pm": EquitiesPMAgent,
+        "risk": EquitiesRiskAgent,
+        "exec_trader": EquitiesExecutionTrader,
+        "ops": EquitiesOpsAgent,
     },
-    "beta": {
-        "researcher": BetaResearcher,
-        "signal": BetaSignalAgent,
-        "pm": BetaPMAgent,
-        "risk": BetaRiskAgent,
-        "exec_trader": BetaExecutionTrader,
-        "ops": BetaOpsAgent,
+    "fx": {
+        "researcher": FXResearcher,
+        "signal": FXSignalAgent,
+        "pm": FXPMAgent,
+        "risk": FXRiskAgent,
+        "exec_trader": FXExecutionTrader,
+        "ops": FXOpsAgent,
     },
-    "gamma": {
-        "researcher": GammaResearcher,
-        "signal": GammaSignalAgent,
-        "pm": GammaPMAgent,
-        "risk": GammaRiskAgent,
-        "exec_trader": GammaExecutionTrader,
-        "ops": GammaOpsAgent,
+    "crypto": {
+        "researcher": CryptoResearcher,
+        "signal": CryptoSignalAgent,
+        "pm": CryptoPMAgent,
+        "risk": CryptoRiskAgent,
+        "exec_trader": CryptoExecutionTrader,
+        "ops": CryptoOpsAgent,
     },
-    "delta": {
-        "researcher": DeltaResearcher,
-        "signal": DeltaSignalAgent,
-        "pm": DeltaPMAgent,
-        "risk": DeltaRiskAgent,
-        "exec_trader": DeltaExecutionTrader,
-        "ops": DeltaOpsAgent,
-    },
-    "epsilon": {
-        "researcher": EpsilonResearcher,
-        "signal": EpsilonSignalAgent,
-        "pm": EpsilonPMAgent,
-        "risk": EpsilonRiskAgent,
-        "exec_trader": EpsilonExecutionTrader,
-        "ops": EpsilonOpsAgent,
+    "commodities": {
+        "researcher": CommoditiesResearcher,
+        "signal": CommoditiesSignalAgent,
+        "pm": CommoditiesPMAgent,
+        "risk": CommoditiesRiskAgent,
+        "exec_trader": CommoditiesExecutionTrader,
+        "ops": CommoditiesOpsAgent,
     },
 }
 
@@ -113,11 +114,11 @@ class SessionManager:
     """Manage live paper trading session.
 
     Responsibilities:
-    1. Initialize Alpaca adapter and 5 pods with capital
-    2. Fetch real-time bars from Alpaca
-    3. Push bars to pod runtimes
-    4. Run governance loops periodically
-    5. Emit pod summaries to EventBus
+    1. Initialize Alpaca adapter and 4 pods (equities, fx, crypto, commodities) with capital
+    2. Fetch hourly bars per-pod universe from Alpaca
+    3. Push bars to pod runtimes, run researcher + signal + PM agent cycles
+    4. Run governance loops periodically (CEO, CIO, CRO)
+    5. Emit pod summaries + research enrichment to EventBus
     6. Log all activity (trades, reasoning, conversations)
     """
 
@@ -128,6 +129,7 @@ class SessionManager:
         audit_log: Optional[AuditLog] = None,
         session_dir: Optional[str] = None,
         enable_web_server: bool = False,
+        enable_news_adapters: bool = False,
     ):
         """Initialize session manager.
 
@@ -137,9 +139,18 @@ class SessionManager:
             audit_log: AuditLog for EventBus (default in-memory)
             session_dir: Directory for logging (default auto-generated)
             enable_web_server: Enable FastAPI web server (default False)
+            enable_news_adapters: Create FRED/GDELT/RSS adapters (default False)
         """
+        self._enable_news_adapters = enable_news_adapters
         self._alpaca = alpaca_adapter or AlpacaAdapter()
-        self._audit_log = audit_log or AuditLog()
+        # Use file-based DuckDB if session_dir is provided for persistence across restarts
+        if audit_log:
+            self._audit_log = audit_log
+        elif session_dir:
+            db_path = str(Path(session_dir) / "audit.duckdb")
+            self._audit_log = AuditLog(db_path=db_path)
+        else:
+            self._audit_log = AuditLog()
         self._event_bus = event_bus or EventBus(audit_log=self._audit_log)
         self._session_logger = SessionLogger(session_dir=session_dir)
         self._data_provider = DataProvider(bus=self._event_bus, audit_log=self._audit_log)
@@ -178,7 +189,7 @@ class SessionManager:
             initial_symbols: Symbols to trade (default ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'AMZN'])
         """
         if initial_symbols is None:
-            initial_symbols = ["AAPL", "MSFT", "GOOGL", "TSLA", "AMZN"]
+            initial_symbols = ["SPY", "QQQ", "GLD", "BTC/USD", "UUP"]
 
         self._start_time = datetime.now()
         self._capital_per_pod = capital_per_pod
@@ -211,12 +222,13 @@ class SessionManager:
             # Initialize pods with capital allocation
             for pod_id in POD_IDS:
                 # Create PodConfig with sensible defaults for live trading
+                pod_universe = POD_UNIVERSES.get(pod_id, initial_symbols)
                 pod_config = PodConfig(
                     pod_id=pod_id,
                     name=f"{pod_id.capitalize()} Strategy",
                     strategy_family="multi-signal",
-                    universe=initial_symbols,
-                    time_horizon=TimeHorizon.INTRADAY,
+                    universe=pod_universe,
+                    time_horizon=TimeHorizon.SWING,
                     risk_budget=RiskBudget(
                         target_vol=0.10,
                         max_leverage=2.0,
@@ -263,23 +275,56 @@ class SessionManager:
                 # Instantiate the 6 pod agents using pod-specific factories
                 agent_classes = POD_AGENTS[pod_id]
 
-                # For Gamma pod, create and inject PolymarketAdapter
+                # Shared adapters (created once, reused across pods).
+                # Only created when enable_news_adapters=True.
+                if not hasattr(self, '_news_adapters_initialized'):
+                    self._news_adapters_initialized = True
+                    if self._enable_news_adapters:
+                        self._fred_adapter: FredAdapter | None = FredAdapter()
+                        self._rss_adapter: RssAdapter | None = RssAdapter()
+                        self._gdelt_adapter: GdeltAdapter | None = GdeltAdapter()
+                        self._x_adapter: XAdapter | None = XAdapter()
+                        logger.info("[session] MVP3 news adapters enabled (incl. news RSS feeds)")
+                        # Live price feeds: StockPrices.dev + CoinMarketCap + Alpha Vantage
+                        self._price_service: PriceService | None = PriceService(
+                            stockprices=StockPricesAdapter(),
+                            coinmarketcap=CoinMarketCapAdapter(),
+                            alphavantage=AlphaVantageAdapter(),
+                        )
+                    else:
+                        self._fred_adapter = None
+                        self._rss_adapter = None
+                        self._gdelt_adapter = None
+                        self._x_adapter = None
+                        self._price_service = None
+
+                # All pods get all available research adapters
+                poly_adapter = PolymarketAdapter()
+                market_tracker = MarketTracker(max_markets=30)
                 researcher_kwargs = {
                     "agent_id": f"{pod_id}.researcher",
                     "pod_id": pod_id,
                     "namespace": namespace,
                     "bus": self._event_bus,
+                    "polymarket_adapter": poly_adapter,
+                    "market_tracker": market_tracker,
                 }
-                if pod_id == "gamma":
-                    poly_adapter = PolymarketAdapter()
-                    researcher_kwargs["polymarket_adapter"] = poly_adapter
+                if self._fred_adapter:
+                    researcher_kwargs["fred_adapter"] = self._fred_adapter
+                if self._rss_adapter:
+                    researcher_kwargs["rss_adapter"] = self._rss_adapter
+                if self._x_adapter:
+                    researcher_kwargs["x_adapter"] = self._x_adapter
+                if self._price_service:
+                    researcher_kwargs["price_service"] = self._price_service
 
                 researcher = agent_classes["researcher"](**researcher_kwargs)
                 signal = agent_classes["signal"](
                     agent_id=f"{pod_id}.signal", pod_id=pod_id, namespace=namespace, bus=self._event_bus
                 )
                 pm = agent_classes["pm"](
-                    agent_id=f"{pod_id}.pm", pod_id=pod_id, namespace=namespace, bus=self._event_bus
+                    agent_id=f"{pod_id}.pm", pod_id=pod_id, namespace=namespace, bus=self._event_bus,
+                    session_logger=self._session_logger
                 )
                 risk = agent_classes["risk"](
                     agent_id=f"{pod_id}.risk", pod_id=pod_id, namespace=namespace, bus=self._event_bus
@@ -344,9 +389,13 @@ class SessionManager:
             )
             logger.info("[session_manager] GovernanceOrchestrator initialized: CEO, CIO, CRO")
 
-            # Fetch initial market snapshot
-            bars = await self._alpaca.fetch_bars(initial_symbols)
-            logger.info("[session_manager] Fetched initial bars for %d symbols", len(bars))
+            # Fetch initial market snapshot (small sample across all pods)
+            sample_symbols = ["SPY", "QQQ", "GLD", "BTC/USD", "UUP"]
+            try:
+                bars = await self._alpaca.fetch_bars(sample_symbols)
+                logger.info("[session_manager] Fetched initial bars for %d symbols", len(bars))
+            except Exception as e:
+                logger.warning("[session_manager] Initial bar fetch failed (non-fatal): %s", e)
 
             # Initialize web server if enabled
             if self._enable_web_server:
@@ -399,6 +448,21 @@ class SessionManager:
                 except Exception:
                     pod_dicts[pod_id] = {}
 
+                # Inject research data for all pods
+                if pod_id in self._pod_runtimes:
+                    ns = self._pod_runtimes[pod_id]._ns
+                    pod_dicts[pod_id]["polymarket_signals"] = ns.get("polymarket_signals") or []
+                    pod_dicts[pod_id]["polymarket_confidence"] = ns.get("polymarket_confidence") or 0.5
+                    pod_dicts[pod_id]["macro_score"] = ns.get("macro_score")
+                    pod_dicts[pod_id]["fred_snapshot"] = ns.get("fred_snapshot") or {}
+                    pod_dicts[pod_id]["fred_score"] = ns.get("fred_score") or 0.0
+                    pod_dicts[pod_id]["poly_sentiment"] = ns.get("poly_sentiment") or 0.0
+                    pod_dicts[pod_id]["social_score"] = ns.get("social_score") or 0.0
+                    all_feed = ns.get("x_feed") or []
+                    pod_dicts[pod_id]["x_feed"] = all_feed[:100]
+                    pod_dicts[pod_id]["x_tweet_count"] = len(all_feed)
+                    pod_dicts[pod_id]["features"] = ns.get("features") or {}
+
             await self._web_app.state.update_session_state(
                 iteration=self._iteration,
                 capital_per_pod=self._capital_per_pod,
@@ -411,16 +475,16 @@ class SessionManager:
 
     async def run_event_loop(
         self,
-        interval_seconds: float = 60.0,
-        governance_freq: int = 5,  # Run governance every N iterations
+        interval_seconds: float = 3600.0,
+        governance_freq: int = 4,
     ) -> None:
         """Run the main event loop.
 
-        Fetches bars, pushes to pods, runs governance, emits summaries.
+        Fetches bars per-pod universe, runs agent cycles, governance, summaries.
 
         Args:
-            interval_seconds: Sleep between iterations (default 60 sec = 1 min)
-            governance_freq: Run governance every N iterations (default 5 = every 5 min)
+            interval_seconds: Sleep between iterations (default 3600 sec = 1 hour)
+            governance_freq: Run governance every N iterations (default 4 = every 4 hours)
         """
         if not self._session_active:
             raise RuntimeError("Session not started; call start_live_session() first")
@@ -432,22 +496,11 @@ class SessionManager:
         )
 
         try:
-            symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]  # Trading universe
-
             while self._session_active:
                 self._iteration += 1
 
                 try:
-                    # 1. Fetch latest bars from Alpaca
-                    try:
-                        bars = await self._alpaca.fetch_bars(symbols, timeframe="1Min")
-                        logger.debug("[session_manager] [iter %d] Fetched bars for %d symbols", self._iteration, len(bars))
-                    except Exception as e:
-                        logger.error("[session_manager] [iter %d] Failed to fetch bars: %s", self._iteration, e)
-                        await asyncio.sleep(interval_seconds)
-                        continue  # Skip this iteration on fetch failure
-
-                    # 2. Inject governance state to all pods (before bar processing)
+                    # 1. Inject governance state to all pods (before bar processing)
                     for pod_id, runtime in self._pod_runtimes.items():
                         runtime.set_governance_state(
                             mandate=self._latest_mandate,
@@ -455,21 +508,110 @@ class SessionManager:
                             risk_halt_reason=self._risk_halt_reason,
                         )
 
-                    # 3. Push bars to each pod (async)
+                    # 2. Run researcher cycles for all pods (so they can update universe)
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        try:
+                            researcher = runtime._researcher
+                            if researcher:
+                                res = await researcher.run_cycle({"bar": None})
+                                logger.info(
+                                    "[session_manager] [iter %d] %s researcher: %d signals",
+                                    self._iteration, pod_id,
+                                    len(res.get("poly_signals", [])),
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[session_manager] [iter %d] %s researcher failed: %s",
+                                self._iteration, pod_id, e,
+                            )
+
+                    # 3. Update gateway universes from namespace
                     for pod_id, gateway in self._pod_gateways.items():
+                        runtime = self._pod_runtimes[pod_id]
+                        gateway.set_universe(runtime._ns.get("universe") or POD_UNIVERSES.get(pod_id, []))
+
+                    # 4. Per-pod: fetch bars for updated universes, push to gateway, mark-to-market
+                    pod_latest_bars: dict[str, Bar | None] = {}
+                    for pod_id, gateway in self._pod_gateways.items():
+                        runtime = self._pod_runtimes[pod_id]
+                        pod_symbols = runtime._ns.get("universe") or POD_UNIVERSES.get(pod_id, [])
+
+                        try:
+                            bars = await self._alpaca.fetch_bars(pod_symbols, timeframe="1Hour")
+                            logger.info("[session_manager] [iter %d] Pod %s: fetched bars for %d symbols",
+                                       self._iteration, pod_id, len(bars))
+                        except Exception as e:
+                            logger.error("[session_manager] [iter %d] Pod %s: bar fetch failed: %s",
+                                        self._iteration, pod_id, e)
+                            pod_latest_bars[pod_id] = None
+                            continue
+
+                        tick_prices = {}
+                        latest_bar = None
+                        bars_count = 0
                         for symbol in bars:
                             for bar in bars[symbol]:
                                 try:
                                     await gateway.push_bar(bar)
+                                    tick_prices[bar.symbol] = bar.close
+                                    latest_bar = bar
+                                    bars_count += 1
                                 except Exception as e:
-                                    logger.warning(
-                                        "[session_manager] [iter %d] Failed to push bar to %s: %s",
-                                        self._iteration, pod_id, e
-                                    )
+                                    logger.warning("[session_manager] push_bar failed for %s: %s", symbol, e)
+
+                        if tick_prices:
+                            accountant = runtime._ns.get("accountant")
+                            if accountant:
+                                accountant.mark_to_market(tick_prices)
+
+                        pod_latest_bars[pod_id] = latest_bar
+                        logger.info("[session_manager] [iter %d] Pod %s: ingested %d bars, mark-to-market done",
+                                    self._iteration, pod_id, bars_count)
+
+                    # 5. Run agent decision cycle ONCE per pod (signal → PM → risk → exec → ops)
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        bar = pod_latest_bars.get(pod_id)
+                        if bar is None:
+                            continue
+                        try:
+                            await runtime.run_cycle(bar)
+                            logger.info("[session_manager] [iter %d] Pod %s: agent cycle complete", self._iteration, pod_id)
+
+                            # Publish PM decision activity for live intelligence feed
+                            try:
+                                ns = runtime._ns
+                                last_decision = ns.get("last_pm_decision")
+                                if last_decision:
+                                    summary_text = last_decision.get("action_summary", "holding")
+                                    detail_text = last_decision.get("reasoning", "")
+                                else:
+                                    summary_text = "holding"
+                                    detail_text = ""
+                                activity_msg = AgentMessage(
+                                    timestamp=datetime.now(timezone.utc),
+                                    sender=f"{pod_id}.pm",
+                                    recipient="dashboard",
+                                    topic="agent.activity",
+                                    payload={
+                                        "agent_id": f"{pod_id}_pm",
+                                        "agent_role": "PM",
+                                        "pod_id": pod_id,
+                                        "action": "trade_decision",
+                                        "summary": f"{pod_id.upper()} PM: {summary_text}"[:200],
+                                        "detail": detail_text[:500],
+                                    },
+                                )
+                                await self._event_bus.publish("agent.activity", activity_msg, publisher_id=f"{pod_id}.pm")
+                            except Exception:
+                                pass
+
+                        except Exception as e:
+                            logger.warning("[session_manager] [iter %d] Pod %s agent cycle failed: %s",
+                                          self._iteration, pod_id, e)
 
                     # 4. Collect pod summaries for governance and emission
                     pod_summaries = await self._collect_pod_summaries()
-                    logger.debug("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
+                    logger.info("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
 
                     # 5. Emit pod summaries to EventBus (for TUI and DataProvider)
                     for pod_id, gateway in self._pod_gateways.items():
@@ -486,6 +628,34 @@ class SessionManager:
                                     "[session_manager] [iter %d] Failed to emit summary for %s: %s",
                                     self._iteration, pod_id, e
                                 )
+
+                    # 5.1 Broadcast research enrichment data for all pods
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        try:
+                            ns = runtime._ns
+                            msg = AgentMessage(
+                                timestamp=datetime.now(timezone.utc),
+                                sender=f"pod.{pod_id}",
+                                recipient="broadcast",
+                                topic=f"pod.{pod_id}.gateway",
+                                payload={
+                                    "pod_id": pod_id,
+                                    "polymarket_signals": ns.get("polymarket_signals") or [],
+                                    "polymarket_confidence": ns.get("polymarket_confidence") or 0.5,
+                                    "macro_score": ns.get("macro_score"),
+                                    "fred_snapshot": ns.get("fred_snapshot") or {},
+                                    "fred_score": ns.get("fred_score") or 0.0,
+                                    "poly_sentiment": ns.get("poly_sentiment") or 0.0,
+                                    "social_score": ns.get("social_score") or 0.0,
+                                    "x_feed": (ns.get("x_feed") or [])[:100],
+                                    "x_tweet_count": len(ns.get("x_feed") or []),
+                                },
+                            )
+                            await self._event_bus.publish(
+                                f"pod.{pod_id}.gateway", msg, publisher_id=f"pod.{pod_id}"
+                            )
+                        except Exception as e:
+                            logger.debug("[session_manager] %s enrichment broadcast failed: %s", pod_id, e)
 
                     # 5.5. Update web server state with latest summaries
                     if self._enable_web_server:
@@ -548,13 +718,38 @@ class SessionManager:
                                     self._iteration, breached_pods
                                 )
 
+                            # Publish governance summary activity
+                            try:
+                                gov_summary = (
+                                    f"Governance cycle complete. "
+                                    f"Breached: {breached_pods or 'none'}. "
+                                    f"Risk halt: {self._risk_halt}."
+                                )
+                                gov_activity = AgentMessage(
+                                    timestamp=datetime.now(timezone.utc),
+                                    sender="governance",
+                                    recipient="dashboard",
+                                    topic="agent.activity",
+                                    payload={
+                                        "agent_id": "governance",
+                                        "agent_role": "CRO",
+                                        "pod_id": "firm",
+                                        "action": "governance_cycle",
+                                        "summary": gov_summary[:200],
+                                        "detail": "",
+                                    },
+                                )
+                                await self._event_bus.publish("agent.activity", gov_activity, publisher_id="governance")
+                            except Exception:
+                                pass
+
                         except Exception as e:
                             logger.error(
                                 "[session_manager] [iter %d] Governance cycle failed: %s",
                                 self._iteration, e, exc_info=True
                             )
 
-                    # 7. Periodic account logging
+                    # 7. Periodic account logging + position reconciliation
                     if self._iteration % 10 == 0:
                         try:
                             account = await self._alpaca.fetch_account()
@@ -566,6 +761,8 @@ class SessionManager:
                             )
                         except Exception as e:
                             logger.warning("[session_manager] [iter %d] Failed to fetch account: %s", self._iteration, e)
+
+                        await self._reconcile_positions()
 
                     # 8. Sleep
                     await asyncio.sleep(interval_seconds)
@@ -585,7 +782,7 @@ class SessionManager:
         """Publish pod summary to EventBus for TUI consumption.
 
         Args:
-            pod_id: ID of the pod (e.g., 'alpha', 'beta')
+            pod_id: ID of the pod (e.g., 'equities', 'fx')
             summary: Pod summary dict with risk_metrics, positions, etc.
         """
         msg = AgentMessage(
@@ -614,6 +811,33 @@ class SessionManager:
                 logger.warning("[session_manager] Error collecting summary for pod %s: %s", pod_id, exc)
                 # Continue with next pod even if one fails
         return summaries
+
+    async def _reconcile_positions(self) -> None:
+        """Compare Alpaca positions against per-pod accountant positions.
+
+        Alpaca tracks aggregate positions (not per-pod), so this is
+        best-effort.  Discrepancies are logged as warnings, not auto-corrected.
+        """
+        try:
+            alpaca_positions = await self._alpaca.get_open_positions()
+            for pod_id, runtime in self._pod_runtimes.items():
+                accountant = runtime._ns.get("accountant")
+                if not accountant:
+                    continue
+                for symbol, snapshot in accountant.current_positions.items():
+                    alpaca_pos = alpaca_positions.get(symbol)
+                    if alpaca_pos is None:
+                        logger.warning(
+                            "[reconcile] %s has %s in accountant but NOT in Alpaca",
+                            pod_id, symbol,
+                        )
+                    elif abs(alpaca_pos["qty"] - snapshot.qty) > 0.01:
+                        logger.warning(
+                            "[reconcile] %s %s qty mismatch: accountant=%.2f, alpaca=%.2f",
+                            pod_id, symbol, snapshot.qty, alpaca_pos["qty"],
+                        )
+        except Exception as e:
+            logger.warning("[reconcile] Position reconciliation failed: %s", e)
 
     async def stop_session(self) -> dict:
         """Stop event loop and gracefully shut down all pods.
@@ -654,6 +878,13 @@ class SessionManager:
         except Exception as e:
             logger.error("[session_manager] Error closing session logger: %s", e)
 
+        # Close DuckDB audit log to release file lock (critical on Windows)
+        try:
+            self._audit_log.close()
+            logger.info("[session_manager] Audit log closed")
+        except Exception as e:
+            logger.warning("[session_manager] Error closing audit log: %s", e)
+
         # Calculate uptime
         uptime_seconds = (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else 0
 
@@ -664,6 +895,11 @@ class SessionManager:
             "pods_closed": closed_count,
             "final_capital": self._capital_per_pod * len(self._pod_runtimes),
         }
+
+    @property
+    def event_bus(self) -> EventBus:
+        """Access the EventBus instance for external consumers (e.g., TUI)."""
+        return self._event_bus
 
     @property
     def data_provider(self) -> DataProvider:

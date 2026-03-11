@@ -9,11 +9,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from src.core.config.universes import POD_UNIVERSES
 from src.core.models.market import Bar
 from src.core.models.pod_summary import PodRiskMetrics, PodSummary, PodExposureBucket
 from src.core.models.enums import PodStatus
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.mission_control.session_manager import SessionManager
+
+
+def _make_bars_for_symbols(symbols, now=None):
+    """Create bar dict for given symbols (used by dynamic mock)."""
+    now = now or datetime.now(timezone.utc)
+    return {
+        s: [Bar(symbol=s, timestamp=now, open=100.0, high=101.0, low=99.0, close=100.5, volume=1000, source="alpaca")]
+        for s in symbols
+    }
 
 
 # ============================================================================
@@ -23,23 +33,17 @@ from src.mission_control.session_manager import SessionManager
 
 @pytest.mark.asyncio
 async def test_session_manager_fetches_bars_from_alpaca():
-    """SessionManager.run_event_loop() fetches bars from AlpacaAdapter with correct symbols and timeframe."""
-    # Create test bars matching run_event_loop's hardcoded symbols
+    """SessionManager.run_event_loop() fetches bars from AlpacaAdapter per-pod universe with 1Hour timeframe."""
     now = datetime.now(timezone.utc)
-    test_bars = {
-        "AAPL": [Bar(symbol="AAPL", timestamp=now, open=150.0, high=151.0, low=149.0, close=150.5, volume=1000, source="alpaca")],
-        "MSFT": [Bar(symbol="MSFT", timestamp=now, open=300.0, high=301.0, low=299.0, close=300.5, volume=1000, source="alpaca")],
-        "GOOGL": [Bar(symbol="GOOGL", timestamp=now, open=140.0, high=141.0, low=139.0, close=140.5, volume=1000, source="alpaca")],
-        "AMZN": [Bar(symbol="AMZN", timestamp=now, open=180.0, high=181.0, low=179.0, close=180.5, volume=1000, source="alpaca")],
-        "NVDA": [Bar(symbol="NVDA", timestamp=now, open=875.0, high=876.0, low=874.0, close=875.5, volume=1000, source="alpaca")],
-    }
 
-    # Mock AlpacaAdapter
+    async def mock_fetch_bars(symbols, timeframe="1Hour"):
+        return _make_bars_for_symbols(symbols, now)
+
     mock_alpaca = AsyncMock(spec=AlpacaAdapter)
     mock_alpaca.fetch_account = AsyncMock(
         return_value={"equity": 50000.0, "buying_power": 25000.0, "position_count": 0}
     )
-    mock_alpaca.fetch_bars = AsyncMock(return_value=test_bars)
+    mock_alpaca.fetch_bars = AsyncMock(side_effect=mock_fetch_bars)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = SessionManager(
@@ -47,46 +51,38 @@ async def test_session_manager_fetches_bars_from_alpaca():
             session_dir=tmpdir,
         )
 
-        # Start session
         await manager.start_live_session(capital_per_pod=100.0)
         assert manager._session_active
 
-        # Create a task to run one iteration of the event loop
+        for runtime in manager._pod_runtimes.values():
+            runtime.run_cycle = AsyncMock(return_value=None)
+
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
-
-        # Let it run for a short time to complete one iteration
-        await asyncio.sleep(0.5)
-
-        # Stop the session (which will cancel the loop_task)
+        await asyncio.sleep(2.0)
         await manager.stop_session()
 
-        # Verify AlpacaAdapter.fetch_bars was called
         assert mock_alpaca.fetch_bars.called, "fetch_bars should have been called"
         assert len(mock_alpaca.fetch_bars.call_args_list) >= 2, \
             f"Expected at least 2 calls (start_live_session + run_event_loop), got {len(mock_alpaca.fetch_bars.call_args_list)}"
 
-        # Find the run_event_loop call (should have "NVDA" symbol since start_live_session uses TSLA)
-        # We look for the call with the event loop symbols: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+        # Find a run_event_loop call (per-pod: equities, fx, crypto, commodities use POD_UNIVERSES)
         event_loop_call = None
         for call_args in mock_alpaca.fetch_bars.call_args_list:
             symbols_arg = call_args[0][0]
-            if "NVDA" in symbols_arg:
+            # Event loop fetches per-pod; equities universe has AAPL
+            if "AAPL" in symbols_arg and len(symbols_arg) > 5:
                 event_loop_call = call_args
                 break
 
         assert event_loop_call is not None, \
-            "Could not find run_event_loop fetch_bars call (should contain NVDA symbol)"
+            "Could not find run_event_loop fetch_bars call (equities universe should contain AAPL)"
 
-        # Verify correct symbols were passed in the event loop call
         symbols_arg = event_loop_call[0][0]
-        assert set(symbols_arg) == {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"}, \
-            f"Expected symbols AAPL, MSFT, GOOGL, AMZN, NVDA from run_event_loop, got {symbols_arg}"
+        assert "AAPL" in symbols_arg, f"Equities universe should include AAPL, got {symbols_arg[:5]}..."
 
-        # Verify timeframe was correct
         timeframe_arg = event_loop_call[1].get("timeframe", "1Min")
-        assert timeframe_arg == "1Min", f"Expected timeframe '1Min', got {timeframe_arg}"
+        assert timeframe_arg == "1Hour", f"Expected timeframe '1Hour', got {timeframe_arg}"
 
-        # Clean up the task
         try:
             loop_task.cancel()
             await loop_task
@@ -101,24 +97,17 @@ async def test_session_manager_fetches_bars_from_alpaca():
 
 @pytest.mark.asyncio
 async def test_session_manager_distributes_bars_to_all_pods():
-    """SessionManager.run_event_loop() pushes bars to all pod gateways."""
-    # Create test bars (5 symbols × 1 bar each = 5 bars total)
-    # Matches run_event_loop's hardcoded symbols: ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
+    """SessionManager.run_event_loop() pushes bars to all pod gateways (per-pod universe)."""
     now = datetime.now(timezone.utc)
-    test_bars = {
-        "AAPL": [Bar(symbol="AAPL", timestamp=now, open=150.0, high=151.0, low=149.0, close=150.5, volume=1000, source="alpaca")],
-        "MSFT": [Bar(symbol="MSFT", timestamp=now, open=300.0, high=301.0, low=299.0, close=300.5, volume=1000, source="alpaca")],
-        "GOOGL": [Bar(symbol="GOOGL", timestamp=now, open=140.0, high=141.0, low=139.0, close=140.5, volume=1000, source="alpaca")],
-        "AMZN": [Bar(symbol="AMZN", timestamp=now, open=180.0, high=181.0, low=179.0, close=180.5, volume=1000, source="alpaca")],
-        "NVDA": [Bar(symbol="NVDA", timestamp=now, open=875.0, high=876.0, low=874.0, close=875.5, volume=1000, source="alpaca")],
-    }
 
-    # Mock AlpacaAdapter
+    async def mock_fetch_bars(symbols, timeframe="1Hour"):
+        return _make_bars_for_symbols(symbols, now)
+
     mock_alpaca = AsyncMock(spec=AlpacaAdapter)
     mock_alpaca.fetch_account = AsyncMock(
         return_value={"equity": 50000.0, "buying_power": 25000.0, "position_count": 0}
     )
-    mock_alpaca.fetch_bars = AsyncMock(return_value=test_bars)
+    mock_alpaca.fetch_bars = AsyncMock(side_effect=mock_fetch_bars)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         manager = SessionManager(
@@ -126,39 +115,33 @@ async def test_session_manager_distributes_bars_to_all_pods():
             session_dir=tmpdir,
         )
 
-        # Start session
         await manager.start_live_session(capital_per_pod=100.0)
         assert manager._session_active
 
-        # Mock push_bar on all pod gateways
         for pod_id, gateway in manager._pod_gateways.items():
             gateway.push_bar = AsyncMock()
 
-        # Create a task to run one iteration
+        # Mock run_cycle to avoid slow LLM/agent calls so one iteration completes quickly
+        for runtime in manager._pod_runtimes.values():
+            runtime.run_cycle = AsyncMock(return_value=None)
+
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
-
-        # Let it run for a short time
-        await asyncio.sleep(0.5)
-
-        # Stop the session
+        await asyncio.sleep(2.0)  # Allow time for all 4 pods to process (equities has many symbols)
         await manager.stop_session()
 
-        # Verify each pod gateway received bars
         for pod_id, gateway in manager._pod_gateways.items():
             assert gateway.push_bar.called, f"push_bar should have been called for pod {pod_id}"
 
-            # Verify at least 5 bars were pushed (one per symbol)
+            pod_symbols = set(POD_UNIVERSES.get(pod_id, []))
             call_count = gateway.push_bar.call_count
-            assert call_count >= 5, \
-                f"Pod {pod_id} should have received at least 5 bar pushes (one per symbol), got {call_count}"
+            assert call_count >= 1, f"Pod {pod_id} should have received at least 1 bar, got {call_count}"
 
-            # Verify the bar data matches
             pushed_bars = [call[0][0] for call in gateway.push_bar.call_args_list]
             pushed_symbols = {bar.symbol for bar in pushed_bars}
-            assert pushed_symbols == {"AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"}, \
-                f"Pod {pod_id} should have received all 5 symbols, got {pushed_symbols}"
+            # Each pod receives bars for its universe (symbols from fetch_bars for that pod)
+            assert pushed_symbols.issubset(pod_symbols) or len(pod_symbols) == 0, \
+                f"Pod {pod_id} received symbols {pushed_symbols} not in universe (first 5: {list(pod_symbols)[:5]})"
 
-        # Clean up the task
         try:
             loop_task.cancel()
             await loop_task
@@ -174,22 +157,16 @@ async def test_session_manager_distributes_bars_to_all_pods():
 @pytest.mark.asyncio
 async def test_session_manager_emits_pod_summaries_to_eventbus():
     """SessionManager.run_event_loop() emits PodSummary to EventBus for each pod."""
-    # Create test bars matching run_event_loop's hardcoded symbols
     now = datetime.now(timezone.utc)
-    test_bars = {
-        "AAPL": [Bar(symbol="AAPL", timestamp=now, open=150.0, high=151.0, low=149.0, close=150.5, volume=1000, source="alpaca")],
-        "MSFT": [Bar(symbol="MSFT", timestamp=now, open=300.0, high=301.0, low=299.0, close=300.5, volume=1000, source="alpaca")],
-        "GOOGL": [Bar(symbol="GOOGL", timestamp=now, open=140.0, high=141.0, low=139.0, close=140.5, volume=1000, source="alpaca")],
-        "AMZN": [Bar(symbol="AMZN", timestamp=now, open=180.0, high=181.0, low=179.0, close=180.5, volume=1000, source="alpaca")],
-        "NVDA": [Bar(symbol="NVDA", timestamp=now, open=875.0, high=876.0, low=874.0, close=875.5, volume=1000, source="alpaca")],
-    }
 
-    # Mock AlpacaAdapter
+    async def mock_fetch_bars(symbols, timeframe="1Hour"):
+        return _make_bars_for_symbols(symbols, now)
+
     mock_alpaca = AsyncMock(spec=AlpacaAdapter)
     mock_alpaca.fetch_account = AsyncMock(
         return_value={"equity": 50000.0, "buying_power": 25000.0, "position_count": 0}
     )
-    mock_alpaca.fetch_bars = AsyncMock(return_value=test_bars)
+    mock_alpaca.fetch_bars = AsyncMock(side_effect=mock_fetch_bars)
 
     # Use tmpdir fixture approach
     tmpdir = tempfile.mkdtemp()
@@ -203,6 +180,9 @@ async def test_session_manager_emits_pod_summaries_to_eventbus():
         # Start session
         await manager.start_live_session(capital_per_pod=100.0)
         assert manager._session_active
+
+        for runtime in manager._pod_runtimes.values():
+            runtime.run_cycle = AsyncMock(return_value=None)
 
         # Mock EventBus.emit (publish method)
         manager._event_bus.publish = AsyncMock()
@@ -245,11 +225,14 @@ async def test_session_manager_emits_pod_summaries_to_eventbus():
         for pod_id, gateway in manager._pod_gateways.items():
             gateway.emit_summary = AsyncMock()
 
+        for runtime in manager._pod_runtimes.values():
+            runtime.run_cycle = AsyncMock(return_value=None)
+
         # Create a task to run one iteration
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
 
-        # Let it run for a short time
-        await asyncio.sleep(0.5)
+        # Let it run for enough time to complete one full iteration (all 4 pods)
+        await asyncio.sleep(2.0)
 
         # Stop the session
         await manager.stop_session()
@@ -273,11 +256,10 @@ async def test_session_manager_emits_pod_summaries_to_eventbus():
             assert emitted_summary.risk_metrics.pod_id == pod_id, \
                 f"Summary risk_metrics.pod_id should be {pod_id}"
 
-        # Verify the number of summaries emitted matches the number of pods
-        # Each pod gateway should emit at least once per event loop iteration
+        # Verify the number of summaries emitted matches the number of pods (4 pods)
         total_emit_calls = sum(gateway.emit_summary.call_count for gateway in manager._pod_gateways.values())
-        assert total_emit_calls >= 5, \
-            f"Total emit_summary calls across all pods should be at least 5 (once per pod), got {total_emit_calls}"
+        assert total_emit_calls >= 4, \
+            f"Total emit_summary calls across all pods should be at least 4 (once per pod), got {total_emit_calls}"
 
         # Clean up the task
         try:

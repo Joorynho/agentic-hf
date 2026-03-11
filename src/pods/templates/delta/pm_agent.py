@@ -1,13 +1,13 @@
 from __future__ import annotations
 import logging
-import os
 from datetime import datetime, timezone
+from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
-_HAS_LLM = bool(os.getenv("ANTHROPIC_API_KEY"))
+_HAS_LLM = has_llm_key()
 BASE_QTY = 50.0
 SIGNAL_THRESHOLD = 0.5
 MAX_HOLD_BARS = 5
@@ -65,17 +65,12 @@ class DeltaPMAgent(BasePodAgent):
 
     async def _llm_decision(self, composite: float, bar) -> dict:
         try:
-            import anthropic, json
-            client = anthropic.Anthropic()
             prompt = (
                 f"Event-driven PM. Composite signal: {composite:.3f}. Price: {bar.close}. "
-                "Reply JSON: {\"action\": \"BUY\"|\"HOLD\", \"symbol\": \"AAPL\", \"rationale\": \"...\"}"
+                "Reply with JSON only: {\"action\": \"BUY\"|\"HOLD\", \"symbol\": \"AAPL\", \"rationale\": \"...\"}"
             )
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001", max_tokens=150,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            decision = json.loads(resp.content[0].text)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=150)
+            decision = extract_json(raw)
             if decision.get("action") == "HOLD":
                 return {}
             self.store("active_position", True)

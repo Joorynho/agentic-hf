@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -15,6 +16,7 @@ class PolymarketSignal(BaseModel):
     volume_24h: float
     open_interest: float
     timestamp: datetime
+    end_date: Optional[datetime] = None
     tags: list[str] = Field(default_factory=list)
     model_config = {"frozen": True}
 

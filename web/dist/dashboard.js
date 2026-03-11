@@ -1,0 +1,1105 @@
+'use strict';
+
+// ─── 1. Clock ─────────────────────────────────────────────────────────────
+function tick() {
+  document.getElementById('clock').textContent =
+    new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
+}
+tick(); setInterval(tick, 1000);
+
+// ─── 2. Signal History Persistence (localStorage, 7-day rolling) ────────────
+const HISTORY_STORAGE_KEY = 'aghf_signal_history';
+const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+function loadSignalHistory() {
+  try {
+    const raw = localStorage.getItem(HISTORY_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    const cutoff = new Date(Date.now() - HISTORY_MAX_AGE_MS).toISOString();
+    return parsed.filter(e => e && e.ts && Array.isArray(e.signals) && e.ts >= cutoff);
+  } catch(e) { return []; }
+}
+
+function saveSignalHistory() {
+  try {
+    const cutoff = new Date(Date.now() - HISTORY_MAX_AGE_MS).toISOString();
+    const trimmed = signalHistory.filter(e => e.ts >= cutoff);
+    localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(trimmed));
+  } catch(e) {}
+}
+
+var signalHistory = loadSignalHistory();
+
+// ─── 3. Tab Switching ─────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+  });
+});
+
+function switchResearchSubTab(name) {
+  document.querySelectorAll('.sub-tab-btn').forEach(b => {
+    b.classList.toggle('active', b.dataset.subtab === name);
+  });
+  document.querySelectorAll('.sub-tab-pane').forEach(p => {
+    p.classList.toggle('active', p.id === 'subtab-' + name);
+  });
+  if (name === 'historical' && researchHistoryChart) {
+    researchHistoryChart.resize();
+  }
+}
+document.querySelectorAll('.sub-tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => switchResearchSubTab(btn.dataset.subtab));
+});
+
+// ─── 4. WebSocket ────────────────────────────────────────────────────────
+const WS_URL = `ws://${window.location.host}/ws`;
+var ws = null;
+
+function setConn(on) {
+  const dot = document.getElementById('conn-dot');
+  const lbl = document.getElementById('conn-label');
+  dot.classList.toggle('on', on);
+  lbl.classList.toggle('on', on);
+  lbl.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
+}
+
+function connect() {
+  ws = new WebSocket(WS_URL);
+  ws.onopen = () => setConn(true);
+  ws.onclose = () => { setConn(false); setTimeout(connect, 3000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = ev => { try { handleMessage(JSON.parse(ev.data)); } catch(e) { console.error(e); } };
+}
+connect();
+
+// ─── 5. Research Tab Helpers ──────────────────────────────────────────────
+function formatPct(v) {
+  if (v == null) return '—';
+  return (v * 100).toFixed(1) + '%';
+}
+
+function formatVol(v) {
+  if (v == null || v === 0) return '—';
+  return '$' + (v / 1_000_000).toFixed(1) + 'M';
+}
+
+function formatTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toLocaleTimeString('en-GB', { hour12: false });
+}
+
+function truncate(str, n) {
+  if (!str) return '—';
+  return str.length > n ? str.slice(0, n) + '…' : str;
+}
+
+function formatEndDate(d) {
+  if (!d) return '—';
+  const dt = typeof d === 'string' ? new Date(d) : d;
+  return dt.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function formatDelta(curr, prev) {
+  if (curr == null || prev == null) return '—';
+  const d = (curr - prev) * 100;
+  const s = d >= 0 ? '+' : '';
+  return s + d.toFixed(1) + 'pp';
+}
+
+function statusBadge(status) {
+  if (!status) return '<span class="status-pill active">Active</span>';
+  const s = String(status).toUpperCase();
+  const cls = s === 'ACTIVE' ? 'active' : s === 'HALTED' ? 'halted' : s === 'CLOSED' ? 'closed' : 'idle';
+  return '<span class="status-pill ' + cls + '">' + escapeHtml(s) + '</span>';
+}
+
+function escapeHtml(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function renderCurrentMarkets(signals) {
+  const tbody = document.getElementById('current-markets-body');
+  const countEl = document.getElementById('market-count');
+  const timeEl = document.getElementById('last-fetch-time');
+  if (!tbody) return;
+
+  document.getElementById('kpi-market-count').textContent = signals.length || '—';
+  const avgProb = signals.length
+    ? (signals.reduce((s, x) => s + (x.implied_prob || 0), 0) / signals.length)
+    : null;
+  document.getElementById('kpi-avg-prob').textContent = formatPct(avgProb);
+
+  if (countEl) countEl.textContent = signals.length;
+  if (timeEl && signals.length) {
+    const ts = signals[0].timestamp;
+    timeEl.textContent = typeof ts === 'string' ? formatTime(ts) : formatTime(ts && ts.toISOString ? ts.toISOString() : ts);
+  }
+
+  if (!signals.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="8">No Polymarket data — check POLYMARKET_API_KEY in .env</td></tr>';
+    return;
+  }
+
+  const prevByMarket = {};
+  if (signalHistory.length) {
+    const last = signalHistory[signalHistory.length - 1].signals || [];
+    last.forEach(s => { prevByMarket[s.market_id || s.question] = s.implied_prob; });
+  }
+
+  tbody.innerHTML = signals.map(s => {
+    const q = s.question || s.market || JSON.stringify(s);
+    const prevProb = prevByMarket[s.market_id || q];
+    const delta = formatDelta(s.implied_prob, prevProb);
+    return '<tr title="' + escapeHtml(q).replace(/"/g, '&quot;') + '">' +
+      '<td>' + truncate(q, 40) + '</td>' +
+      '<td class="num">' + statusBadge(s.status || 'Active') + '</td>' +
+      '<td class="num">' + (s.yes_price != null ? s.yes_price.toFixed(2) : '—') + '</td>' +
+      '<td class="num">' + (s.no_price != null ? s.no_price.toFixed(2) : '—') + '</td>' +
+      '<td class="num accent">' + formatPct(s.implied_prob) + '</td>' +
+      '<td class="num">' + delta + '</td>' +
+      '<td class="num">' + formatVol(s.volume_24h) + '</td>' +
+      '<td class="num">' + formatEndDate(s.end_date) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+const COLORS = ['#00cfe8', '#f0a030', '#00c888', '#7c5cfc', '#e84040'];
+const MAX_MARKETS = 5;
+const BUCKET_MS = 4 * 60 * 60 * 1000;
+const WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+function initResearchHistoryChart() {
+  const ctx = document.getElementById('research-history-chart');
+  if (!ctx || researchHistoryChart) return;
+
+  researchHistoryChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [] },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: {
+          labels: {
+            color: '#6a90aa',
+            font: { family: 'IBM Plex Mono', size: 9 },
+            boxWidth: 12,
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#3a556a', font: { size: 9 } },
+          grid: { color: '#1c2c3c' }
+        },
+        y: {
+          min: 0, max: 100,
+          ticks: {
+            color: '#3a556a',
+            font: { size: 9 },
+            callback: v => v + '%'
+          },
+          grid: { color: '#1c2c3c' }
+        }
+      }
+    }
+  });
+}
+
+function updateHistoricalChart() {
+  if (!researchHistoryChart) initResearchHistoryChart();
+  if (!researchHistoryChart) return;
+
+  const cutoff = Date.now() - WINDOW_MS;
+  const bucketed = {};
+  signalHistory.forEach(e => {
+    const ts = new Date(e.ts).getTime();
+    if (ts < cutoff) return;
+    const bucket = Math.floor(ts / BUCKET_MS) * BUCKET_MS;
+    if (!bucketed[bucket]) bucketed[bucket] = { ts: bucket, signals: [] };
+    bucketed[bucket].signals = e.signals || [];
+  });
+
+  const buckets = Object.keys(bucketed).map(Number).sort((a, b) => a - b);
+  const latestSignals = buckets.length
+    ? [...(bucketed[buckets[buckets.length - 1]].signals || [])]
+        .sort((a, b) => (b.implied_prob || 0) - (a.implied_prob || 0))
+        .slice(0, MAX_MARKETS)
+    : [];
+
+  const topIds = latestSignals.map(s => s.market_id || s.question || JSON.stringify(s));
+  const labels = buckets.map(b => new Date(b).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }));
+
+  const datasets = topIds.map((id, i) => {
+    const market = latestSignals[i];
+    const data = buckets.map(b => {
+      const entry = bucketed[b];
+      const sig = (entry && entry.signals) ? entry.signals.find(s => (s.market_id || s.question) === id) : null;
+      return sig ? parseFloat((sig.implied_prob * 100).toFixed(1)) : null;
+    });
+    return {
+      label: truncate(market && market.question, 25),
+      data,
+      borderColor: COLORS[i % COLORS.length],
+      backgroundColor: 'transparent',
+      borderWidth: 1.5,
+      pointRadius: 2,
+      tension: 0.3,
+      spanGaps: true,
+    };
+  });
+
+  researchHistoryChart.data.labels = labels;
+  researchHistoryChart.data.datasets = datasets;
+  researchHistoryChart.update();
+
+  const countEl = document.getElementById('history-data-count');
+  if (countEl) countEl.textContent = signalHistory.length;
+}
+
+function renderHistoryTable() {
+  const tbody = document.getElementById('history-body');
+  if (!tbody) return;
+
+  if (!signalHistory.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="3">No history yet — waiting for first cycle</td></tr>';
+    return;
+  }
+
+  const rows = [];
+  const recent = signalHistory.slice(-10).reverse();
+  recent.forEach(entry => {
+    const top5 = [...(entry.signals || [])]
+      .sort((a, b) => (b.implied_prob || 0) - (a.implied_prob || 0))
+      .slice(0, 5);
+    top5.forEach((sig, i) => {
+      rows.push('<tr>' +
+        '<td class="num">' + (i === 0 ? formatTime(entry.ts) : '') + '</td>' +
+        '<td>' + truncate(sig.question, 35) + '</td>' +
+        '<td class="num accent">' + formatPct(sig.implied_prob) + '</td>' +
+        '</tr>');
+    });
+    rows.push('<tr style="height:4px"><td colspan="3" style="border-bottom:1px solid var(--border-dim)"></td></tr>');
+  });
+
+  tbody.innerHTML = rows.join('');
+}
+
+function renderContributors(signals, confidence, macroScore, momentum) {
+  const confEl = document.getElementById('kpi-macro-conf');
+  const scoreEl = document.getElementById('kpi-macro-score');
+  if (confEl) confEl.textContent = formatPct(confidence);
+  if (scoreEl) scoreEl.textContent = macroScore != null ? macroScore.toFixed(3) : '—';
+
+  const scPoly = document.getElementById('sc-poly-val');
+  const scFred = document.getElementById('sc-fred-val');
+  const scSocial = document.getElementById('sc-social-val');
+  const scBlend = document.getElementById('sc-blend-val');
+  if (scPoly) scPoly.textContent = (researchPolySentiment != null ? researchPolySentiment.toFixed(3) : '—');
+  if (scFred) scFred.textContent = (researchFredScore != null ? researchFredScore.toFixed(3) : '—');
+  if (scSocial) scSocial.textContent = (researchSocialScore != null ? researchSocialScore.toFixed(3) : '—');
+  if (scBlend) scBlend.textContent = macroScore != null ? macroScore.toFixed(3) : '—';
+
+  const confValEl = document.getElementById('calc-confidence');
+  const resultEl = document.getElementById('calc-result');
+  const marketCtEl = document.getElementById('calc-market-ct');
+  const totalVolEl = document.getElementById('calc-total-vol');
+  if (confValEl) confValEl.textContent = formatPct(confidence);
+  if (resultEl) resultEl.textContent = macroScore != null ? macroScore.toFixed(3) : '—';
+  if (marketCtEl) marketCtEl.textContent = signals.length;
+  const totalVol = signals.reduce((s, x) => s + (x.volume_24h || 0), 0);
+  if (totalVolEl) totalVolEl.textContent = formatVol(totalVol);
+
+  const countEl = document.getElementById('contrib-count');
+  const avgEl = document.getElementById('contrib-avg');
+  const sentEl = document.getElementById('contrib-sentiment');
+  if (countEl) countEl.textContent = signals.length;
+  if (avgEl) avgEl.textContent = formatPct(confidence);
+  if (sentEl) sentEl.textContent = researchPolySentiment != null ? researchPolySentiment.toFixed(3) : '—';
+
+  const tbody = document.getElementById('contributors-body');
+  if (!tbody) return;
+
+  if (!signals.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="5">No Polymarket signals this cycle — macro_confidence defaulted to 0.50</td></tr>';
+    return;
+  }
+
+  const totalV = signals.reduce((s, x) => s + (x.volume_24h || 0), 0) || 1;
+  const sorted = [...signals].sort((a, b) => (b.implied_prob || 0) - (a.implied_prob || 0));
+
+  tbody.innerHTML = sorted.map((sig, i) => {
+    const prob = sig.implied_prob || 0;
+    const barPct = (prob * 100).toFixed(1);
+    const vol = sig.volume_24h || 0;
+    const weight = totalV > 0 ? (vol / totalV * 100).toFixed(1) + '%' : '—';
+    const contrib = (prob * (vol / totalV) * 100).toFixed(2) + '%';
+    const isTop = i < 3;
+    return '<tr class="' + (isTop ? 'top-contributor' : '') + '">' +
+      '<td title="' + escapeHtml(sig.question || '').replace(/"/g, '&quot;') + '">' + truncate(sig.question, 42) + '</td>' +
+      '<td class="num accent">' + formatPct(prob) + '</td>' +
+      '<td class="num">' + formatVol(vol) + '</td>' +
+      '<td>' +
+      '<div class="contrib-bar-wrap"><div class="contrib-bar" style="width:' + barPct + '%"></div></div>' +
+      '</td>' +
+      '<td class="num">' + contrib + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+const FRED_INDICATORS = [
+  { key: 'DFF', label: 'FED FUNDS RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'DGS2', label: '2Y TREASURY', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'DGS10', label: '10Y TREASURY', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'DGS30', label: '30Y TREASURY', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'T10Y2Y', label: 'YIELD CURVE 10Y-2Y', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: v => v != null && v < 0 ? 'bearish' : 'neutral' },
+  { key: 'T10Y3M', label: 'YIELD CURVE 10Y-3M', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: v => v != null && v < 0 ? 'bearish' : 'neutral' },
+  { key: 'MORTGAGE30US', label: '30Y MORTGAGE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'T5YIE', label: '5Y BREAKEVEN', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'T10YIE', label: '10Y BREAKEVEN', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'CPIAUCSL', label: 'CPI', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'PCEPILFE', label: 'CORE PCE', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'VIXCLS', label: 'CBOE VIX', fmt: v => v != null ? v.toFixed(1) : '—', status: v => v != null && v > 25 ? 'bearish' : v != null && v < 15 ? 'bullish' : 'neutral' },
+  { key: 'BAMLH0A0HYM2', label: 'HY CREDIT SPREAD', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: v => v != null && v > 5 ? 'bearish' : 'neutral' },
+  { key: 'NFCI', label: 'NFCI', fmt: v => v != null ? v.toFixed(2) : '—', status: v => v != null && v > 0 ? 'bearish' : 'neutral' },
+  { key: 'UNRATE', label: 'UNEMPLOYMENT', fmt: v => v != null ? v.toFixed(1) + '%' : '—', status: () => 'neutral' },
+  { key: 'ICSA', label: 'INITIAL CLAIMS', fmt: v => v != null ? (v / 1000).toFixed(1) + 'K' : '—', status: () => 'neutral' },
+  { key: 'INDPRO', label: 'INDUSTRIAL PROD', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'RSAFS', label: 'RETAIL SALES', fmt: v => v != null ? '$' + (v / 1000).toFixed(0) + 'B' : '—', status: () => 'neutral' },
+  { key: 'UMCSENT', label: 'CONSUMER SENTIMENT', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'DCOILWTICO', label: 'WTI CRUDE OIL', fmt: v => v != null ? '$' + v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'DTWEXBGS', label: 'USD INDEX', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
+  { key: 'M2SL', label: 'M2 MONEY SUPPLY', fmt: v => v != null ? '$' + (v / 1000).toFixed(0) + 'T' : '—', status: () => 'neutral' },
+  { key: 'WALCL', label: 'FED BALANCE SHEET', fmt: v => v != null ? '$' + (v / 1e6).toFixed(0) + 'T' : '—', status: () => 'neutral' },
+];
+
+function renderMacroIndicators() {
+  const snap = researchFredSnapshot || {};
+  let lastTs = null;
+  FRED_INDICATORS.forEach(ind => {
+    const valEl = document.getElementById('val-' + ind.key);
+    const dotEl = document.getElementById('dot-' + ind.key);
+    const v = snap[ind.key];
+    if (valEl) valEl.textContent = ind.fmt(v);
+    if (dotEl) {
+      dotEl.className = 'ic-dot ' + (typeof ind.status === 'function' ? ind.status(v) : 'neutral');
+    }
+  });
+  const updateEl = document.getElementById('fred-update-time');
+  if (updateEl) updateEl.textContent = lastTs ? formatTime(lastTs) : (Object.keys(snap).length ? 'Just now' : '—');
+
+  const scoreEl = document.getElementById('fc-score-val');
+  if (scoreEl) scoreEl.textContent = researchFredScore != null ? researchFredScore.toFixed(3) : '—';
+
+  const gaugeFill = document.getElementById('gauge-fill');
+  const gaugeMarker = document.getElementById('gauge-marker');
+  if (gaugeFill && gaugeMarker && researchFredScore != null) {
+    const pct = Math.max(0, Math.min(100, (researchFredScore + 1) * 50));
+    gaugeFill.style.left = '0%';
+    gaugeFill.style.width = pct + '%';
+    gaugeMarker.style.left = pct + '%';
+  }
+}
+
+function updateVixKpi() {
+  const vix = researchFredSnapshot && researchFredSnapshot.VIXCLS;
+  const el = document.getElementById('kpi-vix');
+  if (el) el.textContent = vix != null ? vix.toFixed(1) : '—';
+}
+
+function formatRelativeTime(ts) {
+  if (!ts) return '—';
+  const d = typeof ts === 'string' ? new Date(ts) : ts;
+  const now = Date.now();
+  const diff = now - d.getTime();
+  if (diff < 60000) return 'Just now';
+  if (diff < 3600000) return Math.floor(diff / 60000) + 'm ago';
+  if (diff < 86400000) return Math.floor(diff / 3600000) + 'h ago';
+  return Math.floor(diff / 86400000) + 'd ago';
+}
+
+function createNewsCard(item) {
+  const text = item.text || item.title || item.headline || '';
+  const url = item.url || '#';
+  const source = item.handle || item.username || item.source || 'news';
+  const ts = item.timestamp || item.published;
+  const sent = item.sentiment;
+  const cat = item.category || 'Markets';
+  const sentClass = sent != null && sent > 0.1 ? 'bullish' : sent != null && sent < -0.1 ? 'bearish' : 'neutral';
+  return '<div class="news-card">' +
+    '<div class="nc-meta">' +
+    '<span class="nc-cat">' + escapeHtml(cat) + '</span>' +
+    '<span class="nc-dot ' + sentClass + '"></span>' +
+    '<span class="nc-time">' + formatRelativeTime(ts) + '</span>' +
+    '</div>' +
+    '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" class="nc-title">' + escapeHtml(truncate(text, 80)) + '</a>' +
+    '<div class="nc-source">' + escapeHtml(source) + '</div>' +
+    '</div>';
+}
+
+function renderNewsFeed() {
+  const container = document.getElementById('social-feed-container');
+  const emptyEl = document.getElementById('social-empty-state');
+  const sentimentEl = document.getElementById('social-sentiment-val');
+  const countEl = document.getElementById('social-tweet-count');
+  const sourcesEl = document.getElementById('social-sources-count');
+  const refreshEl = document.getElementById('social-last-refresh');
+  const badgeEl = document.getElementById('social-badge');
+
+  const feed = researchXFeed || [];
+  const count = researchXTweetCount != null ? researchXTweetCount : feed.length;
+  const sentiment = researchSocialScore != null ? researchSocialScore.toFixed(3) : '—';
+
+  if (sentimentEl) sentimentEl.textContent = sentiment;
+  if (countEl) countEl.textContent = count;
+  if (sourcesEl) sourcesEl.textContent = feed.length ? feed.length + '/25' : '0/25';
+  if (refreshEl) refreshEl.textContent = feed.length ? formatRelativeTime(feed[0] && feed[0].timestamp) : '—';
+  if (badgeEl) badgeEl.textContent = count > 0 ? count : '';
+
+  if (!container) return;
+
+  if (!feed.length) {
+    if (emptyEl) emptyEl.style.display = 'block';
+    const wrap = container.querySelector('.news-feed-wrap');
+    if (wrap) wrap.innerHTML = '';
+    return;
+  }
+
+  if (emptyEl) emptyEl.style.display = 'none';
+  let wrap = container.querySelector('.news-feed-wrap');
+  if (!wrap) {
+    wrap = document.createElement('div');
+    wrap.className = 'news-feed-wrap';
+    container.appendChild(wrap);
+  }
+  wrap.innerHTML = feed.slice(0, 100).map(createNewsCard).join('');
+}
+
+function updateResearchTab(signals, confidence, macroScore) {
+  researchSignals = signals || [];
+  researchPolyConf = confidence != null ? confidence : 0.5;
+  researchMacroScore = macroScore;
+
+  if (researchSignals.length > 0) {
+    signalHistory.push({ ts: new Date().toISOString(), signals: researchSignals });
+    const cutoff = new Date(Date.now() - HISTORY_MAX_AGE_MS).toISOString();
+    signalHistory = signalHistory.filter(e => e.ts >= cutoff);
+    if (signalHistory.length > MAX_HISTORY) signalHistory = signalHistory.slice(-MAX_HISTORY);
+    saveSignalHistory();
+  }
+
+  renderCurrentMarkets(researchSignals);
+  updateHistoricalChart();
+  renderHistoryTable();
+  renderContributors(researchSignals, researchPolyConf, researchMacroScore, researchMomentum);
+  renderMacroIndicators();
+  updateVixKpi();
+  renderNewsFeed();
+}
+
+// ─── 6. Message Handler ───────────────────────────────────────────────────
+function handleMessage(msg) {
+  if (msg.type === 'session_snapshot') {
+    var snap = msg.data || {};
+    if (snap.iteration) iterCount = snap.iteration;
+    document.getElementById('iter-ctr').textContent = iterCount || '—';
+    var podSums = snap.pod_summaries || {};
+    for (var pid in podSums) {
+      var m = podSums[pid];
+      if (m && m.data) {
+        pods[m.pod_id || pid] = Object.assign(pods[m.pod_id || pid] || {}, m.data);
+      }
+    }
+    (snap.recent_trades || []).forEach(function(t) {
+      if (t.data) {
+        trades.unshift(t.data);
+        if (t.data.symbol && t.data.side && t.data.qty) {
+          addTrade(t.data.pod_id || 'unknown', t.data.symbol, t.data.side, t.data.qty, t.data.fill_price || 0);
+        }
+      }
+    });
+    (snap.recent_governance || []).forEach(function(g) {
+      if (g.data && g.data.agent && g.data.decision) {
+        recordGov(g.data.agent, g.data.decision, g.data.reasoning || '', g.data.weights || null);
+      }
+    });
+    (snap.recent_activity || []).forEach(function(a) {
+      if (a.data) {
+        var act = a.data;
+        if (!agentActivity[act.agent_id]) agentActivity[act.agent_id] = [];
+        agentActivity[act.agent_id].unshift(act);
+        if (agentActivity[act.agent_id].length > 5) agentActivity[act.agent_id].pop();
+        activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, ts: a.timestamp });
+      }
+    });
+    if (activityFeed.length > 50) activityFeed = activityFeed.slice(0, 50);
+    updatePodsTable();
+    updateFirmMetrics();
+    updatePerfTable();
+    calculateRisk();
+    updateRiskTable();
+    updateTopHoldings();
+    updateActivityFeed();
+    updateDecisionTimeline();
+    updateGovHub();
+    return;
+  }
+  if (msg.type === 'pod_summary') {
+    const data = msg.data;
+    const pod_id = msg.pod_id || data.pod_id;
+    if (pod_id) {
+      pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+
+      if (data.polymarket_signals !== undefined || data.fred_snapshot !== undefined || data.x_feed !== undefined) {
+        if (data.fred_snapshot !== undefined) {
+          researchFredSnapshot = Object.assign(researchFredSnapshot || {}, data.fred_snapshot || {});
+        }
+        if (data.fred_score !== undefined) researchFredScore = data.fred_score || 0;
+        if (data.poly_sentiment !== undefined) researchPolySentiment = data.poly_sentiment || 0;
+        if (data.social_score !== undefined) researchSocialScore = data.social_score || 0;
+        if (data.x_feed !== undefined) {
+          researchXFeed = (researchXFeed || []).concat(data.x_feed || []);
+          const seen = new Set();
+          researchXFeed = researchXFeed.filter(t => {
+            const key = (t.handle || t.username || '') + '|' + (t.text || t.title || '');
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          }).slice(-200);
+        }
+        if (data.x_tweet_count !== undefined) researchXTweetCount = (researchXFeed || []).length;
+        if (data.polymarket_signals && data.polymarket_signals.length > 0) {
+          if (!window._allPolySignals) window._allPolySignals = {};
+          window._allPolySignals[pod_id] = data.polymarket_signals;
+          const merged = [];
+          const seenQ = new Set();
+          for (const podSignals of Object.values(window._allPolySignals)) {
+            for (const s of podSignals) {
+              const q = s.question || s.market || JSON.stringify(s);
+              if (!seenQ.has(q)) { seenQ.add(q); merged.push(s); }
+            }
+          }
+          updateResearchTab(merged, data.polymarket_confidence, data.macro_score);
+        } else {
+          updateResearchTab([], data.polymarket_confidence, data.macro_score);
+        }
+        if (!data.status) return;
+      }
+
+      iterCount++;
+      document.getElementById('iter-ctr').textContent = iterCount;
+      // Track per-pod NAV for sparklines
+      if (!podNavSpark[pod_id]) podNavSpark[pod_id] = [];
+      podNavSpark[pod_id].push(data.nav || 0);
+      if (podNavSpark[pod_id].length > 20) podNavSpark[pod_id].shift();
+      updatePodsTable();
+      updateFirmMetrics();
+      recordNavHistory();
+      calculateMetrics();
+      updatePerfTable();
+      calculateRisk();
+      updateRiskTable();
+      updateTopHoldings();
+      if (data.status) {
+        if (typeof updatePodSilhouetteColor === 'function') updatePodSilhouetteColor(pod_id, data.status);
+      }
+    }
+  } else if (msg.type === 'trade') {
+    const t = msg.data;
+    trades.unshift(t);
+    if (trades.length > 20) trades.pop();
+    if (t.symbol && t.side && t.qty)
+      addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
+    if (typeof triggerTradePulse === 'function') triggerTradePulse(podFloorMap[t.pod_id] ?? 0);
+    if (t.pod_id && typeof triggerPodHeartbeat === 'function') {
+      triggerPodHeartbeat(t.pod_id);
+    }
+    const srcFloor = podFloorMap[t.pod_id] ?? 0;
+    if (typeof createDataRoute === 'function') createDataRoute(srcFloor, 4, 0x00cfe8);
+  } else if (msg.type === 'governance') {
+    const gv = msg.data;
+    if (gv.agent && gv.decision) {
+      recordGov(gv.agent, gv.decision, gv.reasoning || '', gv.weights || null);
+      if (typeof triggerGovernanceLightFlow === 'function') triggerGovernanceLightFlow(gv.agent);
+    }
+  } else if (msg.type === 'risk_alert') {
+    const ra = msg.data;
+    riskAlerts.unshift(ra);
+    if (riskAlerts.length > 50) riskAlerts.pop();
+    updateRiskAlertBanner();
+    if (typeof triggerRiskAlert === 'function') triggerRiskAlert(ra);
+  } else if (msg.type === 'agent_activity') {
+    var act = msg.data;
+    if (!agentActivity[act.agent_id]) agentActivity[act.agent_id] = [];
+    agentActivity[act.agent_id].unshift(act);
+    if (agentActivity[act.agent_id].length > 5) agentActivity[act.agent_id].pop();
+    activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, ts: msg.timestamp });
+    if (activityFeed.length > 50) activityFeed.pop();
+    updateActivityFeed();
+    updateDecisionTimeline();
+    if (typeof triggerAgentActivity === 'function') triggerAgentActivity(act.pod_id, act.agent_role);
+  }
+}
+
+// ─── 7. Operations ───────────────────────────────────────────────────────
+function makeSparkline(vals) {
+  if (!vals || vals.length < 2) return '';
+  var w = 60, h = 16, len = vals.length;
+  var min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+  var range = max - min || 1;
+  var pts = vals.map(function(v, i) {
+    return (i / (len - 1) * w).toFixed(1) + ',' + (h - (v - min) / range * h).toFixed(1);
+  }).join(' ');
+  var col = vals[len - 1] >= vals[0] ? '#00d68f' : '#e84040';
+  return '<svg width="' + w + '" height="' + h + '" style="vertical-align:middle"><polyline points="' + pts + '" fill="none" stroke="' + col + '" stroke-width="1.2"/></svg>';
+}
+
+function updatePodsTable() {
+  const ids = Object.keys(pods).sort();
+  document.getElementById('pod-badge').textContent = ids.length + ' pod' + (ids.length !== 1 ? 's' : '');
+  const tbody = document.getElementById('pods-table');
+  if (ids.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">Awaiting data…</div><div class="empty-hint">Start a trading session to see live metrics</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = ids.map(id => {
+    const d   = pods[id];
+    const nav = d.nav || 0;
+    const pnl = d.daily_pnl || 0;
+    const st  = (d.status || 'UNKNOWN').toUpperCase();
+    const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
+    const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
+    const spark = makeSparkline(podNavSpark[id]);
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">$${nav.toFixed(2)}</td>
+      <td class="r">${spark}</td>
+      <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r"><span class="badge ${sc}">${st}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function updateFirmMetrics() {
+  const ids = Object.keys(pods);
+  const nav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
+  const pnl = ids.reduce((s,id) => s + (pods[id].daily_pnl || 0), 0);
+  const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
+  const pos = ids.reduce((s,id) => {
+    const p = pods[id].current_positions;
+    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
+  }, 0);
+
+  document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
+  document.getElementById('kpi-active').textContent = act > 0 ? act : '—';
+  document.getElementById('kpi-pos').textContent    = pos > 0 ? pos : '—';
+
+  const pnlEl = document.getElementById('kpi-pnl');
+  if (nav > 0) {
+    pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} today`;
+    pnlEl.className   = 'kpi-sub ' + (pnl >= 0 ? 'pos' : 'neg');
+  } else {
+    pnlEl.textContent = '—';
+    pnlEl.className   = 'kpi-sub';
+  }
+}
+
+// ─── 8. Performance ──────────────────────────────────────────────────────
+const POD_COLORS = { commodities: '#f5a623', crypto: '#8b6cff', equities: '#00d4f0', fx: '#00d68f' };
+
+function recordNavHistory() {
+  const ids = Object.keys(pods);
+  if (ids.length === 0) return;
+  const firmNav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
+  const podNavs = {};
+  ids.forEach(id => { podNavs[id] = pods[id].nav || 0; });
+  // Track drawdown from high-water mark
+  var hwm = 0;
+  navHistory.forEach(function(h) { if (h.firmNav > hwm) hwm = h.firmNav; });
+  if (firmNav > hwm) hwm = firmNav;
+  var dd = hwm > 0 ? (firmNav - hwm) / hwm : 0;
+  navHistory.push({ t: new Date().toLocaleTimeString(), firmNav, pods: podNavs, drawdown: dd });
+  if (navHistory.length > MAX_HISTORY) navHistory.shift();
+  updateNavChart();
+  updateDrawdownChart();
+}
+
+function updateNavChart() {
+  const ctx    = document.getElementById('navChart').getContext('2d');
+  const labels = navHistory.map(h => h.t);
+  const ids    = Object.keys(pods).sort();
+  const FALLBACK_COLORS = ['#00d4f0','#00d68f','#8b6cff','#f5a623'];
+
+  const datasets = [
+    { label:'FIRM NAV', data: navHistory.map(h => h.firmNav),
+      borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
+      borderWidth:2, pointRadius:0, tension:0.3, fill:false },
+    ...ids.map((id, i) => ({
+      label: id.toUpperCase(), data: navHistory.map(h => h.pods[id] || 0),
+      borderColor: POD_COLORS[id] || FALLBACK_COLORS[i % FALLBACK_COLORS.length], borderWidth:1,
+      pointRadius:0, tension:0.3, fill:false,
+    })),
+  ];
+
+  if (navChart) {
+    navChart.data.labels   = labels;
+    navChart.data.datasets = datasets;
+    navChart.update('none');
+    return;
+  }
+  navChart = new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display:true, position:'top',
+          labels:{ color:'#a0b8d0', font:{size:9, family:"'IBM Plex Mono', monospace"}, padding:8, usePointStyle:true, pointStyle:'line' } },
+        tooltip: { backgroundColor:'#243050', titleColor:'#00d4f0',
+          bodyColor:'#f0f4fa', borderColor:'#4a5e80', borderWidth:1, padding:8 },
+      },
+      scales: {
+        x: { grid:{color:'#384a68'}, ticks:{color:'#6a82a0', font:{size:9, family:'IBM Plex Mono'}, maxRotation:0, maxTicksLimit:6} },
+        y: { grid:{color:'#384a68'}, ticks:{color:'#6a82a0', font:{size:9, family:'IBM Plex Mono'}, callback: v => '$'+v.toFixed(0)} },
+      },
+    },
+  });
+}
+
+function calculateMetrics() {
+  if (navHistory.length < 2) return;
+  const navs   = navHistory.map(h => h.firmNav);
+  const rets   = navs.slice(1).map((v,i) => (v - navs[i]) / (navs[i] || 1));
+  const mean   = rets.reduce((s,r) => s+r, 0) / rets.length;
+  const std    = Math.sqrt(rets.reduce((s,r) => s+(r-mean)**2, 0) / rets.length) || 1e-9;
+  const sharpe = mean / std * Math.sqrt(252);
+  const maxNav = Math.max(...navs);
+  const dd     = maxNav > 0 ? (navs[navs.length-1] - maxNav) / maxNav : 0;
+  const wr     = rets.length > 0 ? rets.filter(r => r>0).length / rets.length : 0;
+
+  document.getElementById('m-sharpe').textContent = isFinite(sharpe) ? sharpe.toFixed(2) : '—';
+  document.getElementById('m-vol').textContent    = (std * Math.sqrt(252) * 100).toFixed(1) + '%';
+  const ddEl = document.getElementById('m-dd');
+  ddEl.textContent = (dd * 100).toFixed(1) + '%';
+  ddEl.className   = 'kpi-val ' + (dd < -0.05 ? 'neg' : '');
+  document.getElementById('m-wr').textContent     = (wr * 100).toFixed(0) + '%';
+}
+
+function updatePerfTable() {
+  const ids = Object.keys(pods).sort();
+  if (ids.length === 0) return;
+  document.getElementById('perf-table').innerHTML = ids.map(id => {
+    const d   = pods[id];
+    const nav = d.nav || 0;
+    const ret = ((nav - 100) / 100 * 100);
+    const pnl = d.daily_pnl || 0;
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">$${nav.toFixed(2)}</td>
+      <td class="r ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</td>
+      <td class="r ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── 9. Risk ──────────────────────────────────────────────────────────────
+function calculateRisk() {
+  const ids = Object.keys(pods);
+  if (ids.length === 0) return;
+
+  // Use real backend risk_metrics when available
+  var totalVar = 0, totalLev = 0, totalVol = 0, totalDD = 0, count = 0;
+  ids.forEach(function(id) {
+    var d = pods[id];
+    if (d.var_95 != null) totalVar += d.var_95;
+    if (d.gross_leverage != null) totalLev += d.gross_leverage;
+    if (d.vol_ann != null) totalVol += d.vol_ann;
+    if (d.drawdown != null) totalDD = Math.min(totalDD, d.drawdown);
+    count++;
+  });
+
+  var nav = ids.reduce(function(s, id) { return s + (pods[id].nav || 0); }, 0);
+  var hasRealData = ids.some(function(id) { return pods[id].var_95 != null && pods[id].var_95 !== 0; });
+
+  if (hasRealData) {
+    document.getElementById('kpi-var').textContent = '$' + totalVar.toFixed(0);
+    document.getElementById('kpi-lev').textContent = (totalLev / (count || 1)).toFixed(2) + 'x';
+  } else {
+    var approxVar = nav * 0.025;
+    document.getElementById('kpi-var').textContent = nav > 0 ? '$' + approxVar.toFixed(0) : '—';
+    document.getElementById('kpi-lev').textContent = '—';
+  }
+
+  var ddEl = document.getElementById('kpi-dd');
+  if (ddEl) {
+    ddEl.textContent = totalDD !== 0 ? (totalDD * 100).toFixed(1) + '%' : '—';
+    ddEl.className = 'kpi-val' + (totalDD < -0.05 ? ' neg' : '');
+  }
+
+  var volEl = document.getElementById('kpi-vol');
+  if (volEl) volEl.textContent = totalVol > 0 ? ((totalVol / (count || 1)) * 100).toFixed(1) + '%' : '—';
+
+  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
+  updateRiskTable();
+}
+
+function updateRiskAlertBanner(severity, message) {
+  const el = document.getElementById('risk-banner');
+  el.className   = 'risk-banner ' + severity;
+  el.textContent = message;
+  riskAlerts.push({ severity, message, ts: new Date().toISOString() });
+  document.getElementById('kpi-alerts').textContent = riskAlerts.length;
+  if (severity === 'critical') triggerRiskAlert();
+}
+
+function updateRiskTable() {
+  const ids = Object.keys(pods).sort();
+  if (ids.length === 0) return;
+  document.getElementById('risk-table').innerHTML = ids.map(id => {
+    const d     = pods[id];
+    const nav   = d.nav || 0;
+    const p     = d.current_positions;
+    const pos   = Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0;
+    const st    = (d.status || 'UNKNOWN').toUpperCase();
+    const sc    = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
+    const var95 = d.var_95 != null && d.var_95 !== 0 ? '$' + d.var_95.toFixed(0) : '$' + (nav * 0.025).toFixed(0);
+    const lev   = d.gross_leverage != null && d.gross_leverage !== 0 ? d.gross_leverage.toFixed(2) + 'x' : '—';
+    const dd    = d.drawdown != null && d.drawdown !== 0 ? (d.drawdown * 100).toFixed(1) + '%' : '0.0%';
+    const ddCls = d.drawdown != null && d.drawdown < -0.05 ? 'neg' : '';
+    return `<tr>
+      <td class="pod-name">${id.toUpperCase()}</td>
+      <td class="r">${var95}</td>
+      <td class="r">${lev}</td>
+      <td class="r ${ddCls}">${dd}</td>
+      <td class="r">${pos}</td>
+      <td class="r"><span class="badge ${sc}">${st}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── 10. Execution ─────────────────────────────────────────────────────────
+function addTrade(podId, symbol, side, qty, price, status = 'FILLED') {
+  executedTrades.unshift({ podId, symbol, side: side.toUpperCase(), qty, price, status, ts: new Date().toISOString() });
+  if (executedTrades.length > 50) executedTrades.pop();
+  updateExecTable();
+}
+
+function updateExecTable() {
+  document.getElementById('kpi-trades').textContent = executedTrades.length;
+  document.getElementById('kpi-filled').textContent = executedTrades.filter(t => t.status === 'FILLED').length;
+  if (executedTrades.length === 0) return;
+  document.getElementById('exec-table').innerHTML = executedTrades.slice(0, 20).map(t => {
+    const sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
+    const ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
+    return `<tr>
+      <td>${(t.podId || 'unknown').toUpperCase()}</td>
+      <td style="font-weight:600">${t.symbol}</td>
+      <td><span class="badge ${sc}">${t.side}</span></td>
+      <td class="r">${t.qty}</td>
+      <td class="r">$${(t.price || 0).toFixed(2)}</td>
+      <td class="r"><span class="badge ${ss}">${t.status}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ─── 11. Governance ───────────────────────────────────────────────────────
+function recordGov(agent, decision, reasoning, weights) {
+  governanceDecisions.unshift({
+    agent,
+    decision,
+    reasoning,
+    weights,
+    ts: new Date().toISOString(),
+  });
+  if (governanceDecisions.length > 50) governanceDecisions.pop();
+  updateGovHub();
+}
+
+function updateGovHub() {
+  const ids = Object.keys(pods).sort();
+  const names = ids.length > 0 ? ids : ['equities','fx','crypto','commodities'];
+  document.getElementById('alloc-grid').innerHTML = names.map(id => {
+    const nav = pods[id] ? pods[id].nav || 0 : 0;
+    return `<div class="alloc-tile">
+      <div class="alloc-pod">${id.toUpperCase()}</div>
+      <div class="alloc-val">${nav > 0 ? '$'+nav.toFixed(0) : '—'}</div>
+    </div>`;
+  }).join('');
+
+  document.getElementById('gov-badge').textContent = governanceDecisions.length + ' decisions';
+  const list = document.getElementById('gov-list');
+  if (governanceDecisions.length === 0) return;
+  list.innerHTML = governanceDecisions.slice(0, 10).map(d => {
+    const ac = d.agent ? 'b-' + d.agent.toLowerCase() : 'b-idle';
+    const tm = new Date(d.ts).toLocaleTimeString();
+    return `<div class="gov-card">
+      <div class="gov-card-hdr">
+        <span class="badge ${ac}">${d.agent}</span>
+        <span class="gov-time">${tm}</span>
+      </div>
+      <div class="gov-card-body">${d.decision}</div>
+      ${d.reasoning ? `<div class="gov-card-sub">${d.reasoning.slice(0,120)}${d.reasoning.length>120?'…':''}</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+// ─── 12. Top Holdings ──────────────────────────────────────────────────────
+function updateTopHoldings() {
+  var tbody = document.getElementById('holdings-table');
+  var badge = document.getElementById('holdings-badge');
+  if (!tbody) return;
+  var allPos = [];
+  var ids = Object.keys(pods);
+  ids.forEach(function(id) {
+    var positions = pods[id].current_positions;
+    if (Array.isArray(positions)) {
+      positions.forEach(function(p) {
+        allPos.push(Object.assign({ _pod: id }, p));
+      });
+    }
+  });
+  if (badge) badge.textContent = allPos.length + ' position' + (allPos.length !== 1 ? 's' : '');
+  if (allPos.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
+    return;
+  }
+  allPos.sort(function(a, b) { return Math.abs(b.notional || 0) - Math.abs(a.notional || 0); });
+  tbody.innerHTML = allPos.slice(0, 15).map(function(p) {
+    var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
+    var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+    var notional = p.notional || (p.qty || 0) * (p.current_price || p.avg_entry || 0);
+    return '<tr>' +
+      '<td class="pod-name">' + escapeHtml((p._pod || '').toUpperCase()) + '</td>' +
+      '<td style="font-weight:600">' + escapeHtml(p.symbol || '') + '</td>' +
+      '<td class="r">' + (p.qty || 0) + '</td>' +
+      '<td class="r">$' + (p.current_price || p.avg_entry || 0).toFixed(2) + '</td>' +
+      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+      '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
+// ─── 13. Drawdown Chart ───────────────────────────────────────────────────
+function updateDrawdownChart() {
+  var canvas = document.getElementById('ddChart');
+  if (!canvas) return;
+  if (navHistory.length < 2) return;
+  var labels = navHistory.map(function(h) { return h.t; });
+  var ddData = navHistory.map(function(h) { return (h.drawdown || 0) * 100; });
+  var datasets = [{
+    label: 'DRAWDOWN %',
+    data: ddData,
+    borderColor: '#e84040',
+    backgroundColor: 'rgba(232,64,64,0.08)',
+    borderWidth: 1.5,
+    pointRadius: 0,
+    tension: 0.3,
+    fill: true,
+  }];
+  if (ddChart) {
+    ddChart.data.labels = labels;
+    ddChart.data.datasets = datasets;
+    ddChart.update('none');
+    return;
+  }
+  ddChart = new Chart(canvas.getContext('2d'), {
+    type: 'line',
+    data: { labels: labels, datasets: datasets },
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      plugins: {
+        legend: { display: true, position: 'top',
+          labels: { color: '#a0b8d0', font: { size: 9, family: "'IBM Plex Mono', monospace" }, padding: 8, usePointStyle: true, pointStyle: 'line' } },
+        tooltip: { backgroundColor: '#243050', titleColor: '#e84040', bodyColor: '#f0f4fa', borderColor: '#4a5e80', borderWidth: 1, padding: 8 },
+      },
+      scales: {
+        x: { grid: { color: '#384a68' }, ticks: { color: '#6a82a0', font: { size: 9, family: 'IBM Plex Mono' }, maxRotation: 0, maxTicksLimit: 6 } },
+        y: { grid: { color: '#384a68' }, ticks: { color: '#6a82a0', font: { size: 9, family: 'IBM Plex Mono' }, callback: function(v) { return v.toFixed(1) + '%'; } },
+          suggestedMax: 0 },
+      },
+    },
+  });
+}
+
+// ─── 14. Decision Timeline ─────────────────────────────────────────────────
+function updateDecisionTimeline() {
+  var container = document.getElementById('decision-timeline');
+  var badge = document.getElementById('timeline-badge');
+  if (!container) return;
+  var events = activityFeed.filter(function(a) {
+    return a.action === 'trade_decision' || a.action === 'mandate_update' || a.action === 'allocation' || a.action === 'order_executed';
+  });
+  if (badge) badge.textContent = events.length + ' event' + (events.length !== 1 ? 's' : '');
+  if (events.length === 0) {
+    container.innerHTML = '<div class="empty"><div class="empty-txt">Waiting for agent decisions…</div></div>';
+    return;
+  }
+  container.innerHTML = events.slice(0, 20).map(function(ev) {
+    var roleColor = ROLE_COLORS[ev.agent_role] || '#6a90aa';
+    var ts = ev.ts ? new Date(ev.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
+    var detailText = ev.detail || '';
+    var hasDetail = detailText.length > 0;
+    var cardId = 'tl-' + (ev.ts || '') + '-' + (ev.agent_role || '');
+    return '<div class="tl-card" id="' + cardId + '">' +
+      '<div class="tl-header">' +
+        '<span class="tl-time">' + ts + '</span>' +
+        '<span class="feed-badge" style="background:' + roleColor + '">' + escapeHtml(ev.agent_role || '?') + '</span>' +
+        '<span class="tl-pod">' + escapeHtml((ev.pod_id || '').toUpperCase()) + '</span>' +
+        '<span class="tl-action">' + escapeHtml((ev.action || '').replace(/_/g, ' ')) + '</span>' +
+        (hasDetail ? '<span class="tl-expand" onclick="toggleTlDetail(\'' + cardId + '\')">&#9660;</span>' : '') +
+      '</div>' +
+      '<div class="tl-summary">' + escapeHtml(ev.summary || '') + '</div>' +
+      (hasDetail ? '<div class="tl-detail" style="display:none">' + escapeHtml(detailText).slice(0, 500) + '</div>' : '') +
+      '</div>';
+  }).join('');
+}
+
+function toggleTlDetail(cardId) {
+  var card = document.getElementById(cardId);
+  if (!card) return;
+  var detail = card.querySelector('.tl-detail');
+  if (!detail) return;
+  var isHidden = detail.style.display === 'none';
+  detail.style.display = isHidden ? 'block' : 'none';
+  var arrow = card.querySelector('.tl-expand');
+  if (arrow) arrow.innerHTML = isHidden ? '&#9650;' : '&#9660;';
+}
+
+// ─── 15. Activity Feed ─────────────────────────────────────────────────────
+var ROLE_COLORS = { CEO: '#f5a623', CIO: '#00d4f0', CRO: '#e84040', PM: '#00d68f', Trader: '#8b6cff', Researcher: '#6a90aa' };
+
+function updateActivityFeed() {
+  var list = document.getElementById('feed-list');
+  if (!list) return;
+  if (activityFeed.length === 0) {
+    list.innerHTML = '<div class="feed-empty">Waiting for agent activity&hellip;</div>';
+    return;
+  }
+  list.innerHTML = activityFeed.slice(0, 20).map(function(item) {
+    var roleColor = ROLE_COLORS[item.agent_role] || '#6a90aa';
+    var ts = item.ts ? new Date(item.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
+    var actionLabel = (item.action || '').replace(/_/g, ' ');
+    return '<div class="feed-item">' +
+      '<span class="feed-badge" style="background:' + roleColor + '">' + escapeHtml(item.agent_role || '?') + '</span>' +
+      '<span class="feed-pod">' + escapeHtml((item.pod_id || '').toUpperCase()) + '</span>' +
+      '<span class="feed-action">' + escapeHtml(actionLabel) + '</span>' +
+      '<span class="feed-summary">' + escapeHtml(truncate(item.summary || '', 80)) + '</span>' +
+      '<span class="feed-ts">' + ts + '</span>' +
+      '</div>';
+  }).join('');
+}
+
+// ─── 16. Init ──────────────────────────────────────────────────────────────
+initResearchHistoryChart();
+updateGovHub();

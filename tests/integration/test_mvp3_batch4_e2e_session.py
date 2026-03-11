@@ -1,7 +1,7 @@
 """End-to-end session manager tests for MVP3 Batch 4.
 
 Tests the full lifecycle of SessionManager:
-- Start session with 5 pods
+- Start session with 4 pods (equities, fx, crypto, commodities)
 - Run event loop with bar distribution and governance
 - Stop session and verify graceful cleanup
 """
@@ -132,8 +132,8 @@ async def test_session_manager_full_lifecycle(mock_alpaca_adapter, temp_session_
     # Start the session
     await manager.start_live_session(capital_per_pod=100.0)
     assert manager._session_active is True
-    assert len(manager._pod_runtimes) == 5
-    assert len(manager._pod_gateways) == 5
+    assert len(manager._pod_runtimes) == 4
+    assert len(manager._pod_gateways) == 4
 
     # Verify Alpaca.fetch_account was called
     mock_alpaca_adapter.fetch_account.assert_called()
@@ -179,8 +179,8 @@ async def test_session_manager_full_lifecycle(mock_alpaca_adapter, temp_session_
 
     assert summary["uptime_seconds"] >= 0
     assert summary["iterations"] >= 1
-    assert summary["pods_closed"] == 5
-    assert summary["final_capital"] == 500.0  # 5 pods × $100
+    assert summary["pods_closed"] == 4
+    assert summary["final_capital"] == 400.0  # 4 pods × $100
 
     # Verify SessionLogger files exist
     assert os.path.isdir(manager.get_session_dir())
@@ -281,10 +281,10 @@ async def test_session_manager_stop_session_gracefully_closes_runtimes(
     assert summary["iterations"] >= 1, f"iterations must be >= 1, got {summary['iterations']}"
 
     assert isinstance(summary["pods_closed"], int)
-    assert summary["pods_closed"] == 5, f"Expected 5 pods closed, got {summary['pods_closed']}"
+    assert summary["pods_closed"] == 4, f"Expected 4 pods closed, got {summary['pods_closed']}"
 
     assert isinstance(summary["final_capital"], (int, float))
-    assert summary["final_capital"] == 500.0, f"Expected final_capital=500.0, got {summary['final_capital']}"
+    assert summary["final_capital"] == 400.0, f"Expected final_capital=400.0, got {summary['final_capital']}"
 
     # Verify SessionLogger was properly closed
     assert os.path.isdir(manager.get_session_dir())
@@ -386,7 +386,7 @@ async def test_session_manager_runs_governance_at_frequency(mock_alpaca_adapter,
     """Test that governance is executed at specified frequency.
 
     Verifies:
-    - Governance runs at iterations 5, 10, 15, ... (for governance_freq=5)
+    - Governance runs at iterations 4, 8, 12, ... (for governance_freq=4)
     - SessionLogger logs governance decisions
     """
     manager = SessionManager(
@@ -420,7 +420,9 @@ async def test_session_manager_runs_governance_at_frequency(mock_alpaca_adapter,
     manager._governance.run_full_cycle = AsyncMock(side_effect=track_governance_calls)
 
     # Run multiple iterations
-    iteration_target = 15
+    from src.core.config.universes import POD_UNIVERSES
+
+    iteration_target = 12
     original_event_loop = manager.run_event_loop
 
     async def limited_event_loop(*args, **kwargs):
@@ -429,18 +431,16 @@ async def test_session_manager_runs_governance_at_frequency(mock_alpaca_adapter,
             raise RuntimeError("Session not started")
 
         try:
-            symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA"]
-            governance_freq = kwargs.get("governance_freq", 5)
+            governance_freq = kwargs.get("governance_freq", 4)
             interval_seconds = kwargs.get("interval_seconds", 60.0)
 
             while manager._session_active and manager._iteration < iteration_target:
                 manager._iteration += 1
 
-                # Fetch bars
-                bars = await manager._alpaca.fetch_bars(symbols, timeframe="1Min")
-
-                # Push to pods
+                # Per-pod: fetch bars for that pod's universe
                 for pod_id, gateway in manager._pod_gateways.items():
+                    pod_symbols = POD_UNIVERSES.get(pod_id, [])
+                    bars = await manager._alpaca.fetch_bars(pod_symbols, timeframe="1Hour")
                     for symbol in bars:
                         for bar in bars[symbol]:
                             await gateway.push_bar(bar)
@@ -464,11 +464,10 @@ async def test_session_manager_runs_governance_at_frequency(mock_alpaca_adapter,
         finally:
             await manager.stop_session()
 
-    await limited_event_loop(interval_seconds=0.01, governance_freq=5)
+    await limited_event_loop(interval_seconds=0.01, governance_freq=4)
 
-    # Verify governance was called at expected iterations
-    # With governance_freq=5, should run at iterations 5, 10, 15
+    # Verify governance was called at expected iterations (4, 8, 12)
     assert manager._governance.run_full_cycle.called
-    expected_calls = iteration_target // 5  # 15 / 5 = 3
+    expected_calls = iteration_target // 4  # 12 / 4 = 3
     actual_calls = manager._governance.run_full_cycle.call_count
     assert actual_calls >= 1, f"Expected at least 1 governance call, got {actual_calls}"

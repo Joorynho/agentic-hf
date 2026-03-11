@@ -141,7 +141,7 @@ async def test_cio_rebalance_sum_invariant():
     bus = EventBus(audit_log=AuditLog())
     allocator = CapitalAllocator(pod_ids=POD_IDS, bus=bus)
     cio = CIOAgent(bus=bus, allocator=allocator)
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": "", "OPENROUTER_API_KEY": ""}):
         records = await cio.rebalance(_make_all_summaries())
     assert len(records) == 5
     assert abs(sum(r.new_pct for r in records) - 1.0) < 1e-6
@@ -184,7 +184,7 @@ async def test_governance_strategy_co_decision_completes():
 
 @pytest.mark.asyncio
 async def test_ceo_rule_based_mandate():
-    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": ""}):
+    with patch.dict(os.environ, {"OPENAI_API_KEY": "", "ANTHROPIC_API_KEY": "", "OPENROUTER_API_KEY": ""}):
         bus = EventBus()
         ceo = CEOAgent(bus=bus)
         mandate = await ceo.approve_mandate(_make_all_summaries())

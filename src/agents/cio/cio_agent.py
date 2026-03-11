@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
 
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.core.bus.event_bus import EventBus
+from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.allocation import AllocationRecord
 from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
@@ -20,7 +20,7 @@ _AGENT_ID = "cio"
 class CIOAgent:
     """Firm-level CIO: capital allocation across pods. Participates in Loop 4/7.
 
-    LLM mode: uses gpt-4o-mini to reason about allocation weights.
+    LLM mode: uses Qwen 3 32B via OpenRouter (falls back to OpenAI if no OpenRouter key).
     Fallback: equal-weight or drift-correction rule.
     """
 
@@ -28,8 +28,7 @@ class CIOAgent:
         self._bus = bus
         self._allocator = allocator
         self._session_logger = session_logger
-        self._api_key = os.getenv("OPENAI_API_KEY", "")
-        self._has_llm = bool(self._api_key)
+        self._has_llm = has_llm_key()
 
     @property
     def agent_id(self) -> str:
@@ -53,6 +52,28 @@ class CIOAgent:
             records = self._allocator.propose_equal_weight(authorized_by="cio_rule_based")
 
         await self._allocator.apply_allocation(records)
+
+        # Publish agent activity for live intelligence feed
+        alloc_summary = ", ".join(f"{r.pod_id}={r.new_pct:.0%}" for r in records)
+        activity_msg = AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender=_AGENT_ID,
+            recipient="dashboard",
+            topic="agent.activity",
+            payload={
+                "agent_id": "cio",
+                "agent_role": "CIO",
+                "pod_id": "firm",
+                "action": "allocation",
+                "summary": f"Rebalanced: {alloc_summary}"[:200],
+                "detail": f"Allocations applied. {', '.join(r.rationale for r in records)}"[:500],
+            },
+        )
+        try:
+            await self._bus.publish("agent.activity", activity_msg, publisher_id=_AGENT_ID)
+        except Exception:
+            pass
+
         logger.info("[cio] Rebalance applied: %s", {r.pod_id: r.new_pct for r in records})
         return records
 
@@ -137,8 +158,6 @@ class CIOAgent:
         cro_constraints: dict,
     ) -> list[AllocationRecord]:
         try:
-            import openai
-
             current = self._allocator.current_allocations()
             summaries_text = "\n".join(
                 f"- {s.pod_id}: pnl={s.risk_metrics.daily_pnl:.2f} "
@@ -155,24 +174,18 @@ class CIOAgent:
                 "Values must sum to 1.0. All values >= 0."
             )
 
-            # Log prompt before LLM call
             if self._session_logger:
                 self._session_logger.log_reasoning("cio", "prompt", prompt)
 
-            client = openai.OpenAI(api_key=self._api_key)
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+            response_text = llm_chat(
+                [{"role": "user", "content": prompt + " Respond with valid JSON only."}],
                 max_tokens=300,
-                response_format={"type": "json_object"},
-                messages=[{"role": "user", "content": prompt + " Respond with valid JSON only."}],
             )
-            response_text = resp.choices[0].message.content
 
-            # Log response after LLM call
             if self._session_logger:
                 self._session_logger.log_reasoning("cio", "response", response_text)
 
-            data = json.loads(response_text)
+            data = extract_json(response_text)
             new_allocs: dict[str, float] = data.get("allocations", {})
             now = datetime.now(timezone.utc)
             records = [

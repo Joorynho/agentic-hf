@@ -84,7 +84,7 @@ def test_session_info_endpoint(test_client):
     assert "capital_per_pod" in data
     assert "total_capital" in data
     assert "num_pods" in data
-    assert data["num_pods"] == 5
+    assert data["num_pods"] == 4
 
 
 def test_pods_endpoint_returns_list(test_client):
@@ -122,7 +122,7 @@ def test_session_info_has_correct_structure(test_client):
     for field in required_fields:
         assert field in data, f"Missing field: {field}"
     assert data["uptime_seconds"] >= 0
-    assert data["num_pods"] == 5
+    assert data["num_pods"] == 4
 
 
 def test_pods_endpoint_no_crash_on_empty(test_client):
@@ -294,7 +294,7 @@ def test_pod_summaries_can_be_updated(test_client):
     assert response1.status_code == 200
 
     # Update state (via app.state if accessible)
-    test_client.app.state.pod_summaries["alpha"] = {
+    test_client.app.state.pod_summaries["equities"] = {
         "nav": 105.0,
         "daily_pnl": 5.0,
         "status": "TRADING",
@@ -306,7 +306,7 @@ def test_pod_summaries_can_be_updated(test_client):
     response2 = test_client.get("/api/pods")
     data = response2.json()
     assert data["count"] == 1
-    assert data["pods"][0]["pod_id"] == "alpha"
+    assert data["pods"][0]["pod_id"] == "equities"
     # Pod summary response uses risk_metrics.nav, not direct nav
     assert data["pods"][0]["nav"] >= 0
 
@@ -354,11 +354,11 @@ async def test_session_with_web_server_integration(alpaca_adapter, event_bus):
         )
 
         # Start session with web server
-        await manager.start_live_session(capital_per_pod=100.0, initial_symbols=["AAPL", "MSFT"])
+        await manager.start_live_session(capital_per_pod=100.0)
 
         # Verify session is active
         assert manager._session_active
-        assert len(manager._pod_runtimes) == 5
+        assert len(manager._pod_runtimes) == 4
         assert manager._capital_per_pod == 100.0
 
         # Verify web app was created
@@ -380,15 +380,15 @@ async def test_pod_summaries_generated_during_session(alpaca_adapter, event_bus)
             enable_web_server=False,
         )
 
-        await manager.start_live_session(capital_per_pod=100.0, initial_symbols=["AAPL"])
+        await manager.start_live_session(capital_per_pod=100.0)
 
         # Collect summaries
         summaries = await manager._collect_pod_summaries()
-        assert len(summaries) == 5
+        assert len(summaries) == 4
 
         # Each summary should have a pod_id
         for pod_id, summary in summaries.items():
-            assert summary.pod_id in ["alpha", "beta", "gamma", "delta", "epsilon"]
+            assert summary.pod_id in ["equities", "fx", "crypto", "commodities"]
             assert summary.nav > 0
 
         await manager.stop_session()
@@ -478,7 +478,7 @@ def test_pods_endpoint_response_structure(test_client):
     """Validate full structure of pods endpoint response."""
     # Add some test data
     test_client.app.state.pod_summaries = {
-        "alpha": {
+        "equities": {
             "nav": 105.5,
             "daily_pnl": 5.5,
             "status": "TRADING",
@@ -496,7 +496,7 @@ def test_pods_endpoint_response_structure(test_client):
     assert len(data["pods"]) == 1
 
     pod = data["pods"][0]
-    assert pod["pod_id"] == "alpha"
+    assert pod["pod_id"] == "equities"
     # Pod response extracts nav from risk_metrics dict
     assert "nav" in pod
     assert "daily_pnl" in pod

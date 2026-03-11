@@ -220,7 +220,7 @@ async def test_mvp3_batch1_minimal_e2e():
 
         # Log a trade
         manager.log_trade(
-            pod_id="alpha",
+            pod_id="equities",
             order_id="test_order",
             symbol="AAPL",
             side="buy",
@@ -239,4 +239,4 @@ async def test_mvp3_batch1_minimal_e2e():
             lines = f.readlines()
         assert len(lines) >= 1
         trade = json.loads(lines[0])
-        assert trade["pod_id"] == "alpha"
+        assert trade["pod_id"] == "equities"

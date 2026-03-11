@@ -30,8 +30,8 @@ from src.mission_control.session_logger import SessionLogger
 
 logger = logging.getLogger(__name__)
 
-# Pod IDs for 5-pod system
-POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+# Pod IDs for 4-pod system (equities, fx, crypto, commodities)
+POD_IDS = ["equities", "fx", "crypto", "commodities"]
 
 
 @pytest.fixture
@@ -79,16 +79,16 @@ def mock_alpaca():
     return mock
 
 
-class TestMVP4LiveSessionExecutes5PodsTrading:
-    """Test 1: Full session with 5 pods trading (15 iterations with governance cycles)."""
+class TestMVP4LiveSessionExecutes4PodsTrading:
+    """Test 1: Full session with 4 pods trading (15 iterations with governance cycles)."""
 
     @pytest.mark.asyncio
-    async def test_mvp4_live_session_executes_5_pods_trading(self, temp_session_dir):
+    async def test_mvp4_live_session_executes_4_pods_trading(self, temp_session_dir):
         """
         Full end-to-end test: 15 iterations with bar distribution, trading, and governance.
 
         Verifies:
-        - 5 pods initialized with $100 capital each
+        - 4 pods initialized with $100 capital each
         - Each pod receives bars
         - Each pod executes at least 1 trade
         - Pod NAVs updated from fills
@@ -101,36 +101,77 @@ class TestMVP4LiveSessionExecutes5PodsTrading:
             return_value={"equity": 500.0, "buying_power": 5000.0}
         )
 
-        # Mock bar fetches - return bars for all 5 symbols
+        # Mock bar fetches - return bars for per-pod universes (equities, fx, crypto, commodities)
         now = datetime.now(timezone.utc)
         test_bars = {
-            "AAPL": [
+            "SPY": [
                 Bar(
-                    symbol="AAPL",
-                    open=150.0,
-                    high=151.0,
-                    low=149.0,
-                    close=150.5,
+                    symbol="SPY",
+                    open=450.0,
+                    high=451.0,
+                    low=449.0,
+                    close=450.5,
                     volume=1000000,
                     timestamp=now,
                     source="alpaca",
                 )
             ],
-            "MSFT": [
+            "QQQ": [
                 Bar(
-                    symbol="MSFT",
-                    open=300.0,
-                    high=301.0,
-                    low=299.0,
-                    close=300.5,
+                    symbol="QQQ",
+                    open=400.0,
+                    high=401.0,
+                    low=399.0,
+                    close=400.5,
                     volume=1000000,
                     timestamp=now,
                     source="alpaca",
                 )
             ],
-            "GOOGL": [
+            "UUP": [
                 Bar(
-                    symbol="GOOGL",
+                    symbol="UUP",
+                    open=28.0,
+                    high=28.1,
+                    low=27.9,
+                    close=28.05,
+                    volume=1000000,
+                    timestamp=now,
+                    source="alpaca",
+                )
+            ],
+            "BTC/USD": [
+                Bar(
+                    symbol="BTC/USD",
+                    open=60000.0,
+                    high=60100.0,
+                    low=59900.0,
+                    close=60050.0,
+                    volume=1000,
+                    timestamp=now,
+                    source="alpaca",
+                )
+            ],
+            "GLD": [
+                Bar(
+                    symbol="GLD",
+                    open=180.0,
+                    high=181.0,
+                    low=179.0,
+                    close=180.5,
+                    volume=1000000,
+                    timestamp=now,
+                    source="alpaca",
+                )
+            ],
+        }
+        # fetch_bars receives (symbols, timeframe) - return bars for per-pod universe
+        def _make_bar(symbol):
+            if symbol in test_bars:
+                return test_bars[symbol]
+            return [
+                Bar(
+                    symbol=symbol,
                     open=100.0,
                     high=101.0,
                     low=99.0,
@@ -139,42 +180,25 @@ class TestMVP4LiveSessionExecutes5PodsTrading:
                     timestamp=now,
                     source="alpaca",
                 )
-            ],
-            "TSLA": [
-                Bar(
-                    symbol="TSLA",
-                    open=200.0,
-                    high=201.0,
-                    low=199.0,
-                    close=200.5,
-                    volume=1000000,
-                    timestamp=now,
-                    source="alpaca",
-                )
-            ],
-            "AMZN": [
-                Bar(
-                    symbol="AMZN",
-                    open=150.0,
-                    high=151.0,
-                    low=149.0,
-                    close=150.5,
-                    volume=1000000,
-                    timestamp=now,
-                    source="alpaca",
-                )
-            ],
-        }
-        mock_alpaca.fetch_bars = AsyncMock(return_value=test_bars)
+            ]
+
+        async def mock_fetch_bars(symbols, timeframe="1Hour"):
+            return {s: _make_bar(s) for s in symbols}
+
+        mock_alpaca.fetch_bars = AsyncMock(side_effect=mock_fetch_bars)
 
         # Mock order execution - return FILLED for every order
+        def _get_fill_price(symbol):
+            bars = test_bars.get(symbol, test_bars.get("SPY"))
+            return bars[0].close if bars else 100.0
+
         async def mock_place_order(symbol, qty, side, order_type, limit_price=None):
             return {
                 "order_id": f"order_{uuid4()}",
                 "symbol": symbol,
                 "qty": qty,
                 "side": side,
-                "fill_price": test_bars[symbol][0].close,
+                "fill_price": _get_fill_price(symbol),
                 "filled_qty": qty,
                 "status": "FILLED",
                 "filled_at": datetime.now(timezone.utc),
@@ -190,9 +214,9 @@ class TestMVP4LiveSessionExecutes5PodsTrading:
         # Start live session
         await manager.start_live_session(capital_per_pod=100.0)
 
-        # Verify 5 pods were initialized
-        assert len(manager._pod_runtimes) == 5, "Should have 5 pods initialized"
-        assert len(manager._pod_gateways) == 5, "Should have 5 pod gateways initialized"
+        # Verify 4 pods were initialized
+        assert len(manager._pod_runtimes) == 4, "Should have 4 pods initialized"
+        assert len(manager._pod_gateways) == 4, "Should have 4 pod gateways initialized"
 
         # Verify each pod has a portfolio accountant with correct initial capital
         for pod_id in POD_IDS:
@@ -208,7 +232,7 @@ class TestMVP4LiveSessionExecutes5PodsTrading:
         # Verify results
         assert summary is not None, "Should return session summary"
         assert "pods_closed" in summary, "Summary should include pods_closed"
-        assert summary["pods_closed"] == 5, "All 5 pods should be closed"
+        assert summary["pods_closed"] == 4, "All 4 pods should be closed"
         assert summary["iterations"] == 0, "No iterations were run"
 
         # Check that session logger was initialized
@@ -273,22 +297,23 @@ class TestMVP4CIOAllocationEnforced:
         Verify CIO allocation constraints are applied to execution.
 
         Verifies:
-        - CIO allocates each pod 20% of firm ($100 per pod of $500)
+        - CIO allocates each pod 25% of firm ($100 per pod of $400)
         - Order exceeding allocation is rejected/scaled
         - SessionManager logs allocation constraint
         """
         mock_alpaca = AsyncMock(spec=AlpacaAdapter)
         mock_alpaca.fetch_account = AsyncMock(
-            return_value={"equity": 500.0, "buying_power": 5000.0}
+            return_value={"equity": 400.0, "buying_power": 4000.0}
         )
+        mock_alpaca.fetch_bars = AsyncMock(return_value={})
 
         manager = SessionManager(mock_alpaca, EventBus(), AuditLog(), session_dir=temp_session_dir)
         await manager.start_live_session(capital_per_pod=100.0)
 
-        # Create mandate: each pod gets 20% = $100 allocation
+        # Create mandate: each pod gets 25% = $100 allocation (4 pods × $100 = $400)
         mandate = MandateUpdate(
             timestamp=datetime.now(timezone.utc),
-            narrative="Equal allocation across 5 pods",
+            narrative="Equal allocation across 4 pods",
             objectives=["Diversify exposure"],
             constraints={"max_leverage": 2.0},
             rationale="Risk-adjusted allocation",
@@ -296,13 +321,12 @@ class TestMVP4CIOAllocationEnforced:
             cio_approved=True,
             cro_approved=True,
             pod_allocations={
-                "alpha": 0.20,
-                "beta": 0.20,
-                "gamma": 0.20,
-                "delta": 0.20,
-                "epsilon": 0.20,
+                "equities": 0.25,
+                "fx": 0.25,
+                "crypto": 0.25,
+                "commodities": 0.25,
             },
-            firm_nav=500.0,
+            firm_nav=400.0,
             cro_halt=False,
         )
 
@@ -311,7 +335,7 @@ class TestMVP4CIOAllocationEnforced:
 
         # Verify mandate is stored
         assert manager._latest_mandate is not None, "Mandate should be stored in manager"
-        assert manager._latest_mandate.pod_allocations["alpha"] == 0.20, "Alpha should have 20%"
+        assert manager._latest_mandate.pod_allocations["equities"] == 0.25, "Equities should have 25%"
 
         await manager.stop_session()
 
@@ -332,8 +356,9 @@ class TestMVP4CRORiskHaltStopsExecution:
         """
         mock_alpaca = AsyncMock(spec=AlpacaAdapter)
         mock_alpaca.fetch_account = AsyncMock(
-            return_value={"equity": 500.0, "buying_power": 5000.0}
+            return_value={"equity": 400.0, "buying_power": 4000.0}
         )
+        mock_alpaca.fetch_bars = AsyncMock(return_value={})
 
         manager = SessionManager(mock_alpaca, EventBus(), AuditLog(), session_dir=temp_session_dir)
         await manager.start_live_session(capital_per_pod=100.0)
@@ -377,8 +402,9 @@ class TestMVP4GovernanceCycleWithLiveExecution:
         # Setup
         mock_alpaca = AsyncMock(spec=AlpacaAdapter)
         mock_alpaca.fetch_account = AsyncMock(
-            return_value={"equity": 500.0, "buying_power": 5000.0}
+            return_value={"equity": 400.0, "buying_power": 4000.0}
         )
+        mock_alpaca.fetch_bars = AsyncMock(return_value={})
 
         manager = SessionManager(mock_alpaca, EventBus(), AuditLog(), session_dir=temp_session_dir)
         await manager.start_live_session(capital_per_pod=100.0)
@@ -392,7 +418,7 @@ class TestMVP4GovernanceCycleWithLiveExecution:
         # Verify risk halt is off
         assert manager._risk_halt is False, "Risk halt should be off initially"
 
-        # Simulate a governance cycle by setting a mandate
+        # Simulate a governance cycle by setting a mandate (25% each for 4 pods)
         test_mandate = MandateUpdate(
             timestamp=datetime.now(timezone.utc),
             narrative="Test allocation",
@@ -402,15 +428,15 @@ class TestMVP4GovernanceCycleWithLiveExecution:
             authorized_by="ceo_rule_based",
             cio_approved=True,
             cro_approved=True,
-            pod_allocations={pod_id: 0.20 for pod_id in POD_IDS},
-            firm_nav=500.0,
+            pod_allocations={pod_id: 0.25 for pod_id in POD_IDS},
+            firm_nav=400.0,
             cro_halt=False,
         )
         manager._latest_mandate = test_mandate
 
         # Verify mandate is stored
         assert manager._latest_mandate is not None, "Mandate should be stored"
-        assert manager._latest_mandate.pod_allocations["alpha"] == 0.20, "Alpha allocation should be 20%"
+        assert manager._latest_mandate.pod_allocations["equities"] == 0.25, "Equities allocation should be 25%"
 
         # Log a governance decision
         manager._session_logger.log_reasoning(
@@ -446,7 +472,7 @@ class TestMVP4SessionLoggerTradeLogging:
 
         # Log some trades using order_info dict (which must include symbol, side, qty)
         logger_obj.log_trade(
-            pod_id="alpha",
+            pod_id="equities",
             order_info={
                 "order_id": "order_1",
                 "symbol": "AAPL",
@@ -462,7 +488,7 @@ class TestMVP4SessionLoggerTradeLogging:
         )
 
         logger_obj.log_trade(
-            pod_id="beta",
+            pod_id="fx",
             order_info={
                 "order_id": "order_2",
                 "symbol": "MSFT",
@@ -489,13 +515,13 @@ class TestMVP4SessionLoggerTradeLogging:
             assert len(trades) == 2, "Should have 2 trades logged"
 
             # Verify first trade
-            assert trades[0]["pod_id"] == "alpha"
+            assert trades[0]["pod_id"] == "equities"
             assert trades[0]["symbol"] == "AAPL"
             assert trades[0]["side"] == "buy"
             assert trades[0]["qty"] == 10.0
 
             # Verify second trade
-            assert trades[1]["pod_id"] == "beta"
+            assert trades[1]["pod_id"] == "fx"
             assert trades[1]["symbol"] == "MSFT"
             assert trades[1]["side"] == "sell"
 
@@ -543,56 +569,61 @@ class TestMVP4NAVCalculationFromFills:
 
 
 class TestMVP4MultiPodTrading:
-    """Test 8: Verify all 5 pods can trade simultaneously."""
+    """Test 8: Verify all 4 pods can trade simultaneously."""
 
     @pytest.mark.asyncio
     async def test_mvp4_multiple_pods_independent_trading(self, temp_session_dir):
-        """Verify 5 pods maintain independent portfolios and NAVs."""
+        """Verify 4 pods maintain independent portfolios and NAVs."""
         from src.backtest.accounting.portfolio import PortfolioAccountant
 
-        # Create 5 independent accountants (one per pod)
+        # Create 4 independent accountants (one per pod)
         accountants = {pod_id: PortfolioAccountant(pod_id=pod_id, initial_nav=100.0) for pod_id in POD_IDS}
 
         # Verify all initialized correctly
         for pod_id, acct in accountants.items():
             assert acct.nav == 100.0, f"Pod {pod_id} should start with $100"
 
-        # Each pod trades independently
+        # Each pod trades independently (symbols from per-pod universes)
         symbol_map = {
-            "alpha": "AAPL",
-            "beta": "MSFT",
-            "gamma": "GOOGL",
-            "delta": "TSLA",
-            "epsilon": "AMZN",
+            "equities": "SPY",
+            "fx": "UUP",
+            "crypto": "BTC/USD",
+            "commodities": "GLD",
         }
 
         for pod_id, acct in accountants.items():
             symbol = symbol_map[pod_id]
-            # Buy 10 shares @ $100
-            acct.record_fill_direct(f"{pod_id}_order_1", symbol, qty=10.0, fill_price=100.0)
-            acct.mark_to_market({symbol: 100.0})
+            # Buy 10 shares @ $100 (use round price for crypto)
+            fill_price = 60000.0 if symbol == "BTC/USD" else 100.0
+            acct.record_fill_direct(f"{pod_id}_order_1", symbol, qty=10.0, fill_price=fill_price)
+            acct.mark_to_market({symbol: fill_price})
 
         # Price move: all symbols up 10%
         for pod_id, acct in accountants.items():
             symbol = symbol_map[pod_id]
-            acct.mark_to_market({symbol: 110.0})
+            new_price = 66000.0 if symbol == "BTC/USD" else 110.0
+            acct.mark_to_market({symbol: new_price})
 
         # Verify each pod's NAV increased by same %
         for pod_id, acct in accountants.items():
-            expected_nav = 100.0 + (10.0 * 10.0)  # 100 initial + 10 shares * $10 gain
+            symbol = symbol_map[pod_id]
+            gain_per_share = 6000.0 if symbol == "BTC/USD" else 10.0
+            expected_nav = 100.0 + (10.0 * gain_per_share)
             assert acct.nav == pytest.approx(expected_nav), f"Pod {pod_id} NAV should be {expected_nav}"
 
         # Verify independence: changes in one don't affect others
-        accountants["alpha"].record_fill_direct("alpha_order_2", "AAPL", qty=-10.0, fill_price=115.0)
-        accountants["alpha"].mark_to_market({"AAPL": 115.0})
+        accountants["equities"].record_fill_direct("equities_order_2", "SPY", qty=-10.0, fill_price=115.0)
+        accountants["equities"].mark_to_market({"SPY": 115.0})
 
-        # Alpha should now have realized 150 gain, others unaffected
-        alpha_nav = accountants["alpha"].nav
-        assert alpha_nav > 100.0, "Alpha should have gains"
+        # Equities should now have realized gains, others unaffected
+        equities_nav = accountants["equities"].nav
+        assert equities_nav > 100.0, "Equities should have gains"
 
-        for pod_id in ["beta", "gamma", "delta", "epsilon"]:
-            # Others should still have their 100 in gains
-            assert accountants[pod_id].nav == pytest.approx(100.0 + 100.0), f"Pod {pod_id} should be unaffected"
+        for pod_id in ["fx", "crypto", "commodities"]:
+            # Others should still have their gains
+            symbol = symbol_map[pod_id]
+            gain_per_share = 6000.0 if symbol == "BTC/USD" else 10.0
+            assert accountants[pod_id].nav == pytest.approx(100.0 + 10.0 * gain_per_share), f"Pod {pod_id} should be unaffected"
 
 
 class TestMVP4ErrorHandling:

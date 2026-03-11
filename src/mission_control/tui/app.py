@@ -40,11 +40,10 @@ class AgenticHFApp(App):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, **kwargs):
+    def __init__(self, event_bus: EventBus | None = None, audit_log: AuditLog | None = None, **kwargs):
         super().__init__(**kwargs)
-        # Initialize EventBus and DataProvider at app startup
-        self._audit_log = AuditLog()
-        self._bus = EventBus(audit_log=self._audit_log)
+        self._audit_log = audit_log or AuditLog()
+        self._bus = event_bus or EventBus(audit_log=self._audit_log)
         self._data_provider = DataProvider(bus=self._bus, audit_log=self._audit_log)
         self._initialized = False
 

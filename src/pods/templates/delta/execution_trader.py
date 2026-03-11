@@ -1,10 +1,12 @@
 from __future__ import annotations
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.core.models.allocation import MandateUpdate
+from src.core.models.enums import Side
 from src.core.models.execution import Order, RiskApprovalToken, OrderResult
+from src.core.models.messages import AgentMessage
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.pods.base.agent import BasePodAgent
 
@@ -191,6 +193,40 @@ class DeltaExecutionTrader(BasePodAgent):
                 )
 
             self.store("last_order_result", result.model_dump(mode="json"))
+
+            # Sync fill with PortfolioAccountant + publish to EventBus
+            if result.status in ("FILLED", "PARTIAL"):
+                accountant = self._ns.get("accountant")
+                if accountant:
+                    signed_qty = result.fill_qty if order.side == Side.BUY else -result.fill_qty
+                    accountant.record_fill_direct(
+                        order_id=result.order_id or "",
+                        symbol=order.symbol,
+                        qty=signed_qty,
+                        fill_price=result.fill_price or 0.0,
+                        filled_at=result.filled_at,
+                    )
+
+                try:
+                    fill_msg = AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"pod.{self._pod_id}.exec",
+                        recipient="broadcast",
+                        topic="execution.fill",
+                        payload={
+                            "pod_id": self._pod_id,
+                            "order_id": result.order_id,
+                            "symbol": order.symbol,
+                            "side": order.side.value,
+                            "qty": result.fill_qty,
+                            "fill_price": result.fill_price,
+                            "status": result.status,
+                            "filled_at": result.filled_at.isoformat() if result.filled_at else None,
+                        },
+                    )
+                    await self._bus.publish("execution.fill", fill_msg, publisher_id=f"pod.{self._pod_id}")
+                except Exception as e:
+                    logger.debug("[delta.exec] Failed to publish fill event: %s", e)
 
             # Log trade to SessionLogger if available and order was filled
             if self._session_logger and result.status in ("FILLED", "PARTIAL"):

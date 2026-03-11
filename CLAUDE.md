@@ -162,7 +162,9 @@ Multi-agent hedge fund simulation OS. 5 isolated strategy pods + firm-level gove
 - **asyncio** — all agents and bus operations are async
 - **DuckDB** — audit log and state store
 - **Textual + Rich** — Mission Control TUI
+- **OpenRouter** — LLM provider for CEO/CIO/PM agents (OpenAI-compatible API). All calls go through `src/core/llm.py` which handles retry + model rotation across free-tier models
 - **yfinance** — primary market data (no API key, free)
+- **FastAPI + WebSocket** — web dashboard (live data broadcast)
 - **pytest + pytest-asyncio** — `asyncio_mode = "auto"` required in `pyproject.toml`
 
 ### Project Structure
@@ -213,22 +215,24 @@ python -m src.mission_control.tui.app
 - **Pydantic v2.11:** Access `model_fields` on the **class** not the instance — `MyModel.model_fields`, not `instance.model_fields`
 - **textual TUI:** Cannot be pytest-tested directly (requires a terminal). Use import smoke tests only: instantiate the widget and verify no errors
 - **Windows git:** LF→CRLF conversion warnings on commit are harmless, can be ignored
-- **snscrape (X scraper):** Fragile and ToS-violating — always wrap in circuit breaker, never let pods block on it. Failures are INFO level only
+- **OpenRouter free-tier:** Free models are rate-limited aggressively. `src/core/llm.py` auto-rotates through 8 free models. Agents fall back to rule-based mode on total failure
 - **yfinance:** Rate limiting can occur with parallel fetches — Parquet cache is mandatory, not optional. Always pre-fetch before the backtest loop
+- **Nitter (X scraper):** Completely non-functional as of 2026. Social feed uses direct news RSS feeds instead (see `src/data/adapters/x_adapter.py`)
 
 ### MVP Progress
 - **MVP1** ✅ Complete — single pod + event bus + backtest engine + TUI (46 tests passing)
-- **MVP2** 🔜 All 5 pods + LLM agents (CIO/CEO via Claude SDK) + building view TUI + Polymarket integration
-- **MVP3** 🔜 News scraper (GDELT + FRED + EDGAR + RSS + Reddit + X) + pod researchers
-- **MVP4** 🔜 Execution hardening + Alpaca paper trading + full TUI visual effects
+- **MVP2** ✅ Complete — all 5 pods + LLM agents (CEO/CIO/PM via OpenRouter) + web dashboard + Polymarket integration
+- **MVP3** ✅ Complete — GDELT + FRED (23 series) + RSS + social feed (news RSS) + pod researchers (Gamma/Delta/Epsilon). EDGAR and Reddit skipped.
+- **MVP4** 🔜 Execution hardening + Alpaca paper trading + accountant sync + dashboard execution tab
 
 ### External API Keys
 **NEVER hardcode API keys. Always load from `.env` via `python-dotenv` or `os.environ`.**
-- `POLYMARKET_API_KEY` — stored in `.env` (gitignored). Used by pod researchers in MVP2.
-  - Docs: https://docs.polymarket.com / CLOB API: https://clob.polymarket.com
-  - Relevant pods: Delta (event odds), Gamma (macro odds), Epsilon (tail risk)
-  - Key fields to extract: `market`, `question`, `outcomePrices`, `volume`, `endDate`
-  - Rate limit: check docs; cache responses aggressively in PodNamespace
+- `OPENROUTER_API_KEY` — LLM provider for all agents (CEO, CIO, PM). Free-tier models available.
+- `OPENROUTER_MODEL` — optional model override (default: `google/gemma-3-27b-it:free`)
+- `POLYMARKET_API_KEY` — Polymarket prediction market data for pod researchers
+- `FRED_API_KEY` — Federal Reserve Economic Data (23 macro indicators)
+- `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` — Alpaca paper trading (MVP4)
+- `OPENAI_API_KEY` — legacy fallback, only used if `OPENROUTER_API_KEY` is not set
 
 ### Polymarket Integration Notes
 - Use the **CLOB API** (`clob.polymarket.com`) for real-time market odds
@@ -245,5 +249,4 @@ python -m src.mission_control.tui.app
 - `superpowers:test-driven-development` — all new features
 - `superpowers:systematic-debugging` — any test failure
 - `superpowers:verification-before-completion` — before claiming any milestone done
-- `claude-developer-platform` — when wiring Claude SDK for CIO/CEO/News agents (MVP2+)
-- `frontend-design` — when building new Textual TUI screens
+- `frontend-design` — when building new Textual TUI screens or web dashboard features

@@ -1,13 +1,13 @@
 from __future__ import annotations
 import logging
-import os
 from datetime import datetime, timezone
+from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
-_HAS_LLM = bool(os.getenv("ANTHROPIC_API_KEY"))
+_HAS_LLM = has_llm_key()
 
 UNIVERSE = ["SPY", "TLT", "GLD", "UUP", "EEM"]
 BASE_QTY = 50.0
@@ -55,22 +55,14 @@ class GammaPMAgent(BasePodAgent):
 
     async def _llm_decision(self, macro_score: float, bar) -> dict:
         try:
-            import anthropic
-            import json
-
-            client = anthropic.Anthropic()
             prompt = (
                 f"You are a macro PM. Macro score: {macro_score:.4f}. "
                 f"Current price: {bar.close}. "
-                "Choose one: BUY SPY, BUY TLT, BUY GLD, or HOLD. Reply with JSON: "
+                "Choose one: BUY SPY, BUY TLT, BUY GLD, or HOLD. Reply with JSON only: "
                 '{"action": "BUY"|"HOLD", "symbol": "SPY"|"TLT"|"GLD"|"UUP"|"EEM", "rationale": "..."}'
             )
-            resp = client.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=200,
-                messages=[{"role": "user", "content": prompt}],
-            )
-            decision = json.loads(resp.content[0].text)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=200)
+            decision = extract_json(raw)
             if decision.get("action") == "HOLD":
                 return {}
             symbol = decision.get("symbol", "SPY")

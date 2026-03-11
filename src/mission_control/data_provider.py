@@ -94,10 +94,10 @@ class DataProvider:
         """Subscribe to EventBus topics for live updates.
 
         Called once at app startup to wire up subscriptions.
-        Subscribes to concrete pod gateway topics for the 5 design pods.
+        Subscribes to concrete pod gateway topics for the 4 design pods.
         """
-        # Subscribe to pod gateway summaries for each of the 5 design pods
-        POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+        # Subscribe to pod gateway summaries for each of the 4 design pods
+        POD_IDS = ["equities", "fx", "crypto", "commodities"]
         for pod_id in POD_IDS:
             topic = f"pod.{pod_id}.gateway"
             await self._bus.subscribe(topic, self._on_pod_summary)
