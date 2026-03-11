@@ -20,10 +20,19 @@ var researchPolySentiment = 0;
 var researchSocialScore = 0;
 var researchXFeed = [];
 var researchXTweetCount = 0;
+var newsLastRefresh = null;
+var newsLastRefresh = null;
 var agentActivity = {};
 var activityFeed = [];
 var podNavSpark = {};
 var ddChart = null;
+var initialCapital = 0;
+var pnlHistory = [];
+var chartTimeframeMinutes = 0;
+var orderBook = {};
+var podPnlHistory = {};
+var execFilter = 'all';
+var sessionActive = false;
 var currentFloor = 0;
 var isScrolling = false;
 var scrollTimeout = null;
@@ -474,8 +483,8 @@ function buildGovernanceFurniture(g, acc) {
   addPartition(g, -4.0, 0.5, 2.4, 0.04);
   addPartition(g,  4.0, 0.5, 2.4, 0.04);
 
-  // Large presentation screen centered on rear wall
-  addWallDisplay(g, 0, FLOOR_H * 0.55, -(FLOOR_D * 0.5) + 0.12, 4.0, 1.6, acc);
+  // Presentation screen on rear wall (compact, above table sightline)
+  addWallDisplay(g, 0, FLOOR_H * 0.6, -(FLOOR_D * 0.5) + 0.12, 2.4, 0.9, acc);
 
   // Low credenza along rear wall sides
   addCabinet(g, -4.5, -(FLOOR_D * 0.5) + 0.5, 2.0, 0.5, 0.6, matFurn);

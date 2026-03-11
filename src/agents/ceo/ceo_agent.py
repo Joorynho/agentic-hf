@@ -152,11 +152,12 @@ class CEOAgent:
         return None
 
     def _rule_based_mandate(
-        self, pod_summaries: list[PodSummary], cro_constraints: dict
+        self, pod_summaries, cro_constraints: dict
     ) -> MandateUpdate:
-        active_pods = [s for s in pod_summaries if s.status == "active"]
+        items = pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries
+        active_pods = [s for s in items if s.status == "active"]
         narrative = (
-            f"Firm operating with {len(active_pods)}/{len(pod_summaries)} active pods. "
+            f"Firm operating with {len(active_pods)}/{len(list(items))} active pods. "
             "Rule-based mandate: balanced risk, preserve capital, diversified exposure."
         )
         constraints = {**_DEFAULT_CONSTRAINTS, **cro_constraints}
@@ -173,15 +174,16 @@ class CEOAgent:
 
     async def _llm_mandate(
         self,
-        pod_summaries: list[PodSummary],
+        pod_summaries,
         cio_input: str,
         cro_constraints: dict,
     ) -> MandateUpdate:
         try:
+            items = pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries
             summaries_text = "\n".join(
                 f"- {s.pod_id}: status={s.status} pnl={s.risk_metrics.daily_pnl:.2f} "
                 f"dd={s.risk_metrics.drawdown_from_hwm:.3f}"
-                for s in pod_summaries
+                for s in items
             )
             prompt = (
                 "You are the CEO of an algorithmic hedge fund. "

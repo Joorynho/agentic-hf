@@ -63,7 +63,7 @@ class GovernanceOrchestrator:
                 "action": "ceo_strategy",
                 "trigger": trigger,
                 "pod_count": len(pod_summaries),
-                "active_pods": [s.pod_id for s in pod_summaries if s.status.value == "active"],
+                "active_pods": [s.pod_id for s in (pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries) if s.status.value == "active"],
             },
         )
         loop = await self._runner.run_loop(

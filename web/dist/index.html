@@ -30,6 +30,11 @@
       <div class="sb-dot" id="conn-dot"></div>
       <span class="sb-label" id="conn-label">DISCONNECTED</span>
     </div>
+    <div class="sb-pill" id="session-pill">
+      <div class="sb-dot" id="session-dot"></div>
+      <span class="sb-label" id="session-label">IDLE</span>
+    </div>
+    <button class="sb-btn sb-btn-stop" id="session-btn" onclick="toggleSession()">START</button>
     <div class="sb-pill">
       <span class="sb-label">ITER</span>
       <span id="iter-ctr" style="color:var(--text-primary);font-family:var(--font-mono)">—</span>
@@ -87,6 +92,11 @@
           <div class="kpi-sub" id="kpi-pnl">—</div>
         </div>
         <div class="kpi">
+          <div class="kpi-lbl">Cumulative P&amp;L</div>
+          <div class="kpi-val" id="kpi-cpnl">—</div>
+          <div class="kpi-sub" id="kpi-cret">—</div>
+        </div>
+        <div class="kpi">
           <div class="kpi-lbl">Active Pods</div>
           <div class="kpi-val" id="kpi-active">—</div>
           <div class="kpi-sub">of 4</div>
@@ -101,6 +111,7 @@
         <div class="sec-hdr">
           <span class="sec-title">Pod Performance</span>
           <span class="sec-badge" id="pod-badge">0 pods</span>
+          <button class="export-btn" onclick="exportPods()">CSV</button>
         </div>
         <div class="tbl-wrap">
           <table class="dtbl">
@@ -133,10 +144,42 @@
           </table>
         </div>
       </div>
+      <div id="pod-drilldown" class="pod-drilldown" style="display:none">
+        <div class="dd-header">
+          <span class="dd-pod-name" id="dd-pod-name">EQUITIES</span>
+          <button class="dd-close" onclick="closeDrilldown()">CLOSE</button>
+        </div>
+        <div class="dd-kpis" id="dd-kpis"></div>
+        <div class="dd-section">
+          <div class="sec-hdr"><span class="sec-title">Positions</span></div>
+          <div class="tbl-wrap"><table class="dtbl">
+            <thead><tr><th>Symbol</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th></tr></thead>
+            <tbody id="dd-positions"></tbody>
+          </table></div>
+        </div>
+        <div class="dd-section">
+          <div class="sec-hdr"><span class="sec-title">Recent Trades</span></div>
+          <div class="tbl-wrap"><table class="dtbl">
+            <thead><tr><th>Symbol</th><th>Side</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Status</th></tr></thead>
+            <tbody id="dd-trades"></tbody>
+          </table></div>
+        </div>
+        <div class="dd-section">
+          <div class="sec-hdr"><span class="sec-title">PM Reasoning</span></div>
+          <div id="dd-reasoning" class="dd-reasoning"></div>
+        </div>
+      </div>
     </div>
 
     <!-- PERFORMANCE -->
     <div class="tab-pane" id="tab-performance">
+      <div class="chart-timeframe" id="chart-timeframe">
+        <button class="tf-btn" data-tf="5" onclick="setChartTimeframe(5)">5m</button>
+        <button class="tf-btn" data-tf="15" onclick="setChartTimeframe(15)">15m</button>
+        <button class="tf-btn" data-tf="60" onclick="setChartTimeframe(60)">1h</button>
+        <button class="tf-btn active" data-tf="0" onclick="setChartTimeframe(0)">ALL</button>
+        <button class="export-btn" onclick="exportNavHistory()" style="margin-left:auto">CSV</button>
+      </div>
       <div class="chart-wrap"><canvas id="navChart"></canvas></div>
       <div class="chart-wrap dd-chart-wrap"><canvas id="ddChart"></canvas></div>
       <div class="kpi-row">
@@ -155,6 +198,10 @@
             <tbody id="perf-table"><tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
           </table>
         </div>
+      </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Pod Attribution</span></div>
+        <div id="attribution-panel"></div>
       </div>
     </div>
 
@@ -179,6 +226,10 @@
           </table>
         </div>
       </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Cross-Pod Correlation</span></div>
+        <div id="correlation-heatmap"></div>
+      </div>
     </div>
 
     <!-- EXECUTION -->
@@ -188,7 +239,16 @@
         <div class="kpi"><div class="kpi-lbl">Filled</div><div class="kpi-val" id="kpi-filled">0</div></div>
       </div>
       <div>
-        <div class="sec-hdr"><span class="sec-title">Trade Log</span></div>
+        <div class="sec-hdr">
+          <span class="sec-title">Trade Log</span>
+          <div class="exec-filters">
+            <button class="ef-btn active" data-ef="all" onclick="setExecFilter('all')">All</button>
+            <button class="ef-btn" data-ef="PENDING" onclick="setExecFilter('PENDING')">Pending</button>
+            <button class="ef-btn" data-ef="FILLED" onclick="setExecFilter('FILLED')">Filled</button>
+            <button class="ef-btn" data-ef="REJECTED" onclick="setExecFilter('REJECTED')">Rejected</button>
+          </div>
+          <button class="export-btn" onclick="exportTrades()">CSV</button>
+        </div>
         <div class="tbl-wrap">
           <table class="dtbl">
             <thead><tr>
@@ -504,7 +564,11 @@
 
     <!-- INTELLIGENCE FEED -->
     <div id="activity-feed">
-      <div class="feed-header">INTELLIGENCE FEED</div>
+      <div class="feed-header" onclick="toggleIntelFeed()">
+        <span>INTELLIGENCE FEED</span>
+        <span class="feed-count" id="intel-count"></span>
+        <span class="feed-toggle" id="intel-toggle">&#9650;</span>
+      </div>
       <div id="feed-list">
         <div class="feed-empty">Waiting for agent activity&hellip;</div>
       </div>

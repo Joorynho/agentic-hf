@@ -546,7 +546,7 @@ leftPanel.addEventListener('wheel', (e) => {
   if (isScrolling) return;
   isScrolling = true;
 
-  const direction = e.deltaY > 0 ? 1 : -1;
+  const direction = e.deltaY > 0 ? -1 : 1;
   const base = currentFloor < 0 ? (direction > 0 ? -1 : -1) : currentFloor;
   const nextFloor = Math.max(0, Math.min(4, base + direction));
 

@@ -13,7 +13,7 @@ from src.agents.cio.cio_agent import CIOAgent
 from src.agents.governance.governance_orchestrator import GovernanceOrchestrator
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 
-POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+POD_IDS = ["equities", "fx", "crypto", "commodities"]
 
 
 def _summary(
@@ -77,11 +77,11 @@ async def test_cro_no_breach_on_healthy_pods(cro):
 
 async def test_cro_detects_drawdown_breach(cro):
     summaries = [
-        _summary("alpha", drawdown=0.11),  # >10% → alert
+        _summary("equities", drawdown=0.11),  # >10% → alert
         *[_summary(pid) for pid in POD_IDS[1:]],
     ]
     breached = await cro.check_all_pods(summaries)
-    assert "alpha" in breached
+    assert "equities" in breached
 
 
 async def test_cro_approves_valid_allocation_message(cro):
@@ -90,7 +90,7 @@ async def test_cro_approves_valid_allocation_message(cro):
         sender="cio", recipient="cro", topic="governance.cro",
         payload={
             "action": "cio_proposal",
-            "proposed_allocations": {pid: 0.2 for pid in POD_IDS},
+            "proposed_allocations": {pid: 0.25 for pid in POD_IDS},
         },
     )
     response = await cro.handle_governance_message(msg)
@@ -104,13 +104,13 @@ async def test_cro_rejects_over_concentrated_allocation(cro):
         sender="cio", recipient="cro", topic="governance.cro",
         payload={
             "action": "cio_proposal",
-            "proposed_allocations": {"alpha": 0.6, "beta": 0.1, "gamma": 0.1, "delta": 0.1, "epsilon": 0.1},
+            "proposed_allocations": {"equities": 0.6, "fx": 0.15, "crypto": 0.1, "commodities": 0.15},
         },
     )
     response = await cro.handle_governance_message(msg)
     assert response is not None
     assert response.payload["consensus"] is False
-    assert "alpha" in response.payload["violations"]
+    assert "equities" in response.payload["violations"]
 
 
 async def test_cro_firm_kill_switch_publishes(bus):
@@ -151,8 +151,48 @@ async def test_governance_full_cycle(governance):
 
 async def test_governance_risk_interrogation_on_breach(governance):
     summaries = [
-        _summary("alpha", drawdown=0.11),
+        _summary("equities", drawdown=0.11),
         *[_summary(pid) for pid in POD_IDS[1:]],
     ]
     breached = await governance.run_risk_interrogation(summaries)
-    assert "alpha" in breached
+    assert "equities" in breached
+
+
+# --- Dict input (matching real runtime behavior) ---
+
+async def test_cro_accepts_dict_input(cro):
+    """CRO.check_all_pods must accept dict[str, PodSummary] since
+    session_manager._collect_pod_summaries returns a dict."""
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    breached = await cro.check_all_pods(summaries)
+    assert breached == []
+
+
+async def test_cro_detects_breach_with_dict_input(cro):
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    summaries["equities"] = _summary("equities", drawdown=0.11)
+    breached = await cro.check_all_pods(summaries)
+    assert "equities" in breached
+
+
+async def test_governance_full_cycle_with_dict_input(governance):
+    """run_full_cycle receives a dict from session_manager."""
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    result = await governance.run_full_cycle(summaries)
+    assert "breached_pods" in result
+    assert "mandate" in result
+    assert result["mandate"] is not None
+
+
+async def test_governance_deliberation_with_dict_input(governance):
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    loop = await governance.run_firm_deliberation(summaries)
+    assert loop.topic == "firm_deliberation"
+    assert loop.iterations_used >= 1
+
+
+async def test_governance_risk_interrogation_dict_with_breach(governance):
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    summaries["crypto"] = _summary("crypto", drawdown=0.11)
+    breached = await governance.run_risk_interrogation(summaries)
+    assert "crypto" in breached

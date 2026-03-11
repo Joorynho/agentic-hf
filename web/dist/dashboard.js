@@ -32,6 +32,44 @@ function saveSignalHistory() {
 
 var signalHistory = loadSignalHistory();
 
+// ─── 2b. Session Status ──────────────────────────────────────────────────
+var sessionActive = false;
+
+function updateSessionStatus(active) {
+  sessionActive = active;
+  var dot = document.getElementById('session-dot');
+  var lbl = document.getElementById('session-label');
+  var btn = document.getElementById('session-btn');
+  if (!dot || !lbl || !btn) return;
+  dot.classList.toggle('on', active);
+  lbl.classList.toggle('on', active);
+  lbl.textContent = active ? 'ACTIVE' : 'IDLE';
+  btn.textContent = active ? 'STOP' : 'START';
+  btn.className = active ? 'sb-btn sb-btn-stop' : 'sb-btn sb-btn-start';
+}
+
+function toggleSession() {
+  if (sessionActive) {
+    if (!confirm('Stop the trading session? All pods will be halted.')) return;
+    fetch('/api/session/stop', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) { if (d.ok) updateSessionStatus(false); })
+      .catch(function(e) { console.error('stop failed', e); });
+  } else {
+    fetch('/api/session/start', { method: 'POST' })
+      .then(function(r) { return r.json(); })
+      .then(function(d) { if (d.ok) updateSessionStatus(true); })
+      .catch(function(e) { console.error('start failed', e); });
+  }
+}
+
+(function pollSessionStatus() {
+  fetch('/api/session/status')
+    .then(function(r) { return r.json(); })
+    .then(function(d) { updateSessionStatus(!!d.active); })
+    .catch(function() {});
+})();
+
 // ─── 3. Tab Switching ─────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -464,7 +502,7 @@ function renderNewsFeed() {
   if (sentimentEl) sentimentEl.textContent = sentiment;
   if (countEl) countEl.textContent = count;
   if (sourcesEl) sourcesEl.textContent = feed.length ? feed.length + '/25' : '0/25';
-  if (refreshEl) refreshEl.textContent = feed.length ? formatRelativeTime(feed[0] && feed[0].timestamp) : '—';
+  if (refreshEl) refreshEl.textContent = newsLastRefresh ? formatRelativeTime(newsLastRefresh) : '—';
   if (badgeEl) badgeEl.textContent = count > 0 ? count : '';
 
   if (!container) return;
@@ -514,6 +552,7 @@ function handleMessage(msg) {
     var snap = msg.data || {};
     if (snap.iteration) iterCount = snap.iteration;
     document.getElementById('iter-ctr').textContent = iterCount || '—';
+    if (snap.session_active !== undefined) updateSessionStatus(!!snap.session_active);
     var podSums = snap.pod_summaries || {};
     for (var pid in podSums) {
       var m = podSums[pid];
@@ -540,10 +579,13 @@ function handleMessage(msg) {
         if (!agentActivity[act.agent_id]) agentActivity[act.agent_id] = [];
         agentActivity[act.agent_id].unshift(act);
         if (agentActivity[act.agent_id].length > 5) agentActivity[act.agent_id].pop();
-        activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, ts: a.timestamp });
+        activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, urls: act.urls, ts: a.timestamp });
       }
     });
     if (activityFeed.length > 50) activityFeed = activityFeed.slice(0, 50);
+    (snap.recent_orders || []).forEach(function(o) {
+      if (o.data && o.data.order_id) orderBook[o.data.order_id] = o.data;
+    });
     updatePodsTable();
     updateFirmMetrics();
     updatePerfTable();
@@ -553,6 +595,11 @@ function handleMessage(msg) {
     updateActivityFeed();
     updateDecisionTimeline();
     updateGovHub();
+    return;
+  }
+  if (msg.type === 'session_status') {
+    var sd = msg.data || {};
+    updateSessionStatus(!!sd.active);
     return;
   }
   if (msg.type === 'pod_summary') {
@@ -579,6 +626,7 @@ function handleMessage(msg) {
           }).slice(-200);
         }
         if (data.x_tweet_count !== undefined) researchXTweetCount = (researchXFeed || []).length;
+        if (data.news_last_refresh) newsLastRefresh = data.news_last_refresh;
         if (data.polymarket_signals && data.polymarket_signals.length > 0) {
           if (!window._allPolySignals) window._allPolySignals = {};
           window._allPolySignals[pod_id] = data.polymarket_signals;
@@ -644,11 +692,20 @@ function handleMessage(msg) {
     if (!agentActivity[act.agent_id]) agentActivity[act.agent_id] = [];
     agentActivity[act.agent_id].unshift(act);
     if (agentActivity[act.agent_id].length > 5) agentActivity[act.agent_id].pop();
-    activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, ts: msg.timestamp });
+    activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, urls: act.urls, ts: msg.timestamp });
     if (activityFeed.length > 50) activityFeed.pop();
     updateActivityFeed();
     updateDecisionTimeline();
     if (typeof triggerAgentActivity === 'function') triggerAgentActivity(act.pod_id, act.agent_role);
+  } else if (msg.type === 'order_update') {
+    var od = msg.data;
+    if (od.order_id) {
+      orderBook[od.order_id] = od;
+      if (od.status === 'FILLED' || od.status === 'PARTIAL') {
+        addTrade(od.pod_id || 'unknown', od.symbol, od.side, od.fill_qty || od.qty, od.fill_price || 0, od.status);
+      }
+      updateExecTable();
+    }
   }
 }
 
@@ -681,7 +738,7 @@ function updatePodsTable() {
     const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
     const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
     const spark = makeSparkline(podNavSpark[id]);
-    return `<tr>
+    return `<tr onclick="openDrilldown('${id}')" style="cursor:pointer" title="Click for details">
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r">$${nav.toFixed(2)}</td>
       <td class="r">${spark}</td>
@@ -701,6 +758,12 @@ function updateFirmMetrics() {
     return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
   }, 0);
 
+  if (initialCapital === 0 && ids.length > 0) {
+    initialCapital = ids.reduce(function(s, id) {
+      return s + (pods[id].starting_capital || pods[id].nav || 0);
+    }, 0);
+  }
+
   document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
   document.getElementById('kpi-active').textContent = act > 0 ? act : '—';
   document.getElementById('kpi-pos').textContent    = pos > 0 ? pos : '—';
@@ -713,6 +776,20 @@ function updateFirmMetrics() {
     pnlEl.textContent = '—';
     pnlEl.className   = 'kpi-sub';
   }
+
+  var cpnlEl = document.getElementById('kpi-cpnl');
+  var cretEl = document.getElementById('kpi-cret');
+  if (cpnlEl && initialCapital > 0) {
+    var cpnl = nav - initialCapital;
+    var cret = (cpnl / initialCapital) * 100;
+    cpnlEl.textContent = (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2);
+    cpnlEl.className = 'kpi-val ' + (cpnl >= 0 ? 'pos' : 'neg');
+    if (cretEl) {
+      cretEl.textContent = (cret >= 0 ? '+' : '') + cret.toFixed(2) + '%';
+      cretEl.className = 'kpi-sub ' + (cret >= 0 ? 'pos' : 'neg');
+    }
+  }
+  updateAttribution();
 }
 
 // ─── 8. Performance ──────────────────────────────────────────────────────
@@ -729,24 +806,31 @@ function recordNavHistory() {
   navHistory.forEach(function(h) { if (h.firmNav > hwm) hwm = h.firmNav; });
   if (firmNav > hwm) hwm = firmNav;
   var dd = hwm > 0 ? (firmNav - hwm) / hwm : 0;
-  navHistory.push({ t: new Date().toLocaleTimeString(), firmNav, pods: podNavs, drawdown: dd });
+  navHistory.push({ t: new Date().toLocaleTimeString(), ts: Date.now(), firmNav, pods: podNavs, drawdown: dd });
   if (navHistory.length > MAX_HISTORY) navHistory.shift();
   updateNavChart();
   updateDrawdownChart();
 }
 
+function getFilteredNavHistory() {
+  if (!chartTimeframeMinutes || chartTimeframeMinutes <= 0) return navHistory;
+  var cutoff = Date.now() - chartTimeframeMinutes * 60 * 1000;
+  return navHistory.filter(function(h) { return h.ts && h.ts >= cutoff; });
+}
+
 function updateNavChart() {
+  var filtered = getFilteredNavHistory();
   const ctx    = document.getElementById('navChart').getContext('2d');
-  const labels = navHistory.map(h => h.t);
+  const labels = filtered.map(h => h.t);
   const ids    = Object.keys(pods).sort();
   const FALLBACK_COLORS = ['#00d4f0','#00d68f','#8b6cff','#f5a623'];
 
   const datasets = [
-    { label:'FIRM NAV', data: navHistory.map(h => h.firmNav),
+    { label:'FIRM NAV', data: filtered.map(h => h.firmNav),
       borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
       borderWidth:2, pointRadius:0, tension:0.3, fill:false },
     ...ids.map((id, i) => ({
-      label: id.toUpperCase(), data: navHistory.map(h => h.pods[id] || 0),
+      label: id.toUpperCase(), data: filtered.map(h => h.pods[id] || 0),
       borderColor: POD_COLORS[id] || FALLBACK_COLORS[i % FALLBACK_COLORS.length], borderWidth:1,
       pointRadius:0, tension:0.3, fill:false,
     })),
@@ -852,6 +936,7 @@ function calculateRisk() {
 
   document.getElementById('kpi-alerts').textContent = riskAlerts.length;
   updateRiskTable();
+  renderCorrelationHeatmap();
 }
 
 function updateRiskAlertBanner(severity, message) {
@@ -895,21 +980,51 @@ function addTrade(podId, symbol, side, qty, price, status = 'FILLED') {
   updateExecTable();
 }
 
+function setExecFilter(filter) {
+  execFilter = filter;
+  document.querySelectorAll('.ef-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.ef === filter);
+  });
+  updateExecTable();
+}
+
 function updateExecTable() {
-  document.getElementById('kpi-trades').textContent = executedTrades.length;
-  document.getElementById('kpi-filled').textContent = executedTrades.filter(t => t.status === 'FILLED').length;
-  if (executedTrades.length === 0) return;
-  document.getElementById('exec-table').innerHTML = executedTrades.slice(0, 20).map(t => {
-    const sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
-    const ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
-    return `<tr>
-      <td>${(t.podId || 'unknown').toUpperCase()}</td>
-      <td style="font-weight:600">${t.symbol}</td>
-      <td><span class="badge ${sc}">${t.side}</span></td>
-      <td class="r">${t.qty}</td>
-      <td class="r">$${(t.price || 0).toFixed(2)}</td>
-      <td class="r"><span class="badge ${ss}">${t.status}</span></td>
-    </tr>`;
+  var allItems = executedTrades.slice();
+  var obKeys = Object.keys(orderBook);
+  var filledIds = new Set(allItems.map(function(t) { return t.orderId; }).filter(Boolean));
+  obKeys.forEach(function(oid) {
+    var o = orderBook[oid];
+    if (!filledIds.has(oid) && (o.status === 'PENDING' || o.status === 'REJECTED' || o.status === 'PARTIAL')) {
+      allItems.push({
+        podId: o.pod_id || 'unknown', symbol: o.symbol, side: (o.side || '').toUpperCase(),
+        qty: o.qty || 0, price: o.fill_price || 0, status: o.status,
+        ts: o.timestamp || '', orderId: oid
+      });
+    }
+  });
+  allItems.sort(function(a, b) { return (b.ts || '').localeCompare(a.ts || ''); });
+
+  if (execFilter !== 'all') {
+    allItems = allItems.filter(function(t) { return t.status === execFilter.toUpperCase(); });
+  }
+
+  document.getElementById('kpi-trades').textContent = executedTrades.length + obKeys.length;
+  document.getElementById('kpi-filled').textContent = executedTrades.filter(function(t) { return t.status === 'FILLED'; }).length;
+  if (allItems.length === 0) {
+    document.getElementById('exec-table').innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr>';
+    return;
+  }
+  document.getElementById('exec-table').innerHTML = allItems.slice(0, 30).map(function(t) {
+    var sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
+    var ss = t.status === 'FILLED' ? 'b-filled' : t.status === 'PENDING' ? 'b-pending' : t.status === 'PARTIAL' ? 'b-partial' : t.status === 'REJECTED' ? 'b-rejected' : 'b-pending';
+    return '<tr>' +
+      '<td>' + (t.podId || 'unknown').toUpperCase() + '</td>' +
+      '<td style="font-weight:600">' + (t.symbol || '') + '</td>' +
+      '<td><span class="badge ' + sc + '">' + (t.side || '') + '</span></td>' +
+      '<td class="r">' + (t.qty || 0) + '</td>' +
+      '<td class="r">$' + (t.price || 0).toFixed(2) + '</td>' +
+      '<td class="r"><span class="badge ' + ss + '">' + (t.status || '') + '</span></td>' +
+      '</tr>';
   }).join('');
 }
 
@@ -994,9 +1109,10 @@ function updateTopHoldings() {
 function updateDrawdownChart() {
   var canvas = document.getElementById('ddChart');
   if (!canvas) return;
-  if (navHistory.length < 2) return;
-  var labels = navHistory.map(function(h) { return h.t; });
-  var ddData = navHistory.map(function(h) { return (h.drawdown || 0) * 100; });
+  var filtered = getFilteredNavHistory();
+  if (filtered.length < 2) return;
+  var labels = filtered.map(function(h) { return h.t; });
+  var ddData = filtered.map(function(h) { return (h.drawdown || 0) * 100; });
   var datasets = [{
     label: 'DRAWDOWN %',
     data: ddData,
@@ -1079,9 +1195,16 @@ function toggleTlDetail(cardId) {
 // ─── 15. Activity Feed ─────────────────────────────────────────────────────
 var ROLE_COLORS = { CEO: '#f5a623', CIO: '#00d4f0', CRO: '#e84040', PM: '#00d68f', Trader: '#8b6cff', Researcher: '#6a90aa' };
 
+function toggleIntelFeed() {
+  var el = document.getElementById('activity-feed');
+  if (el) el.classList.toggle('collapsed');
+}
+
 function updateActivityFeed() {
   var list = document.getElementById('feed-list');
   if (!list) return;
+  var countEl = document.getElementById('intel-count');
+  if (countEl) countEl.textContent = activityFeed.length > 0 ? '(' + activityFeed.length + ')' : '';
   if (activityFeed.length === 0) {
     list.innerHTML = '<div class="feed-empty">Waiting for agent activity&hellip;</div>';
     return;
@@ -1090,16 +1213,287 @@ function updateActivityFeed() {
     var roleColor = ROLE_COLORS[item.agent_role] || '#6a90aa';
     var ts = item.ts ? new Date(item.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
     var actionLabel = (item.action || '').replace(/_/g, ' ');
+    var summaryHtml;
+    if (item.action === 'article_deep_dive' && item.urls) {
+      summaryHtml = escapeHtml(item.summary || '') + ' ' +
+        (item.urls || []).map(function(u) {
+          return '<a href="' + escapeHtml(u) + '" target="_blank" rel="noopener" style="color:var(--cyan);font-size:9px">[source]</a>';
+        }).join(' ');
+    } else {
+      summaryHtml = escapeHtml(truncate(item.summary || '', 80));
+    }
     return '<div class="feed-item">' +
       '<span class="feed-badge" style="background:' + roleColor + '">' + escapeHtml(item.agent_role || '?') + '</span>' +
       '<span class="feed-pod">' + escapeHtml((item.pod_id || '').toUpperCase()) + '</span>' +
       '<span class="feed-action">' + escapeHtml(actionLabel) + '</span>' +
-      '<span class="feed-summary">' + escapeHtml(truncate(item.summary || '', 80)) + '</span>' +
+      '<span class="feed-summary">' + summaryHtml + '</span>' +
       '<span class="feed-ts">' + ts + '</span>' +
       '</div>';
   }).join('');
 }
 
-// ─── 16. Init ──────────────────────────────────────────────────────────────
+// ─── 16. CSV Export ─────────────────────────────────────────────────────────
+function downloadCsv(filename, headers, rows) {
+  var csv = headers.join(',') + '\n' +
+    rows.map(function(r) { return r.map(function(c) {
+      return '"' + String(c == null ? '' : c).replace(/"/g, '""') + '"';
+    }).join(','); }).join('\n');
+  var blob = new Blob([csv], { type: 'text/csv' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  a.click();
+}
+
+function exportPods() {
+  var ids = Object.keys(pods).sort();
+  var headers = ['Pod','NAV','Daily P&L','VaR 95%','Leverage','Drawdown','Status'];
+  var rows = ids.map(function(id) {
+    var d = pods[id];
+    return [
+      id.toUpperCase(),
+      (d.nav || 0).toFixed(2),
+      (d.daily_pnl || 0).toFixed(2),
+      d.var_95 != null ? d.var_95.toFixed(2) : '',
+      d.gross_leverage != null ? d.gross_leverage.toFixed(2) : '',
+      d.drawdown != null ? (d.drawdown * 100).toFixed(1) + '%' : '',
+      d.status || 'UNKNOWN'
+    ];
+  });
+  downloadCsv('pods_' + new Date().toISOString().slice(0,10) + '.csv', headers, rows);
+}
+
+function exportTrades() {
+  var headers = ['Timestamp','Pod','Symbol','Side','Qty','Price','Status'];
+  var rows = executedTrades.map(function(t) {
+    return [t.ts || '', (t.podId || '').toUpperCase(), t.symbol, t.side, t.qty, (t.price || 0).toFixed(2), t.status];
+  });
+  downloadCsv('trades_' + new Date().toISOString().slice(0,10) + '.csv', headers, rows);
+}
+
+function exportNavHistory() {
+  var podIds = Object.keys(pods).sort();
+  var headers = ['Time','Firm NAV','Drawdown %'].concat(podIds.map(function(id) { return id.toUpperCase(); }));
+  var rows = navHistory.map(function(h) {
+    var row = [h.t, h.firmNav.toFixed(2), ((h.drawdown || 0) * 100).toFixed(1) + '%'];
+    podIds.forEach(function(id) { row.push(((h.pods && h.pods[id]) || 0).toFixed(2)); });
+    return row;
+  });
+  downloadCsv('nav_history_' + new Date().toISOString().slice(0,10) + '.csv', headers, rows);
+}
+
+// ─── 17. Chart Timeframe Toggle ────────────────────────────────────────────
+function setChartTimeframe(minutes) {
+  chartTimeframeMinutes = minutes;
+  document.querySelectorAll('.tf-btn').forEach(function(b) {
+    b.classList.toggle('active', parseInt(b.dataset.tf) === minutes);
+  });
+  updateNavChart();
+  updateDrawdownChart();
+}
+
+// ─── 18. Pod Drill-Down ────────────────────────────────────────────────────
+function openDrilldown(podId) {
+  var panel = document.getElementById('pod-drilldown');
+  if (!panel) return;
+  var d = pods[podId];
+  if (!d) return;
+  panel.style.display = 'block';
+  document.getElementById('dd-pod-name').textContent = podId.toUpperCase();
+
+  var kpis = document.getElementById('dd-kpis');
+  var nav = d.nav || 0;
+  var pnl = d.daily_pnl || 0;
+  var sc = d.starting_capital || 0;
+  var cpnl = sc > 0 ? nav - sc : pnl;
+  var cret = sc > 0 ? ((nav - sc) / sc * 100).toFixed(2) + '%' : '—';
+  kpis.innerHTML = [
+    { lbl: 'NAV', val: '$' + nav.toFixed(2) },
+    { lbl: 'Daily P&L', val: (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) },
+    { lbl: 'Cum. P&L', val: (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2) },
+    { lbl: 'Return', val: cret },
+    { lbl: 'VaR 95%', val: d.var_95 != null ? '$' + d.var_95.toFixed(0) : '—' },
+    { lbl: 'Leverage', val: d.gross_leverage != null ? d.gross_leverage.toFixed(2) + 'x' : '—' },
+    { lbl: 'Drawdown', val: d.drawdown != null ? (d.drawdown * 100).toFixed(1) + '%' : '—' },
+    { lbl: 'Vol (ann)', val: d.vol_ann != null ? (d.vol_ann * 100).toFixed(1) + '%' : '—' },
+  ].map(function(k) {
+    return '<div class="kpi"><div class="kpi-lbl">' + k.lbl + '</div><div class="kpi-val">' + k.val + '</div></div>';
+  }).join('');
+
+  var posTbody = document.getElementById('dd-positions');
+  var positions = d.current_positions;
+  if (Array.isArray(positions) && positions.length > 0) {
+    posTbody.innerHTML = positions.map(function(p) {
+      var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
+      var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+      var notional = p.notional || (p.qty || 0) * (p.current_price || p.avg_entry || 0);
+      return '<tr>' +
+        '<td style="font-weight:600">' + escapeHtml(p.symbol || '') + '</td>' +
+        '<td class="r">' + (p.qty || 0) + '</td>' +
+        '<td class="r">$' + (p.current_price || p.avg_entry || 0).toFixed(2) + '</td>' +
+        '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+        '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
+        '</tr>';
+    }).join('');
+  } else {
+    posTbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">No open positions</div></td></tr>';
+  }
+
+  var tradeTbody = document.getElementById('dd-trades');
+  var podTrades = executedTrades.filter(function(t) { return (t.podId || '').toLowerCase() === podId.toLowerCase(); });
+  if (podTrades.length > 0) {
+    tradeTbody.innerHTML = podTrades.slice(0, 10).map(function(t) {
+      var sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
+      var ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
+      return '<tr>' +
+        '<td style="font-weight:600">' + escapeHtml(t.symbol) + '</td>' +
+        '<td><span class="badge ' + sc + '">' + t.side + '</span></td>' +
+        '<td class="r">' + t.qty + '</td>' +
+        '<td class="r">$' + (t.price || 0).toFixed(2) + '</td>' +
+        '<td class="r"><span class="badge ' + ss + '">' + t.status + '</span></td>' +
+        '</tr>';
+    }).join('');
+  } else {
+    tradeTbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">No trades for this pod</div></td></tr>';
+  }
+
+  var reasonEl = document.getElementById('dd-reasoning');
+  var pmActivity = agentActivity[podId + '_pm'] || agentActivity[podId + '_PM'] || [];
+  if (pmActivity.length === 0) {
+    var allKeys = Object.keys(agentActivity);
+    for (var i = 0; i < allKeys.length; i++) {
+      if (allKeys[i].toLowerCase().indexOf(podId.toLowerCase()) >= 0 &&
+          allKeys[i].toLowerCase().indexOf('pm') >= 0) {
+        pmActivity = agentActivity[allKeys[i]];
+        break;
+      }
+    }
+  }
+  if (pmActivity.length > 0) {
+    var latest = pmActivity[0];
+    reasonEl.textContent = (latest.summary || '') + (latest.detail ? '\n\n' + latest.detail : '');
+  } else {
+    reasonEl.textContent = 'No PM reasoning available yet.';
+  }
+
+  panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function closeDrilldown() {
+  var panel = document.getElementById('pod-drilldown');
+  if (panel) panel.style.display = 'none';
+}
+
+// ─── 19. Correlation Heatmap ────────────────────────────────────────────────
+function pearson(a, b) {
+  if (a.length < 3 || a.length !== b.length) return 0;
+  var n = a.length;
+  var sumA = 0, sumB = 0, sumAB = 0, sumA2 = 0, sumB2 = 0;
+  for (var i = 0; i < n; i++) {
+    sumA += a[i]; sumB += b[i]; sumAB += a[i]*b[i];
+    sumA2 += a[i]*a[i]; sumB2 += b[i]*b[i];
+  }
+  var denom = Math.sqrt((n*sumA2 - sumA*sumA) * (n*sumB2 - sumB*sumB));
+  return denom === 0 ? 0 : (n*sumAB - sumA*sumB) / denom;
+}
+
+function computeCorrelationMatrix() {
+  var ids = Object.keys(pods).sort();
+  if (ids.length < 2 || navHistory.length < 10) return null;
+  var returns = {};
+  ids.forEach(function(id) {
+    var navs = navHistory.map(function(h) { return (h.pods && h.pods[id]) || 0; });
+    var r = [];
+    for (var i = 1; i < navs.length; i++) {
+      r.push(navs[i-1] > 0 ? (navs[i] - navs[i-1]) / navs[i-1] : 0);
+    }
+    returns[id] = r;
+  });
+  var matrix = {};
+  ids.forEach(function(a) {
+    matrix[a] = {};
+    ids.forEach(function(b) {
+      matrix[a][b] = a === b ? 1.0 : pearson(returns[a], returns[b]);
+    });
+  });
+  return { ids: ids, matrix: matrix };
+}
+
+function corrColor(v) {
+  if (v >= 0) {
+    var g = Math.round(180 + v * 75);
+    return 'rgba(0,' + g + ',100,' + (0.15 + Math.abs(v) * 0.5) + ')';
+  }
+  var r = Math.round(180 + Math.abs(v) * 75);
+  return 'rgba(' + r + ',50,50,' + (0.15 + Math.abs(v) * 0.5) + ')';
+}
+
+function renderCorrelationHeatmap() {
+  var container = document.getElementById('correlation-heatmap');
+  if (!container) return;
+  var result = computeCorrelationMatrix();
+  if (!result) {
+    container.innerHTML = '<div class="empty"><div class="empty-txt">Need 10+ data points</div></div>';
+    return;
+  }
+  var ids = result.ids, mx = result.matrix;
+  var html = '<table class="corr-table"><thead><tr><th></th>';
+  ids.forEach(function(id) { html += '<th>' + id.toUpperCase() + '</th>'; });
+  html += '</tr></thead><tbody>';
+  ids.forEach(function(a) {
+    html += '<tr><td class="corr-label">' + a.toUpperCase() + '</td>';
+    ids.forEach(function(b) {
+      var v = mx[a][b];
+      html += '<td class="corr-cell" style="background:' + corrColor(v) + '">' + v.toFixed(2) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+// ─── 20. Pod Attribution ────────────────────────────────────────────────────
+function updateAttribution() {
+  var container = document.getElementById('attribution-panel');
+  if (!container) return;
+  var ids = Object.keys(pods).sort();
+  if (ids.length === 0) {
+    container.innerHTML = '<div class="empty"><div class="empty-txt">Awaiting data...</div></div>';
+    return;
+  }
+  var firmPnl = 0;
+  var podStats = ids.map(function(id) {
+    var d = pods[id];
+    var nav = d.nav || 0;
+    var sc = d.starting_capital || nav;
+    var pnl = nav - sc;
+    firmPnl += pnl;
+    var podTrades = executedTrades.filter(function(t) { return (t.podId || '').toLowerCase() === id.toLowerCase(); });
+    var tradeCount = podTrades.length;
+    var wins = podTrades.filter(function(t) { return (t.price || 0) > 0; }).length;
+    var ret = sc > 0 ? (pnl / sc * 100) : 0;
+    return { id: id, pnl: pnl, ret: ret, trades: tradeCount, wins: wins, nav: nav };
+  });
+  var maxAbsPnl = Math.max.apply(null, podStats.map(function(p) { return Math.abs(p.pnl); })) || 1;
+
+  var html = '<div class="attr-bars">';
+  podStats.forEach(function(p) {
+    var pct = firmPnl !== 0 ? (p.pnl / Math.abs(firmPnl) * 100) : 0;
+    var barW = Math.abs(p.pnl) / maxAbsPnl * 100;
+    var col = p.pnl >= 0 ? '#00d68f' : '#e84040';
+    var wr = p.trades > 0 ? (p.wins / p.trades * 100).toFixed(0) + '%' : '—';
+    html += '<div class="attr-row">' +
+      '<span class="attr-pod">' + p.id.toUpperCase() + '</span>' +
+      '<div class="attr-bar-wrap"><div class="attr-bar" style="width:' + barW.toFixed(0) + '%;background:' + col + '"></div></div>' +
+      '<span class="attr-val" style="color:' + col + '">' + (p.pnl >= 0 ? '+' : '') + '$' + p.pnl.toFixed(2) + '</span>' +
+      '<span class="attr-pct">' + (pct >= 0 ? '+' : '') + pct.toFixed(0) + '%</span>' +
+      '<span class="attr-stat">' + p.trades + ' trades · WR ' + wr + '</span>' +
+      '</div>';
+  });
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+// ─── 21. Init ──────────────────────────────────────────────────────────────
 initResearchHistoryChart();
 updateGovHub();

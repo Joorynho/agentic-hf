@@ -104,6 +104,35 @@ button { font-family: inherit; cursor: pointer; }
 .sb-spacer { flex: 1; }
 .sb-clock { color: var(--text-muted); font-size: 10px; }
 
+.sb-btn {
+  padding: 2px 10px;
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+  background: transparent;
+  color: var(--text-muted);
+}
+.sb-btn:hover { background: rgba(255,255,255,0.06); }
+.sb-btn-start {
+  color: var(--green);
+  border-color: var(--green);
+}
+.sb-btn-start:hover {
+  background: rgba(0,200,120,0.12);
+}
+.sb-btn-stop {
+  color: var(--red, #e84040);
+  border-color: var(--red, #e84040);
+}
+.sb-btn-stop:hover {
+  background: rgba(232,64,64,0.12);
+}
+
 /* ============================================================
    LEFT PANEL — 3D VIEWPORT
 ============================================================ */
@@ -1021,10 +1050,13 @@ button { font-family: inherit; cursor: pointer; }
 #activity-feed {
   border-top: 1px solid var(--border-dim);
   background: var(--bg-surface);
-  max-height: 180px;
-  overflow-y: auto;
   flex-shrink: 0;
+  overflow: hidden;
+  transition: max-height 0.25s ease;
+  max-height: 260px;
 }
+#activity-feed.collapsed { max-height: 28px; }
+#activity-feed.collapsed #feed-list { display: none; }
 .feed-header {
   font-size: 9px;
   font-weight: 600;
@@ -1037,6 +1069,27 @@ button { font-family: inherit; cursor: pointer; }
   top: 0;
   background: var(--bg-surface);
   z-index: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  user-select: none;
+}
+.feed-header:hover { color: var(--text-primary); }
+.feed-toggle {
+  margin-left: auto;
+  font-size: 8px;
+  transition: transform 0.2s ease;
+}
+#activity-feed.collapsed .feed-toggle { transform: rotate(180deg); }
+.feed-count {
+  font-size: 9px;
+  color: var(--cyan);
+  font-weight: 400;
+}
+#feed-list {
+  max-height: 230px;
+  overflow-y: auto;
 }
 .feed-empty {
   font-size: 10px;
@@ -1171,6 +1224,121 @@ button { font-family: inherit; cursor: pointer; }
 }
 
 /* ============================================================
+   EXPORT BUTTONS
+============================================================ */
+.export-btn {
+  background: rgba(0,207,232,0.1);
+  color: var(--cyan);
+  border: 1px solid rgba(0,207,232,0.25);
+  border-radius: 10px;
+  font-size: 9px;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  letter-spacing: 0.5px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: background 0.2s, border-color 0.2s;
+}
+.export-btn:hover {
+  background: rgba(0,207,232,0.2);
+  border-color: var(--cyan);
+}
+
+/* ============================================================
+   CHART TIMEFRAME TOGGLE
+============================================================ */
+.chart-timeframe {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+}
+.tf-btn {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-dim);
+  border-radius: 8px;
+  font-size: 9px;
+  font-family: var(--font-mono);
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.tf-btn:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.tf-btn.active {
+  background: rgba(0,207,232,0.15);
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+
+/* ============================================================
+   POD DRILL-DOWN PANEL
+============================================================ */
+.pod-drilldown {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-dim);
+  border-radius: 6px;
+  margin: 8px 0;
+  padding: 12px;
+  animation: fadeSlideIn 0.2s ease-out;
+}
+@keyframes fadeSlideIn {
+  from { opacity: 0; transform: translateY(-8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.dd-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.dd-pod-name {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  color: var(--text-primary);
+}
+.dd-close {
+  background: transparent;
+  color: var(--text-dim);
+  border: 1px solid var(--border-dim);
+  border-radius: 4px;
+  font-size: 9px;
+  font-family: var(--font-mono);
+  letter-spacing: 0.5px;
+  padding: 2px 10px;
+  cursor: pointer;
+  transition: color 0.2s, border-color 0.2s;
+}
+.dd-close:hover { color: var(--text-primary); border-color: var(--text-muted); }
+.dd-kpis {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+.dd-kpis .kpi {
+  flex: 1 1 80px;
+  min-width: 80px;
+}
+.dd-section {
+  margin-top: 8px;
+}
+.dd-reasoning {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+  line-height: 1.6;
+  padding: 8px;
+  background: rgba(0,0,0,0.15);
+  border-radius: 4px;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ============================================================
    REDUCED MOTION SUPPORT
 ============================================================ */
 @media (prefers-reduced-motion: reduce) {
@@ -1181,3 +1349,49 @@ button { font-family: inherit; cursor: pointer; }
   }
   .tweet-card { animation: none; }
 }
+
+/* ============================================================
+   ORDER STATUS BADGES
+============================================================ */
+.b-pending { background: rgba(245,166,35,0.18); color: #f5a623; animation: pulse-badge 1.5s ease infinite; }
+.b-partial { background: rgba(0,207,232,0.18); color: #00cfe8; }
+.b-rejected { background: rgba(232,64,64,0.15); color: #e84040; opacity: 0.8; }
+@keyframes pulse-badge { 0%,100%{opacity:1}50%{opacity:0.5} }
+
+/* ============================================================
+   EXEC FILTER BUTTONS
+============================================================ */
+.exec-filters { display: flex; gap: 4px; margin-left: 8px; }
+.ef-btn {
+  font-size: 9px; letter-spacing: 0.5px; padding: 3px 8px;
+  border: 1px solid var(--border); border-radius: 4px;
+  background: transparent; color: var(--text-dim); cursor: pointer;
+  transition: all 0.15s;
+}
+.ef-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+.ef-btn.active { background: rgba(0,207,232,0.15); border-color: var(--cyan); color: var(--cyan); }
+
+/* ============================================================
+   CORRELATION HEATMAP
+============================================================ */
+#correlation-heatmap { margin-top: 8px; }
+.corr-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+.corr-table th { padding: 6px 10px; color: var(--text-dim); font-size: 9px; letter-spacing: 0.5px; border-bottom: 1px solid var(--border); }
+.corr-label { font-weight: 600; padding: 6px 10px; color: var(--text-dim); font-size: 10px; }
+.corr-cell { text-align: center; padding: 8px 10px; font-weight: 500; border: 1px solid rgba(42,58,80,0.4); border-radius: 3px; }
+
+/* ============================================================
+   ATTRIBUTION PANEL
+============================================================ */
+#attribution-panel { margin-top: 8px; }
+.attr-bars { display: flex; flex-direction: column; gap: 6px; }
+.attr-row {
+  display: grid; grid-template-columns: 80px 1fr 90px 50px auto; gap: 8px; align-items: center;
+  padding: 6px 8px; background: rgba(26,37,53,0.5); border-radius: 4px;
+}
+.attr-pod { font-size: 10px; font-weight: 600; letter-spacing: 0.5px; color: var(--text-dim); }
+.attr-bar-wrap { height: 8px; background: rgba(42,58,80,0.4); border-radius: 4px; overflow: hidden; }
+.attr-bar { height: 100%; border-radius: 4px; transition: width 0.4s ease; }
+.attr-val { font-size: 11px; font-weight: 600; text-align: right; }
+.attr-pct { font-size: 10px; color: var(--text-dim); text-align: right; }
+.attr-stat { font-size: 9px; color: var(--text-dim); }

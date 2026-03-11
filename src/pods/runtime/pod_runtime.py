@@ -101,6 +101,28 @@ class PodRuntime:
         signal_out = await self._signal.run_cycle(ctx)  # type: ignore[union-attr]
         ctx.update(signal_out)
 
+        # Inject sizing context for PM (LLM-informed position sizing)
+        accountant = self._ns.get("accountant")
+        if accountant:
+            pos_summary = []
+            for sym, snap in accountant.current_positions.items():
+                pos_summary.append({
+                    "symbol": sym, "qty": snap.qty,
+                    "notional": abs(snap.qty * snap.current_price),
+                    "unrealized_pnl": snap.unrealized_pnl,
+                })
+            total_notional = sum(p["notional"] for p in pos_summary)
+            gross_lev = total_notional / accountant.nav if accountant.nav > 0 else 0
+            ctx["sizing_context"] = {
+                "pod_nav": round(accountant.nav, 2),
+                "available_cash": round(accountant._cash, 2),
+                "current_leverage": round(gross_lev, 2),
+                "max_position_pct": 0.10,
+                "max_leverage": 2.0,
+                "position_limit_notional": round(accountant.nav * 0.10, 2),
+                "positions_summary": pos_summary,
+            }
+
         # 3. PM (with Signal↔PM challenge, max 5 iter — handled inside pm.run_cycle)
         pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
         ctx.update(pm_out)
@@ -235,6 +257,7 @@ class PodRuntime:
             timestamp=datetime.now(),
             nav=accountant.nav,
             daily_pnl=accountant.daily_pnl,
+            starting_capital=accountant.starting_capital,
             drawdown_from_hwm=max(0.0, drawdown),  # Clamp to non-negative
             current_vol_ann=vol_ann,
             gross_leverage=gross_leverage,

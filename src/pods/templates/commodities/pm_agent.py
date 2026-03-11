@@ -7,6 +7,7 @@ import uuid
 from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order
+from src.core.models.messages import AgentMessage
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,17 @@ JSON. You will then receive the article text and make a final decision.
 Only request articles when the headline suggests a material catalyst you need detail on.
 
 Output JSON: {"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "reasoning": "..."}], "read_articles": ["url1"]}
-Omit read_articles if you don't need to read any articles."""
+Omit read_articles if you don't need to read any articles.
+
+POSITION SIZING:
+You receive your pod's NAV, cash, leverage, and position limits every cycle.
+Size your trades intentionally:
+- Consider the conviction level of your thesis (higher conviction = larger size)
+- Never exceed the position limit notional shown
+- Account for existing exposure when adding to positions
+- Scale size down in high-volatility / uncertain regimes
+- The Risk agent will reject orders that breach hard limits
+Output qty as a specific number of shares/units, not a percentage."""
 
 
 class CommoditiesPMAgent(BasePodAgent):
@@ -68,8 +79,10 @@ class CommoditiesPMAgent(BasePodAgent):
         if not features:
             return {}
 
+        sizing = context.get("sizing_context", {})
+
         if has_llm_key():
-            return await self._llm_decision(features)
+            return await self._llm_decision(features, sizing)
         return self._rule_based_decision(features)
 
     async def _read_articles_and_decide(
@@ -84,6 +97,26 @@ class CommoditiesPMAgent(BasePodAgent):
         if not articles:
             logger.info("[commodities.pm] No articles fetched, using first decision")
             return (first_decision, None)
+
+        try:
+            act_msg = AgentMessage(
+                timestamp=datetime.now(timezone.utc),
+                sender=self._agent_id,
+                recipient="dashboard",
+                topic="agent.activity",
+                payload={
+                    "agent_id": self._agent_id,
+                    "agent_role": "PM",
+                    "pod_id": self._pod_id,
+                    "action": "article_deep_dive",
+                    "summary": f"Read {len(articles)} article(s)",
+                    "detail": "\n".join(f"[{url}]: {text[:200]}..." for url, text in articles.items()),
+                    "urls": list(articles.keys())[:3],
+                },
+            )
+            await self._bus.publish("agent.activity", act_msg, publisher_id=self._agent_id)
+        except Exception:
+            pass
 
         article_section = "\n\n## Article Deep-Dives (requested by you)\n"
         for url, text in articles.items():
@@ -116,12 +149,23 @@ class CommoditiesPMAgent(BasePodAgent):
         })
         return {}
 
-    async def _llm_decision(self, features: dict) -> dict:
+    async def _llm_decision(self, features: dict, sizing_context: dict | None = None) -> dict:
         positions = self.recall("current_positions_summary", "none")
         universe = self.recall("universe", [])
+        sizing = sizing_context or {}
 
         sections = []
-        sections.append("## Macro Indicators (FRED)")
+        if sizing:
+            sections.append("\n## Position Sizing Context")
+            sections.append(f"  Pod NAV: ${sizing.get('pod_nav', 0):,.2f}")
+            sections.append(f"  Available cash: ${sizing.get('available_cash', 0):,.2f}")
+            sections.append(f"  Current leverage: {sizing.get('current_leverage', 0):.2f}x")
+            sections.append(f"  Max leverage: {sizing.get('max_leverage', 2.0):.1f}x")
+            sections.append(f"  Max position size: ${sizing.get('position_limit_notional', 0):,.2f} (10% of NAV)")
+            for p in sizing.get("positions_summary", []):
+                sections.append(f"  Position: {p['symbol']} qty={p['qty']:.1f} notional=${p['notional']:,.0f} pnl=${p['unrealized_pnl']:,.2f}")
+
+        sections.append("\n## Macro Indicators (FRED)")
         fred = features.get("fred_indicators", {})
         if fred:
             for k, v in fred.items():

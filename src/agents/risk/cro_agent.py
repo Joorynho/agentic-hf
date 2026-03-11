@@ -36,18 +36,18 @@ class CROAgent:
     def agent_id(self) -> str:
         return _AGENT_ID
 
-    async def check_all_pods(self, pod_summaries: list[PodSummary]) -> list[str]:
+    async def check_all_pods(self, pod_summaries) -> list[str]:
         """Run full firm-level risk checks. Returns list of pod_ids with breaches."""
+        items = pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries
         breached: list[str] = []
 
-        # Per-pod checks
-        for summary in pod_summaries:
+        for summary in items:
             breach = await self._check_pod(summary)
             if breach:
                 breached.append(summary.pod_id)
 
-        # Firm-level aggregate checks
-        await self._check_firm_aggregate(pod_summaries)
+        items_list = list(pod_summaries.values()) if isinstance(pod_summaries, dict) else pod_summaries
+        await self._check_firm_aggregate(items_list)
 
         return breached
 
@@ -89,9 +89,10 @@ class CROAgent:
 
         return False
 
-    async def _check_firm_aggregate(self, summaries: list[PodSummary]) -> None:
+    async def _check_firm_aggregate(self, summaries) -> None:
         """Check firm-level aggregates: total VaR and total leverage."""
-        active = [s for s in summaries if s.status != PodStatus.HALTED]
+        items = summaries.values() if isinstance(summaries, dict) else summaries
+        active = [s for s in items if s.status != PodStatus.HALTED]
 
         total_var = sum(s.risk_metrics.var_95_1d for s in active)
         if total_var > _FIRM_VAR_LIMIT:

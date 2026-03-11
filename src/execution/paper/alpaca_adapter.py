@@ -420,3 +420,36 @@ class AlpacaAdapter:
         except Exception as exc:
             logger.error("[alpaca] close_all_positions failed: %s", exc)
             raise
+
+    async def cancel_order(self, order_id: str) -> bool:
+        """Cancel an open order by ID. Returns True if cancelled successfully."""
+        try:
+            self._client.cancel_order(order_id)
+            logger.info("[alpaca] Cancelled order %s", order_id)
+            return True
+        except Exception as exc:
+            logger.warning("[alpaca] cancel_order failed for %s: %s", order_id, exc)
+            return False
+
+    async def get_all_open_orders(self) -> list[dict]:
+        """Get all open/pending orders.
+
+        Returns:
+            list of dicts with order_id, symbol, side, qty, status, submitted_at
+        """
+        try:
+            orders = self._client.list_orders(status="open")
+            return [
+                {
+                    "order_id": o.id,
+                    "symbol": o.symbol,
+                    "side": o.side,
+                    "qty": float(o.qty),
+                    "status": o.status,
+                    "submitted_at": o.submitted_at,
+                }
+                for o in orders
+            ]
+        except Exception as exc:
+            logger.error("[alpaca] get_all_open_orders failed: %s", exc)
+            return []

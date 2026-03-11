@@ -45,6 +45,25 @@ class CommoditiesRiskAgent(BasePodAgent):
                 )
                 return {"revised_order": revised}
 
+            total_notional = sum(
+                abs(s.qty * s.current_price) for s in accountant.current_positions.values()
+            )
+            order_notional = order.quantity * est_price
+            projected_notional = total_notional + order_notional
+            if nav > 0 and projected_notional / nav > MAX_LEVERAGE:
+                max_add = MAX_LEVERAGE * nav - total_notional
+                if max_add <= 0:
+                    logger.info("[commodities.risk] Leverage limit hit for %s", order.symbol)
+                    return {}
+                max_qty_lev = max_add / est_price if est_price > 0 else 0
+                revised = Order(
+                    id=order.id, pod_id=order.pod_id, symbol=order.symbol,
+                    side=order.side, order_type=order.order_type,
+                    quantity=max(1.0, max_qty_lev), limit_price=order.limit_price,
+                    timestamp=order.timestamp, strategy_tag=order.strategy_tag,
+                )
+                return {"revised_order": revised}
+
         token = RiskApprovalToken(
             order_id=order.id, pod_id=self._pod_id, expires_ms=500,
         )

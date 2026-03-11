@@ -27,7 +27,7 @@ from src.core.models.pod_summary import PodExposureBucket, PodRiskMetrics, PodSu
 from src.mission_control.session_manager import SessionManager
 from src.mission_control.session_logger import SessionLogger
 
-POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+POD_IDS = ["equities", "fx", "crypto", "commodities"]
 
 
 def _make_summary(
@@ -178,7 +178,7 @@ async def test_session_manager_runs_governance_cycle_every_5_iterations():
             assert len(args) > 0 or "pod_summaries" in kwargs
             pod_summaries_arg = args[0] if args else kwargs.get("pod_summaries")
             assert isinstance(pod_summaries_arg, dict)
-            assert len(pod_summaries_arg) == 5  # All 5 pods
+            assert len(pod_summaries_arg) == len(POD_IDS)
 
 
 @pytest.mark.asyncio

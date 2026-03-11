@@ -7,7 +7,7 @@ import pytest
 import asyncio
 import json
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 from fastapi.testclient import TestClient
 from websockets.client import connect as ws_connect
@@ -461,3 +461,120 @@ class TestEndToEnd:
         resp = client.get("/api/pods")
         assert resp.status_code == 200
         assert resp.json()["count"] == 1
+
+
+class TestSessionControl:
+    """Tests for session start/stop control endpoints."""
+
+    @pytest.fixture
+    def mock_session_manager(self):
+        """Create a mock SessionManager with required properties."""
+        sm = MagicMock()
+        sm.session_active = False
+        sm.iteration = 0
+        sm._pod_runtimes = {}
+        sm.stop_session = AsyncMock()
+        sm.start_live_session = AsyncMock()
+        sm.run_event_loop = AsyncMock()
+        return sm
+
+    @pytest.fixture
+    def app_with_manager(self, event_bus, mock_session_manager):
+        """Create a test app with a mock SessionManager."""
+        return create_app(
+            event_bus=event_bus,
+            session_start_time=datetime.now(timezone.utc),
+            session_manager=mock_session_manager,
+        )
+
+    @pytest.fixture
+    def client_with_manager(self, app_with_manager):
+        return TestClient(app_with_manager)
+
+    def test_session_status_idle(self, client_with_manager):
+        """GET /api/session/status returns idle when no session is running."""
+        resp = client_with_manager.get("/api/session/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"] is False
+        assert "iteration" in data
+        assert "uptime_seconds" in data
+        assert "pod_count" in data
+
+    def test_session_status_active(self, app_with_manager, client_with_manager):
+        """GET /api/session/status returns active when session is running."""
+        sm = app_with_manager.state.session_manager
+        sm.session_active = True
+        sm.iteration = 42
+        sm._pod_runtimes = {"equities": None, "fx": None, "crypto": None, "commodities": None}
+
+        resp = client_with_manager.get("/api/session/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"] is True
+        assert data["iteration"] == 42
+        assert data["pod_count"] == 4
+
+    def test_stop_session_calls_manager(self, app_with_manager, client_with_manager):
+        """POST /api/session/stop calls stop_session on the manager."""
+        sm = app_with_manager.state.session_manager
+        sm.session_active = True
+
+        resp = client_with_manager.post("/api/session/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        sm.stop_session.assert_called_once()
+
+    def test_stop_session_when_idle(self, client_with_manager):
+        """POST /api/session/stop returns error when session is already idle."""
+        resp = client_with_manager.post("/api/session/stop")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "not running" in data["detail"].lower()
+
+    def test_start_session_when_idle(self, app_with_manager, client_with_manager):
+        """POST /api/session/start spawns session when idle."""
+        sm = app_with_manager.state.session_manager
+        sm.session_active = False
+
+        resp = client_with_manager.post("/api/session/start")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert "starting" in data["detail"].lower()
+
+    def test_start_session_when_already_active(self, app_with_manager, client_with_manager):
+        """POST /api/session/start returns error when already running."""
+        sm = app_with_manager.state.session_manager
+        sm.session_active = True
+
+        resp = client_with_manager.post("/api/session/start")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is False
+        assert "already running" in data["detail"].lower()
+
+    def test_session_status_no_manager(self, event_bus):
+        """GET /api/session/status still works without a manager (returns idle)."""
+        app = create_app(event_bus=event_bus)
+        client = TestClient(app)
+        resp = client.get("/api/session/status")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["active"] is False
+
+    def test_stop_without_manager_returns_503(self, event_bus):
+        """POST /api/session/stop returns 503 without a manager."""
+        app = create_app(event_bus=event_bus)
+        client = TestClient(app)
+        resp = client.post("/api/session/stop")
+        assert resp.status_code == 503
+
+    def test_start_without_manager_returns_503(self, event_bus):
+        """POST /api/session/start returns 503 without a manager."""
+        app = create_app(event_bus=event_bus)
+        client = TestClient(app)
+        resp = client.post("/api/session/start")
+        assert resp.status_code == 503

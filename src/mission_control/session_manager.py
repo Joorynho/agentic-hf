@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -165,6 +166,7 @@ class SessionManager:
         self._latest_mandate: Optional[MandateUpdate] = None
         self._risk_halt: bool = False
         self._risk_halt_reason: Optional[str] = None
+        self._governance_decisions: list = []
 
         # Web server state
         self._web_app = None
@@ -174,6 +176,8 @@ class SessionManager:
         self._session_active = False
         self._capital_per_pod = 0.0
         self._iteration = 0
+        self._restartable = False
+        self._stop_in_progress = False
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
@@ -191,7 +195,21 @@ class SessionManager:
         if initial_symbols is None:
             initial_symbols = ["SPY", "QQQ", "GLD", "BTC/USD", "UUP"]
 
+        # Reinitialize resources for a fresh session (only if restarting after a stop)
+        if self._iteration > 0 or self._restartable:
+            try:
+                self._session_logger.close()
+            except Exception:
+                pass
+            self._session_logger = SessionLogger()
+            self._data_provider = DataProvider(bus=self._event_bus, audit_log=self._audit_log)
+            self._pod_runtimes = {}
+            self._pod_gateways = {}
+            self._pod_capital = {}
+            self._iteration = 0
+
         self._start_time = datetime.now()
+        self._session_start = datetime.now()
         self._capital_per_pod = capital_per_pod
         total_capital = capital_per_pod * len(POD_IDS)
 
@@ -461,6 +479,7 @@ class SessionManager:
                     all_feed = ns.get("x_feed") or []
                     pod_dicts[pod_id]["x_feed"] = all_feed[:100]
                     pod_dicts[pod_id]["x_tweet_count"] = len(all_feed)
+                    pod_dicts[pod_id]["news_last_refresh"] = datetime.now(timezone.utc).isoformat()
                     pod_dicts[pod_id]["features"] = ns.get("features") or {}
 
             await self._web_app.state.update_session_state(
@@ -649,6 +668,7 @@ class SessionManager:
                                     "social_score": ns.get("social_score") or 0.0,
                                     "x_feed": (ns.get("x_feed") or [])[:100],
                                     "x_tweet_count": len(ns.get("x_feed") or []),
+                                    "news_last_refresh": datetime.now(timezone.utc).isoformat(),
                                 },
                             )
                             await self._event_bus.publish(
@@ -817,6 +837,7 @@ class SessionManager:
 
         Alpaca tracks aggregate positions (not per-pod), so this is
         best-effort.  Discrepancies are logged as warnings, not auto-corrected.
+        Also cancels stale open orders (pending > 60s).
         """
         try:
             alpaca_positions = await self._alpaca.get_open_positions()
@@ -839,12 +860,32 @@ class SessionManager:
         except Exception as e:
             logger.warning("[reconcile] Position reconciliation failed: %s", e)
 
+        try:
+            from datetime import datetime, timezone
+            open_orders = await self._alpaca.get_all_open_orders()
+            now = datetime.now(timezone.utc)
+            for o in open_orders:
+                submitted = o.get("submitted_at")
+                if submitted and hasattr(submitted, "timestamp"):
+                    age_s = (now - submitted.replace(tzinfo=timezone.utc)).total_seconds()
+                    if age_s > 60:
+                        logger.warning(
+                            "[reconcile] Cancelling stale order %s (%s, %.0fs old)",
+                            o["order_id"], o["symbol"], age_s,
+                        )
+                        await self._alpaca.cancel_order(o["order_id"])
+        except Exception as e:
+            logger.debug("[reconcile] Stale order cleanup skipped: %s", e)
+
     async def stop_session(self) -> dict:
         """Stop event loop and gracefully shut down all pods.
 
         Returns:
             Dictionary with session summary: uptime_seconds, iterations, pods_closed, final_capital.
         """
+        if self._stop_in_progress:
+            return {"already_stopped": True}
+        self._stop_in_progress = True
         logger.info("[session_manager] Stopping live session")
         self._session_active = False
 
@@ -879,14 +920,58 @@ class SessionManager:
             logger.error("[session_manager] Error closing session logger: %s", e)
 
         # Close DuckDB audit log to release file lock (critical on Windows)
+        # Skip if session may be restarted via dashboard
+        if not self._restartable:
+            try:
+                self._audit_log.close()
+                logger.info("[session_manager] Audit log closed")
+            except Exception as e:
+                logger.warning("[session_manager] Error closing audit log: %s", e)
+
+        # Generate daily report
         try:
-            self._audit_log.close()
-            logger.info("[session_manager] Audit log closed")
+            from src.reports.daily_report import DailyReportGenerator
+            from src.reports.email_sender import EmailSender
+
+            pods_data = {}
+            for pid, runtime in self._pod_runtimes.items():
+                try:
+                    summary = await runtime.get_summary()
+                    pods_data[pid] = summary.model_dump(mode="json") if hasattr(summary, "model_dump") else {}
+                except Exception:
+                    pods_data[pid] = {}
+
+            report_html = DailyReportGenerator().generate(
+                session_dir=self._session_logger.session_dir if self._session_logger else "",
+                session_start=getattr(self, "_session_start", None),
+                session_end=datetime.now(),
+                pods_data=pods_data,
+                trades=self._session_logger._fill_log if self._session_logger else [],
+                governance=getattr(self, "_governance_decisions", []),
+                firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
+                initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
+            )
+
+            session_dir = self._session_logger.session_dir if self._session_logger else None
+            if session_dir:
+                report_path = os.path.join(
+                    session_dir, f"daily_report_{datetime.now().strftime('%Y%m%d')}.html"
+                )
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(report_html)
+                logger.info("[session_manager] Daily report saved to %s", report_path)
+
+            sender = EmailSender()
+            if sender.is_configured:
+                date_str = datetime.now().strftime("%Y-%m-%d")
+                sender.send(f"Agentic HF Daily Report — {date_str}", report_html)
         except Exception as e:
-            logger.warning("[session_manager] Error closing audit log: %s", e)
+            logger.warning("[session_manager] Daily report generation failed: %s", e)
 
         # Calculate uptime
         uptime_seconds = (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else 0
+
+        self._stop_in_progress = False
 
         # Return session summary
         return {
@@ -895,6 +980,16 @@ class SessionManager:
             "pods_closed": closed_count,
             "final_capital": self._capital_per_pod * len(self._pod_runtimes),
         }
+
+    @property
+    def session_active(self) -> bool:
+        """Whether the trading session is currently running."""
+        return self._session_active
+
+    @property
+    def iteration(self) -> int:
+        """Current event loop iteration count."""
+        return self._iteration
 
     @property
     def event_bus(self) -> EventBus:

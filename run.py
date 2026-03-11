@@ -23,10 +23,10 @@ async def main():
     audit_log = AuditLog()
     event_bus = EventBus(audit_log=audit_log)
 
-    app = create_app(event_bus=event_bus)
     manager = SessionManager(
         event_bus=event_bus, audit_log=audit_log, enable_news_adapters=True
     )
+    app = create_app(event_bus=event_bus, session_manager=manager)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info")
     server = uvicorn.Server(config)

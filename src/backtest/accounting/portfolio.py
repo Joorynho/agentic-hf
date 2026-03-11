@@ -178,6 +178,10 @@ class PortfolioAccountant:
         return self.nav - self._starting_capital
 
     @property
+    def starting_capital(self) -> float:
+        return self._starting_capital
+
+    @property
     def realized_pnl(self) -> float:
         """PnL from closed positions."""
         return self._realized_pnl

@@ -92,6 +92,7 @@ class EventBusListener:
             'recent_trades': [],
             'recent_governance': [],
             'recent_activity': [],
+            'recent_orders': [],
         }
 
     async def subscribe(self):
@@ -113,6 +114,9 @@ class EventBusListener:
 
             # Subscribe to execution fill events
             await self.bus.subscribe("execution.fill", self._on_trade)
+
+            # Subscribe to order lifecycle updates
+            await self.bus.subscribe("execution.order_update", self._on_order_update)
 
             # Subscribe to risk alerts
             await self.bus.subscribe("risk.alert", self._on_risk_alert)
@@ -136,6 +140,7 @@ class EventBusListener:
             rm = payload.get("risk_metrics", {})
             payload["nav"] = payload.get("nav") or rm.get("nav", 0)
             payload["daily_pnl"] = payload.get("daily_pnl") or rm.get("daily_pnl", 0)
+            payload["starting_capital"] = rm.get("starting_capital", 0)
             payload["drawdown"] = rm.get("drawdown_from_hwm", 0)
             payload["vol_ann"] = rm.get("current_vol_ann", 0)
             payload["gross_leverage"] = rm.get("gross_leverage", 0)
@@ -227,6 +232,21 @@ class EventBusListener:
         except Exception as e:
             logger.error("[web] Error broadcasting agent activity: %s", e)
 
+    async def _on_order_update(self, message: AgentMessage):
+        """Handle order lifecycle event -- forward to WebSocket clients."""
+        try:
+            msg = {
+                "type": "order_update",
+                "timestamp": message.timestamp.isoformat(),
+                "data": message.payload,
+            }
+            await self.manager.broadcast(msg)
+            self._app_state['recent_orders'].insert(0, msg)
+            if len(self._app_state['recent_orders']) > 50:
+                self._app_state['recent_orders'] = self._app_state['recent_orders'][:50]
+        except Exception as e:
+            logger.error("[web] Error broadcasting order update: %s", e)
+
     def get_snapshot(self) -> dict:
         """Build a session snapshot for new WebSocket clients."""
         return {
@@ -236,6 +256,7 @@ class EventBusListener:
                 "recent_trades": self._app_state.get('recent_trades', [])[:20],
                 "recent_governance": self._app_state.get('recent_governance', [])[:10],
                 "recent_activity": self._app_state.get('recent_activity', [])[:20],
+                "recent_orders": self._app_state.get('recent_orders', [])[:30],
             },
         }
 
@@ -278,13 +299,16 @@ class HealthResponse(BaseModel):
 
 
 def create_app(
-    event_bus: Optional[EventBus] = None, session_start_time: Optional[datetime] = None
+    event_bus: Optional[EventBus] = None,
+    session_start_time: Optional[datetime] = None,
+    session_manager=None,
 ) -> FastAPI:
     """Create FastAPI application.
 
     Args:
         event_bus: EventBus instance (for testing or explicit injection)
         session_start_time: Session start time (for testing)
+        session_manager: SessionManager instance for session control
 
     Returns:
         FastAPI application instance
@@ -315,6 +339,9 @@ def create_app(
     app.state.pod_summaries: dict[str, dict] = {}
     app.state.risk_halt = False
     app.state.risk_halt_reason: Optional[str] = None
+    app.state.session_manager = session_manager
+    if session_manager:
+        session_manager._restartable = True
 
     @app.on_event("startup")
     async def startup():
@@ -410,6 +437,68 @@ def create_app(
             "note": "Audit log endpoint not yet implemented",
         }
 
+    # --- Session control endpoints ---
+
+    @app.get("/api/session/status")
+    async def get_session_status():
+        """Get current session status (active, iteration, uptime)."""
+        sm = app.state.session_manager
+        active = sm.session_active if sm else False
+        iteration = sm.iteration if sm else app.state.iteration
+        uptime = (datetime.now(timezone.utc) - app.state.session_start_time).total_seconds() if active else 0
+        pod_count = len(sm._pod_runtimes) if sm and hasattr(sm, '_pod_runtimes') else 0
+        return {
+            "active": active,
+            "iteration": iteration,
+            "uptime_seconds": round(uptime, 1),
+            "pod_count": pod_count,
+        }
+
+    @app.post("/api/session/stop")
+    async def stop_session():
+        """Stop the running trading session."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="SessionManager not available")
+        if not sm.session_active:
+            return {"ok": False, "detail": "Session is not running"}
+        try:
+            await sm.stop_session()
+            status_msg = {
+                "type": "session_status",
+                "data": {"active": False, "iteration": sm.iteration},
+            }
+            await manager.broadcast(status_msg)
+            return {"ok": True, "detail": "Session stopped"}
+        except Exception as exc:
+            logger.error("[web] stop_session failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+    @app.post("/api/session/start")
+    async def start_session():
+        """Start a new trading session (if not already running)."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="SessionManager not available")
+        if sm.session_active:
+            return {"ok": False, "detail": "Session is already running"}
+        try:
+            async def _run():
+                await sm.start_live_session()
+                await sm.run_event_loop(interval_seconds=60.0, governance_freq=5)
+            asyncio.ensure_future(_run())
+            await asyncio.sleep(0.5)
+            status_msg = {
+                "type": "session_status",
+                "data": {"active": True, "iteration": sm.iteration},
+            }
+            await manager.broadcast(status_msg)
+            app.state.session_start_time = datetime.now(timezone.utc)
+            return {"ok": True, "detail": "Session starting"}
+        except Exception as exc:
+            logger.error("[web] start_session failed: %s", exc)
+            raise HTTPException(status_code=500, detail=str(exc))
+
     # WebSocket endpoint
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
@@ -420,6 +509,8 @@ def create_app(
             if listener:
                 snapshot = listener.get_snapshot()
                 snapshot["data"]["iteration"] = app.state.iteration
+                sm = app.state.session_manager
+                snapshot["data"]["session_active"] = sm.session_active if sm else False
                 await websocket.send_json(snapshot)
             while True:
                 data = await websocket.receive_text()

@@ -12,7 +12,7 @@ from src.agents.cio.cio_agent import CIOAgent
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 
 
-POD_IDS = ["alpha", "beta", "gamma", "delta", "epsilon"]
+POD_IDS = ["equities", "fx", "crypto", "commodities"]
 
 
 def _summary(pod_id: str, status: str = "active", pnl: float = 0.0, dd: float = 0.0):
@@ -95,8 +95,9 @@ async def test_cio_rule_based_no_drift(bus, allocator, monkeypatch):
     cio = CIOAgent(bus, allocator)
     summaries = [_summary(pid) for pid in POD_IDS]
     records = await cio.rebalance(summaries)
-    assert len(records) == 5
-    assert all(abs(r.new_pct - 0.2) < 0.01 for r in records)
+    assert len(records) == len(POD_IDS)
+    target = 1.0 / len(POD_IDS)
+    assert all(abs(r.new_pct - target) < 0.01 for r in records)
 
 
 async def test_cio_rule_based_corrects_drift(bus, allocator, monkeypatch):
@@ -104,39 +105,35 @@ async def test_cio_rule_based_corrects_drift(bus, allocator, monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     from src.core.models.allocation import AllocationRecord
     now = datetime.now(timezone.utc)
+    target = 1.0 / len(POD_IDS)
     skew = [
-        AllocationRecord(timestamp=now, pod_id="alpha", old_pct=0.2, new_pct=0.4,
+        AllocationRecord(timestamp=now, pod_id=POD_IDS[0], old_pct=target, new_pct=0.5,
                          rationale="test", authorized_by="cio_rule_based"),
-        AllocationRecord(timestamp=now, pod_id="beta", old_pct=0.2, new_pct=0.15,
-                         rationale="test", authorized_by="cio_rule_based"),
-        AllocationRecord(timestamp=now, pod_id="gamma", old_pct=0.2, new_pct=0.15,
-                         rationale="test", authorized_by="cio_rule_based"),
-        AllocationRecord(timestamp=now, pod_id="delta", old_pct=0.2, new_pct=0.15,
-                         rationale="test", authorized_by="cio_rule_based"),
-        AllocationRecord(timestamp=now, pod_id="epsilon", old_pct=0.2, new_pct=0.15,
-                         rationale="test", authorized_by="cio_rule_based"),
+    ] + [
+        AllocationRecord(timestamp=now, pod_id=pid, old_pct=target, new_pct=round((1.0 - 0.5) / (len(POD_IDS) - 1), 4),
+                         rationale="test", authorized_by="cio_rule_based")
+        for pid in POD_IDS[1:]
     ]
     await allocator.apply_allocation(skew)
 
     cio = CIOAgent(bus, allocator)
     summaries = [_summary(pid) for pid in POD_IDS]
     records = await cio.rebalance(summaries)
-    # After correction, should be back to equal weight
-    assert all(abs(r.new_pct - 0.2) < 0.01 for r in records)
+    assert all(abs(r.new_pct - target) < 0.01 for r in records)
 
 
 async def test_cio_governance_pod_pm_counter(bus, allocator):
     cio = CIOAgent(bus, allocator)
     msg = AgentMessage(
         timestamp=datetime.now(timezone.utc),
-        sender="pm.alpha", recipient="cio", topic="governance.cio",
-        payload={"action": "pod_pm_counter", "pod_id": "alpha", "requested_pct": 0.30},
+        sender="pm.equities", recipient="cio", topic="governance.cio",
+        payload={"action": "pod_pm_counter", "pod_id": "equities", "requested_pct": 0.35},
     )
     response = await cio.handle_governance_message(msg)
     assert response is not None
     assert response.payload["consensus"] is True
     agreed = response.payload["outcome"]["agreed_pct"]
-    assert 0.2 <= agreed <= 0.30  # compromise between current 0.2 and requested 0.3
+    assert 0.25 <= agreed <= 0.35
 
 
 async def test_cio_validates_and_falls_back_on_bad_llm_output(bus, allocator):
@@ -147,7 +144,7 @@ async def test_cio_validates_and_falls_back_on_bad_llm_output(bus, allocator):
         from src.core.models.allocation import AllocationRecord
         now = datetime.now(timezone.utc)
         # Sum = 2.0 — invalid
-        return [AllocationRecord(timestamp=now, pod_id=pid, old_pct=0.2, new_pct=0.4,
+        return [AllocationRecord(timestamp=now, pod_id=pid, old_pct=0.25, new_pct=0.5,
                                  rationale="bad", authorized_by="cio_llm")
                 for pid in POD_IDS]
 
@@ -156,4 +153,29 @@ async def test_cio_validates_and_falls_back_on_bad_llm_output(bus, allocator):
     summaries = [_summary(pid) for pid in POD_IDS]
     records = await cio.rebalance(summaries)
     # Should fall back to equal weight
-    assert all(abs(r.new_pct - 0.2) < 0.01 for r in records)
+    assert all(abs(r.new_pct - 0.25) < 0.01 for r in records)
+
+
+# --- Dict input (matching real runtime behavior) ---
+
+async def test_ceo_rule_based_mandate_with_dict_input(bus, monkeypatch):
+    """CEO.approve_mandate must accept dict[str, PodSummary] since
+    session_manager passes a dict, not a list."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    ceo = CEOAgent(bus)
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    mandate = await ceo.approve_mandate(summaries)
+    assert mandate.authorized_by == "ceo_rule_based"
+    assert len(mandate.objectives) > 0
+    assert mandate.narrative != ""
+
+
+async def test_cio_rule_based_rebalance_with_dict_input(bus, allocator, monkeypatch):
+    """CIO.rebalance must accept dict[str, PodSummary]."""
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    cio = CIOAgent(bus, allocator)
+    summaries = {pid: _summary(pid) for pid in POD_IDS}
+    records = await cio.rebalance(summaries)
+    assert len(records) == len(POD_IDS)

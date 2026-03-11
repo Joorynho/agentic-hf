@@ -164,11 +164,15 @@ class EquitiesExecutionTrader(BasePodAgent):
                 order.side.value, order.quantity, order.symbol, order.limit_price or "MARKET"
             )
 
+            await self._broadcast_order_update(
+                order, status="PENDING", fill_price=None, fill_qty=0.0,
+            )
+
             # Call Alpaca to place order
             result_dict = await self._alpaca.place_order(
                 symbol=order.symbol,
                 qty=order.quantity,
-                side=order.side.value,  # Convert Side enum to string
+                side=order.side.value,
                 order_type="limit" if order.order_type.value == "limit" else "market",
                 limit_price=order.limit_price,
             )
@@ -198,6 +202,12 @@ class EquitiesExecutionTrader(BasePodAgent):
                     "[equities.exec] Order %s: %s (id=%s, reason=%s)",
                     result.status, order.symbol, result.order_id, result.reason
                 )
+
+            await self._broadcast_order_update(
+                order, status=result.status,
+                fill_price=result.fill_price, fill_qty=result.fill_qty,
+                order_id=result.order_id, reason=result.reason,
+            )
 
             # Store result in namespace for ops agent
             self.store("last_order_result", result.model_dump(mode="json"))
@@ -296,6 +306,35 @@ class EquitiesExecutionTrader(BasePodAgent):
                 "order_executed": False,
                 "execution_error": str(exc),
             }
+
+    async def _broadcast_order_update(
+        self, order: Order, status: str,
+        fill_price: float | None = None, fill_qty: float = 0.0,
+        order_id: str | None = None, reason: str | None = None,
+    ) -> None:
+        """Publish order lifecycle event to EventBus for dashboard visibility."""
+        try:
+            msg = AgentMessage(
+                timestamp=datetime.now(timezone.utc),
+                sender=f"pod.{self._pod_id}.exec",
+                recipient="broadcast",
+                topic="execution.order_update",
+                payload={
+                    "pod_id": self._pod_id,
+                    "order_id": order_id or str(order.id),
+                    "symbol": order.symbol,
+                    "side": order.side.value,
+                    "qty": order.quantity,
+                    "status": status,
+                    "fill_price": fill_price,
+                    "fill_qty": fill_qty,
+                    "reason": reason,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            await self._bus.publish("execution.order_update", msg, publisher_id=f"pod.{self._pod_id}")
+        except Exception:
+            pass
 
     def _queue_for_paper_adapter(self, order: Order) -> dict:
         """Queue order for paper adapter (backtest mode)."""

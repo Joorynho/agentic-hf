@@ -153,16 +153,17 @@ class CIOAgent:
 
     async def _llm_allocation(
         self,
-        pod_summaries: list[PodSummary],
+        pod_summaries,
         ceo_narrative: str,
         cro_constraints: dict,
     ) -> list[AllocationRecord]:
         try:
             current = self._allocator.current_allocations()
+            items = pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries
             summaries_text = "\n".join(
                 f"- {s.pod_id}: pnl={s.risk_metrics.daily_pnl:.2f} "
                 f"dd={s.risk_metrics.drawdown_from_hwm:.3f} status={s.status}"
-                for s in pod_summaries
+                for s in items
             )
             prompt = (
                 "You are the CIO of an algorithmic hedge fund. "
