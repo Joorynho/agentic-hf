@@ -8,9 +8,13 @@ from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
 
-MAX_POSITION_PCT = 0.20
 MAX_LEVERAGE = 2.0
 MIN_FRACTIONAL_QTY = 0.01
+
+
+def _conviction_limit(conviction: float) -> float:
+    """Position limit as % of NAV, scaled by conviction (10% at 0.0, 25% at 1.0)."""
+    return 0.10 + 0.15 * max(0.0, min(1.0, conviction))
 
 
 class EquitiesRiskAgent(BasePodAgent):
@@ -35,19 +39,23 @@ class EquitiesRiskAgent(BasePodAgent):
             else accountant.get_last_price(order.symbol, 100.0)
         )
 
-        # --- Position limit check ---
+        # --- Position limit check (conviction + regime scaled) ---
+        conviction = getattr(order, "conviction", 0.5)
+        regime = self._ns.get("market_regime") or {}
+        regime_scale = regime.get("scale", 1.0)
+        max_position_pct = min(0.30, _conviction_limit(conviction) * regime_scale)
         signed_qty = order.quantity if order.side == Side.BUY else -order.quantity
         new_qty = existing_qty + signed_qty
         new_notional = abs(new_qty) * est_price
-        if nav > 0 and new_notional / nav > MAX_POSITION_PCT:
-            max_notional = MAX_POSITION_PCT * nav
+        if nav > 0 and new_notional / nav > max_position_pct:
+            max_notional = max_position_pct * nav
             max_qty = max_notional / est_price if est_price > 0 else 0
             if order.side == Side.BUY:
                 max_qty = max(0, max_qty - existing_qty)
             else:
                 max_qty = max(0, existing_qty - max_qty)
             if max_qty < MIN_FRACTIONAL_QTY:
-                reason = f"Position limit ({MAX_POSITION_PCT*100:.0f}% NAV=${nav:.2f}). No feasible size for {order.symbol}."
+                reason = f"Position limit ({max_position_pct*100:.0f}% NAV=${nav:.2f}, conv={conviction:.1f}). No feasible size for {order.symbol}."
                 logger.info("[equities.risk] %s", reason)
                 await self._broadcast("risk_rejection", order, reason)
                 return {"reason": reason}
@@ -56,8 +64,9 @@ class EquitiesRiskAgent(BasePodAgent):
                 side=order.side, order_type=order.order_type,
                 quantity=round(max_qty, 4), limit_price=order.limit_price,
                 timestamp=order.timestamp, strategy_tag=order.strategy_tag,
+                conviction=conviction,
             )
-            reason = f"Position limit: {order.side.value} {order.symbol} {order.quantity:.2f} -> {revised.quantity:.2f} ({MAX_POSITION_PCT*100:.0f}% of NAV=${nav:.2f})"
+            reason = f"Position limit: {order.side.value} {order.symbol} {order.quantity:.2f} -> {revised.quantity:.2f} ({max_position_pct*100:.0f}% of NAV=${nav:.2f}, conv={conviction:.1f})"
             logger.info("[equities.risk] %s", reason)
             await self._broadcast("risk_revision", order, reason, revised_qty=revised.quantity)
             return {"revised_order": revised, "reason": reason}
@@ -79,6 +88,7 @@ class EquitiesRiskAgent(BasePodAgent):
                 side=order.side, order_type=order.order_type,
                 quantity=round(max(MIN_FRACTIONAL_QTY, max_qty_lev), 4), limit_price=order.limit_price,
                 timestamp=order.timestamp, strategy_tag=order.strategy_tag,
+                conviction=conviction,
             )
             reason = f"Leverage limit: {order.side.value} {order.symbol} {order.quantity:.2f} -> {revised.quantity:.2f} ({MAX_LEVERAGE:.1f}x max)"
             logger.info("[equities.risk] %s", reason)

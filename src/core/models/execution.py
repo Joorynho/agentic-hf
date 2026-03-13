@@ -5,7 +5,9 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from typing import Annotated
+
+from pydantic import BaseModel, BeforeValidator, Field
 
 from .enums import OrderType, Side
 
@@ -20,6 +22,7 @@ class Order(BaseModel):
     limit_price: float | None = None
     timestamp: datetime
     strategy_tag: str  # pod-internal, never exposed cross-boundary
+    conviction: float = 0.5
     model_config = {"frozen": True}
 
 
@@ -75,12 +78,22 @@ class OrderResult(BaseModel):
     filled_at: datetime | None = None
 
 
+def _clamp_01(v: float) -> float:
+    return max(0.0, min(1.0, float(v)))
+
+
+ClampedFloat = Annotated[float, BeforeValidator(_clamp_01)]
+
+
 class TradeProposal(BaseModel):
     """Validated trade proposal from LLM output. Rejects malformed trades."""
     action: Literal["BUY", "SELL"]
     symbol: str
     qty: float = Field(gt=0)
     reasoning: str = ""
+    conviction: ClampedFloat = 0.5
+    strategy_tag: str = ""
+    signal_snapshot: dict = Field(default_factory=dict)
 
 
 class PositionSnapshot(BaseModel):
@@ -90,6 +103,8 @@ class PositionSnapshot(BaseModel):
     cost_basis: float  # Average cost per share
     current_price: float  # Current market price
     unrealized_pnl: float  # qty * (current_price - cost_basis)
+    entry_thesis: str = ""
+    entry_date: str = ""
 
     @property
     def notional(self) -> float:

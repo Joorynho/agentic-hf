@@ -11,6 +11,8 @@ from src.core.models.enums import PodStatus
 from src.core.models.execution import Order, RiskApprovalToken, PodPosition
 from src.core.models.market import Bar
 from src.core.models.pod_summary import PodSummary, PodRiskMetrics, PodExposureBucket
+from src.core.signal_scorer import SignalScorer
+from src.core.trade_outcomes import TradeOutcomeTracker
 from src.pods.base.agent import BasePodAgent
 from src.pods.base.gateway import PodGateway
 from src.pods.base.namespace import PodNamespace
@@ -46,6 +48,9 @@ class PodRuntime:
         self._gateway = gateway
         self._bus = bus
         self._collab = collaboration_runner or CollaborationRunner()
+
+        self._outcome_tracker = TradeOutcomeTracker(pod_id)
+        self._signal_scorer = SignalScorer(pod_id)
 
         # Agents are injected after construction via set_agents()
         self._researcher: BasePodAgent | None = None
@@ -128,15 +133,53 @@ class PodRuntime:
                 "positions_summary": pos_summary,
             }
 
+        # Feed closed trades to outcome tracker + signal scorer, inject into PM context
+        if accountant:
+            closed = accountant.closed_trades
+            self._outcome_tracker.ingest(closed)
+            self._signal_scorer.ingest_closed_trades(closed)
+
+            track_record = self._outcome_tracker.format_for_prompt()
+            signal_quality = self._signal_scorer.format_for_prompt()
+            ctx["trade_track_record"] = track_record
+            ctx["signal_quality"] = signal_quality
+            self._ns.set("trade_track_record", track_record)
+            self._ns.set("signal_quality", signal_quality)
+
+        # Inject firm intelligence memo (cross-pod views) if available
+        firm_memo = self._ns.get("firm_memo")
+        if firm_memo:
+            ctx["firm_memo"] = firm_memo
+
         # 3. PM (with Signal↔PM challenge, max 5 iter — handled inside pm.run_cycle)
         pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
         ctx.update(pm_out)
+
+        # Emit pod macro view for cross-pod intelligence
+        features = ctx.get("features", {})
+        regime = features.get("regime", {})
+        last_pm = self._ns.get("last_pm_decision") or {}
+        self._ns.set("macro_view", {
+            "pod_id": self._pod_id,
+            "regime": regime.get("label", "Unknown"),
+            "outlook": features.get("macro_outlook", "neutral"),
+            "action": last_pm.get("action_summary", "holding")[:100],
+        })
 
         order: Order | None = ctx.get("order")
         if order is None:
             # No trade proposed — still run Ops
             await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
             return
+
+        # Carry PM decision metadata so exec trader can attach it to fills
+        last_pm = self._ns.get("last_pm_decision") or {}
+        self._ns.set("pm_trade_metadata", {
+            "reasoning": last_pm.get("reasoning", "")[:500],
+            "conviction": order.conviction,
+            "strategy_tag": order.strategy_tag,
+            "signal_snapshot": last_pm.get("signal_snapshot", {}),
+        })
 
         # 4. Risk sign-off loop (PM↔Risk, max 10 iter)
         approved_order = await self._run_risk_loop(order)

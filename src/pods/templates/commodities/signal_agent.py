@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from src.core.regime import classify_regime
 from src.data.adapters.fred_adapter import FredAdapter
 from src.pods.base.agent import BasePodAgent
 
@@ -30,6 +31,8 @@ class CommoditiesSignalAgent(BasePodAgent):
         fed_rate = fred.get("FEDFUNDS")
         dgs10 = fred.get("DGS10")
         vix = fred.get("VIXCLS")
+        yield_curve = fred.get("T10Y2Y")
+        credit_spread = fred.get("BAMLH0A0HYM2")
 
         macro_outlook = "neutral"
         if t5y_breakeven is not None:
@@ -82,6 +85,8 @@ class CommoditiesSignalAgent(BasePodAgent):
                 "usd_index_dxy": dxy,
                 "fed_funds_rate": fed_rate,
                 "treasury_10y": dgs10,
+                "yield_curve_10y2y": yield_curve,
+                "credit_spread": credit_spread,
                 "vix": vix,
             },
             "global_rate_table": FredAdapter.build_global_rate_table(fred),
@@ -97,7 +102,21 @@ class CommoditiesSignalAgent(BasePodAgent):
             },
         }
 
+        # Classify market regime for risk scaling
+        regime = classify_regime(
+            vix=float(vix) if vix is not None else None,
+            yield_curve=float(yield_curve) if yield_curve is not None else None,
+            credit_spread=float(credit_spread) if credit_spread is not None else None,
+        )
+        features["regime"] = {
+            "name": regime.regime,
+            "label": regime.label,
+            "scale": regime.scale,
+            "description": regime.description,
+        }
+        self._ns.set("market_regime", features["regime"])
+
         self.store("features", features)
-        logger.debug("[commodities.signal] features assembled: %d FRED, %d poly, %d headlines",
-                     len(fred), len(poly_summary), len(headlines))
+        logger.debug("[commodities.signal] features assembled: %d FRED, %d poly, %d headlines, regime=%s",
+                     len(fred), len(poly_summary), len(headlines), regime.regime)
         return {"features": features}

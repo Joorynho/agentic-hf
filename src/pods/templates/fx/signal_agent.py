@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from src.core.regime import classify_regime
 from src.data.adapters.fred_adapter import FredAdapter
 from src.pods.base.agent import BasePodAgent
 
@@ -27,6 +28,7 @@ class FXSignalAgent(BasePodAgent):
         dgs2 = fred.get("DGS2")
         yield_curve = fred.get("T10Y2Y")
         vix = fred.get("VIXCLS")
+        credit_spread = fred.get("BAMLH0A0HYM2")
         dxy = fred.get("DTWEXBGS")
         m2 = fred.get("M2SL")
         cpi = fred.get("CPIAUCSL")
@@ -79,6 +81,7 @@ class FXSignalAgent(BasePodAgent):
                 "treasury_10y": dgs10,
                 "treasury_2y": dgs2,
                 "yield_curve_10y2y": yield_curve,
+                "credit_spread": credit_spread,
                 "vix": vix,
                 "usd_index_dxy": dxy,
                 "m2_money_supply": m2,
@@ -97,7 +100,21 @@ class FXSignalAgent(BasePodAgent):
             },
         }
 
+        # Classify market regime for risk scaling
+        regime = classify_regime(
+            vix=float(vix) if vix is not None else None,
+            yield_curve=float(yield_curve) if yield_curve is not None else None,
+            credit_spread=float(credit_spread) if credit_spread is not None else None,
+        )
+        features["regime"] = {
+            "name": regime.regime,
+            "label": regime.label,
+            "scale": regime.scale,
+            "description": regime.description,
+        }
+        self._ns.set("market_regime", features["regime"])
+
         self.store("features", features)
-        logger.debug("[fx.signal] features assembled: %d FRED, %d poly, %d headlines",
-                     len(fred), len(poly_summary), len(headlines))
+        logger.debug("[fx.signal] features assembled: %d FRED, %d poly, %d headlines, regime=%s",
+                     len(fred), len(poly_summary), len(headlines), regime.regime)
         return {"features": features}

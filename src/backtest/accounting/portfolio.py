@@ -21,6 +21,10 @@ class PortfolioAccountant:
         self._nav_history: list[float] = [initial_nav]
         self._realized_pnl = 0.0
         self._fill_log: list[dict] = []
+        self._entry_theses: dict[str, str] = {}
+        self._entry_dates: dict[str, str] = {}
+        self._entry_metadata: dict[str, dict] = {}
+        self._closed_trades: list[dict] = []
 
     def record_fill(self, fill: Fill) -> None:
         """Record a fill from the execution layer (original method - updated to track cost basis)."""
@@ -55,6 +59,10 @@ class PortfolioAccountant:
         qty: float,
         fill_price: float,
         filled_at: datetime | None = None,
+        reasoning: str = "",
+        strategy_tag: str = "",
+        signal_snapshot: dict | None = None,
+        conviction: float = 0.5,
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -65,6 +73,10 @@ class PortfolioAccountant:
             qty: Filled quantity (positive for BUY, negative for SELL)
             fill_price: Price at which order was filled
             filled_at: Timestamp of fill (default: now)
+            reasoning: PM reasoning for the trade
+            strategy_tag: Strategy identifier (e.g., 'macro_momentum')
+            signal_snapshot: Signal state at trade time
+            conviction: PM conviction score (0-1)
         """
         if filled_at is None:
             filled_at = datetime.now(timezone.utc)
@@ -84,24 +96,54 @@ class PortfolioAccountant:
         prev_cost = self._cost_basis[symbol]
         new_qty = prev_qty + qty
 
+        # Store entry metadata when opening a new position
+        if prev_qty == 0 and qty != 0:
+            self._entry_theses[symbol] = reasoning or ""
+            self._entry_dates[symbol] = filled_at.strftime("%Y-%m-%d") if filled_at else ""
+            self._entry_metadata[symbol] = {
+                "entry_price": fill_price,
+                "entry_time": filled_at.isoformat() if filled_at else "",
+                "reasoning": reasoning,
+                "conviction": conviction,
+                "strategy_tag": strategy_tag,
+                "signal_snapshot": signal_snapshot or {},
+            }
+
         # Calculate realized PnL for any position reduction
         if (prev_qty > 0 and qty < 0) or (prev_qty < 0 and qty > 0):
-            # We're reducing or closing a position
-            # Only the reduced portion realizes PnL
             reduced_qty = min(abs(qty), abs(prev_qty))
             realized = reduced_qty * (fill_price - prev_cost)
             if prev_qty < 0:
-                # Short position: profit when price falls
                 realized = -realized
             self._realized_pnl += realized
+
+            entry_meta = self._entry_metadata.get(symbol, {})
+            self._closed_trades.append({
+                "symbol": symbol,
+                "side": "long" if prev_qty > 0 else "short",
+                "entry_price": entry_meta.get("entry_price", prev_cost),
+                "exit_price": fill_price,
+                "qty": reduced_qty,
+                "realized_pnl": realized,
+                "entry_time": entry_meta.get("entry_time", ""),
+                "exit_time": filled_at.isoformat() if filled_at else "",
+                "entry_reasoning": entry_meta.get("reasoning", ""),
+                "conviction": entry_meta.get("conviction", 0.5),
+                "strategy_tag": entry_meta.get("strategy_tag", ""),
+                "signal_snapshot": entry_meta.get("signal_snapshot", {}),
+            })
             logger.info(
-                f"[{self._pod_id}] Realized PnL on {symbol}: ${realized:.2f}"
+                f"[{self._pod_id}] Closed trade on {symbol}: ${realized:.2f} "
+                f"(entry={entry_meta.get('entry_price', prev_cost):.2f}, "
+                f"exit={fill_price:.2f})"
             )
 
         # Update cost basis using weighted average
         if new_qty == 0:
-            # Closing position entirely
             self._cost_basis[symbol] = 0.0
+            self._entry_theses.pop(symbol, None)
+            self._entry_dates.pop(symbol, None)
+            self._entry_metadata.pop(symbol, None)
         elif prev_qty == 0:
             # Opening new position
             self._cost_basis[symbol] = fill_price
@@ -125,6 +167,10 @@ class PortfolioAccountant:
                 "qty": qty,
                 "fill_price": fill_price,
                 "notional": qty * fill_price,
+                "reasoning": reasoning,
+                "strategy_tag": strategy_tag,
+                "signal_snapshot": signal_snapshot or {},
+                "conviction": conviction,
             }
         )
 
@@ -163,8 +209,15 @@ class PortfolioAccountant:
                     cost_basis=self._cost_basis.get(symbol, 0.0),
                     current_price=current_price,
                     unrealized_pnl=unrealized_pnl,
+                    entry_thesis=self._entry_theses.get(symbol, ""),
+                    entry_date=self._entry_dates.get(symbol, ""),
                 )
         return positions
+
+    @property
+    def closed_trades(self) -> list[dict]:
+        """All closed trades with entry metadata and realized PnL."""
+        return list(self._closed_trades)
 
     @property
     def nav(self) -> float:

@@ -445,10 +445,28 @@ class SessionManager:
 
             # Restore trade history + governance from previous session
             self._restored_memory = self._load_memory()
-            if self._restored_memory and self._web_app:
-                lsnr = getattr(self._web_app.state, "listener", None)
-                if lsnr:
-                    lsnr.inject_restored_memory(self._restored_memory)
+            if self._restored_memory:
+                # Restore trade outcome trackers and signal scorers
+                from src.core.trade_outcomes import TradeOutcomeTracker
+                from src.core.signal_scorer import SignalScorer
+                saved_outcomes = self._restored_memory.get("trade_outcomes", {})
+                for pod_id, outcome_state in saved_outcomes.items():
+                    rt = self._pod_runtimes.get(pod_id)
+                    if rt:
+                        rt._outcome_tracker = TradeOutcomeTracker.load_from_state(outcome_state)
+                        logger.info("[session_manager] Restored %d trade outcomes for %s",
+                                    rt._outcome_tracker.total_trades, pod_id)
+                saved_scores = self._restored_memory.get("signal_scores", {})
+                for pod_id, score_state in saved_scores.items():
+                    rt = self._pod_runtimes.get(pod_id)
+                    if rt:
+                        rt._signal_scorer = SignalScorer.load_from_state(score_state)
+                        logger.info("[session_manager] Restored signal scorer for %s", pod_id)
+
+                if self._web_app:
+                    lsnr = getattr(self._web_app.state, "listener", None)
+                    if lsnr:
+                        lsnr.inject_restored_memory(self._restored_memory)
 
         except Exception as exc:
             logger.error("[session_manager] Failed to start session: %s", exc)
@@ -501,6 +519,16 @@ class SessionManager:
                     f"{p.symbol}: qty={p.qty:.2f}, notional=${p.notional:,.0f}, pnl=${p.unrealized_pnl:+,.2f}"
                     for p in summary.positions[:5]
                 ]
+
+            # Performance attribution from trade outcome tracker
+            tracker = getattr(runtime, "_outcome_tracker", None)
+            if tracker and tracker.total_trades > 0:
+                brief["performance"] = {
+                    "total_trades": tracker.total_trades,
+                    "win_rate": f"{tracker.win_rate:.0%}",
+                    "total_realized_pnl": f"${tracker.total_pnl:.2f}",
+                    "avg_pnl_per_trade": f"${tracker.avg_pnl:.2f}",
+                }
 
             # Cross-pod conflict check (injected per pod)
             if hasattr(self._governance, "check_cross_pod_conflicts"):
@@ -657,7 +685,8 @@ class SessionManager:
                         logger.info("[session_manager] [iter %d] Pod %s: ingested %d bars, mark-to-market done",
                                     self._iteration, pod_id, bars_count)
 
-                    # 5. Run agent decision cycle ONCE per pod (signal → PM → risk → exec → ops)
+                    # 5. Build cross-pod intelligence memos and run agent cycles
+                    self._inject_firm_memos()
                     for pod_id, runtime in self._pod_runtimes.items():
                         bar = pod_latest_bars.get(pod_id)
                         if bar is None:
@@ -1049,6 +1078,36 @@ class SessionManager:
                 # Continue with next pod even if one fails
         return summaries
 
+    def _inject_firm_memos(self) -> None:
+        """Build cross-pod intelligence memos and inject into each pod's namespace.
+
+        Each pod gets a memo showing macro views from all OTHER pods,
+        so PMs can see what other desks are thinking without crossing
+        the pod isolation boundary for positions or signals.
+        """
+        views: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            view = runtime._ns.get("macro_view")
+            if view:
+                views[pod_id] = view
+
+        if len(views) < 2:
+            return
+
+        for pod_id, runtime in self._pod_runtimes.items():
+            other_views = [v for pid, v in views.items() if pid != pod_id]
+            if not other_views:
+                continue
+            lines = ["Cross-pod intelligence (other desks):"]
+            for v in other_views:
+                lines.append(
+                    f"  {v.get('pod_id', '?').upper()}: "
+                    f"regime={v.get('regime', '?')}, "
+                    f"outlook={v.get('outlook', '?')}, "
+                    f"action={v.get('action', 'holding')}"
+                )
+            runtime._ns.set("firm_memo", "\n".join(lines))
+
     async def _reconcile_positions(self) -> None:
         """Compare Alpaca positions against per-pod accountant positions.
 
@@ -1155,6 +1214,16 @@ class SessionManager:
             total_nav = sum(ps.get("nav", 0) for ps in pods_state.values())
             total_capital = sum(ps.get("starting_capital", 0) for ps in pods_state.values())
 
+            outcomes_state: dict[str, dict] = {}
+            signal_scores_state: dict[str, dict] = {}
+            for pod_id, runtime in self._pod_runtimes.items():
+                tracker = getattr(runtime, "_outcome_tracker", None)
+                if tracker and tracker.total_trades > 0:
+                    outcomes_state[pod_id] = tracker.to_state_dict()
+                scorer = getattr(runtime, "_signal_scorer", None)
+                if scorer and scorer.get_hit_rates():
+                    signal_scores_state[pod_id] = scorer.to_state_dict()
+
             memory = {
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "session_start": self._session_start.isoformat() if self._session_start else None,
@@ -1167,6 +1236,8 @@ class SessionManager:
                 "pods": pods_state,
                 "trades": trades,
                 "governance": governance,
+                "trade_outcomes": outcomes_state,
+                "signal_scores": signal_scores_state,
             }
 
             self._MEMORY_JSON.write_text(

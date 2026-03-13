@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from src.core.regime import classify_regime
 from src.data.adapters.fred_adapter import FredAdapter
 from src.pods.base.agent import BasePodAgent
 
@@ -93,7 +94,21 @@ class CryptoSignalAgent(BasePodAgent):
             },
         }
 
+        # Classify market regime for risk scaling
+        regime = classify_regime(
+            vix=float(vix) if vix is not None else None,
+            yield_curve=float(yield_curve) if yield_curve is not None else None,
+            credit_spread=float(credit_spread) if credit_spread is not None else None,
+        )
+        features["regime"] = {
+            "name": regime.regime,
+            "label": regime.label,
+            "scale": regime.scale,
+            "description": regime.description,
+        }
+        self._ns.set("market_regime", features["regime"])
+
         self.store("features", features)
-        logger.debug("[crypto.signal] features assembled: %d FRED, %d poly, %d headlines",
-                     len(fred), len(poly_summary), len(headlines))
+        logger.debug("[crypto.signal] features assembled: %d FRED, %d poly, %d headlines, regime=%s",
+                     len(fred), len(poly_summary), len(headlines), regime.regime)
         return {"features": features}

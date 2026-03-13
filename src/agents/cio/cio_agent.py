@@ -145,6 +145,14 @@ class CIOAgent:
                     lines.append(f"  Position: {pos}")
             if brief.get("fred_highlights"):
                 lines.append(f"  FRED: {brief['fred_highlights']}")
+            perf = brief.get("performance")
+            if perf:
+                lines.append(
+                    f"  Performance: {perf['total_trades']} trades, "
+                    f"{perf['win_rate']} win rate, "
+                    f"realized PnL {perf['total_realized_pnl']}, "
+                    f"avg {perf['avg_pnl_per_trade']}/trade"
+                )
             if brief.get("cross_pod_conflicts"):
                 for conflict in brief["cross_pod_conflicts"]:
                     lines.append(f"  WARNING: {conflict}")
@@ -266,7 +274,9 @@ class CIOAgent:
                 prompt += f"\n{intel_brief}\n\n"
             prompt += (
                 "Propose new allocations as JSON: {\"allocations\": {\"pod_id\": float, ...}}. "
-                "Values must sum to 1.0. All values >= 0."
+                "Values must sum to 1.0. All values >= 0.\n"
+                "Consider pod performance attribution (win rate, realized PnL) when allocating — "
+                "increase allocation to consistently profitable pods, reduce for poor performers."
             )
 
             if self._session_logger:

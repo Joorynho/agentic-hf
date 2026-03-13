@@ -68,12 +68,15 @@ If a headline suggests a material catalyst worth investigating, include "read_ar
 (max 3). You will receive the full article text.
 
 Output JSON:
-{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "reasoning": "THESIS: ... | EDGE: ... | RISK: ..."}], "read_articles": ["url1"]}
+{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ..."}], "read_articles": ["url1"]}
+conviction: 0.0 = no confidence, 0.5 = moderate, 0.8+ = high conviction, 1.0 = maximum.
+Only trades with conviction >= 0.7 should be above 10% of NAV.
 Omit read_articles if not needed.
 
 POSITION SIZING:
-- Standard conviction: 5-10% of NAV
-- High conviction (with full THESIS/EDGE/RISK): up to 20% of NAV
+- Low conviction (<0.5): max 5% of NAV
+- Medium conviction (0.5-0.7): max 10% of NAV
+- High conviction (>0.7): up to 20% of NAV
 - Hard cap: 20% of NAV per position, 40% of cash per cycle
 - Scale down in high-vol regimes. The Risk agent enforces hard limits.
 Output qty as a specific number of shares/units, not a percentage."""
@@ -103,9 +106,10 @@ class CommoditiesPMAgent(BasePodAgent):
             return {}
 
         sizing = context.get("sizing_context", {})
+        track_record = context.get("trade_track_record")
 
         if has_llm_key():
-            return await self._llm_decision(features, sizing)
+            return await self._llm_decision(features, sizing, track_record)
         return self._rule_based_decision(features)
 
     async def _evaluate_risk_revision(self, context: dict) -> dict:
@@ -303,7 +307,8 @@ class CommoditiesPMAgent(BasePodAgent):
         })
         return {}
 
-    async def _llm_decision(self, features: dict, sizing_context: dict | None = None) -> dict:
+    async def _llm_decision(self, features: dict, sizing_context: dict | None = None,
+                             trade_track_record: str | None = None) -> dict:
         positions = self.recall("current_positions_summary", "none")
         universe = self.recall("universe", [])
         sizing = sizing_context or {}
@@ -345,6 +350,11 @@ class CommoditiesPMAgent(BasePodAgent):
                 if v is not None:
                     sections.append(f"  {k}: {v}")
         sections.append(f"  Macro outlook: {features.get('macro_outlook', 'unknown')}")
+        regime = features.get("regime") or self._ns.get("market_regime") or {}
+        if regime:
+            sections.append(f"\n## Market Regime: {regime.get('label', 'Unknown')}")
+            sections.append(f"  {regime.get('description', '')}")
+            sections.append(f"  Position sizing multiplier: {regime.get('scale', 1.0):.1f}x")
 
         rate_table = features.get("global_rate_table", {})
         if rate_table:
@@ -371,11 +381,23 @@ class CommoditiesPMAgent(BasePodAgent):
         else:
             sections.append("  No headlines available")
 
+        track_record = trade_track_record or self._ns.get("trade_track_record") or ""
+        if track_record and track_record != "No closed trades yet.":
+            sections.append(f"\n## Trade Track Record\n{track_record}")
+
+        signal_quality = self._ns.get("signal_quality") or ""
+        if signal_quality:
+            sections.append(f"\n## Signal Quality\n{signal_quality}")
+
+        firm_memo = self._ns.get("firm_memo") or ""
+        if firm_memo:
+            sections.append(f"\n## Firm Intelligence\n{firm_memo}")
+
         sections.append(f"\n## Current Positions\n  {positions}")
         sections.append(f"\n## Universe (commodity ETFs)\n  {universe[:20]}")
 
         user_content = "\n".join(sections)
-        user_content += '\n\nBased on ALL the above data, propose 0-3 commodity ETF trades or HOLD.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
+        user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 commodity ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
 
         try:
             raw = llm_chat(
@@ -418,6 +440,15 @@ class CommoditiesPMAgent(BasePodAgent):
                     logger.warning("[commodities.pm] Invalid trade proposal skipped: %s — %s", t, ve)
             parsed_trades = validated_trades
 
+            signal_snap = {}
+            fred = features.get("fred_indicators", {})
+            if fred.get("VIXCLS") is not None:
+                signal_snap["vix"] = fred["VIXCLS"]
+            if fred.get("T10Y2Y") is not None:
+                signal_snap["yield_curve"] = fred["T10Y2Y"]
+            if features.get("macro_outlook"):
+                signal_snap["macro_outlook"] = features["macro_outlook"]
+
             action_parts = []
             for t in parsed_trades:
                 action_parts.append(f"{t.get('action','')} {t.get('qty',0)} {t.get('symbol','')}")
@@ -427,6 +458,7 @@ class CommoditiesPMAgent(BasePodAgent):
                 "trades": parsed_trades[:10],
                 "reasoning": response_text or "",
                 "action_summary": action_summary[:500],
+                "signal_snapshot": signal_snap,
             })
 
             self._decision_history.append({
@@ -454,6 +486,7 @@ class CommoditiesPMAgent(BasePodAgent):
                     continue
                 side = Side.BUY if action == "BUY" else Side.SELL
                 reasoning = t.get("reasoning", "")
+                conviction = max(0.0, min(1.0, float(t.get("conviction", 0.5))))
                 qty, clamp_note = self._apply_sizing_discipline(
                     qty, symbol, side, sizing, cycle_notional_used,
                 )
@@ -467,10 +500,11 @@ class CommoditiesPMAgent(BasePodAgent):
                     side=side, order_type=OrderType.MARKET, quantity=qty,
                     limit_price=None, timestamp=datetime.now(timezone.utc),
                     strategy_tag=f"llm_commodities_{action.lower()}",
+                    conviction=conviction,
                 )
                 orders.append(order)
                 log_suffix = f" [{clamp_note}]" if clamp_note else ""
-                logger.info("[commodities.pm] LLM: %s %s %.2f (%s)%s", action, symbol, qty, reasoning, log_suffix)
+                logger.info("[commodities.pm] LLM: %s %s %.2f conv=%.1f (%s)%s", action, symbol, qty, conviction, reasoning, log_suffix)
 
             if not orders:
                 return {}

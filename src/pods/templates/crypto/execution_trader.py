@@ -217,12 +217,17 @@ class CryptoExecutionTrader(BasePodAgent):
                 accountant = self._ns.get("accountant")
                 if accountant:
                     signed_qty = result.fill_qty if order.side == Side.BUY else -result.fill_qty
+                    pm_meta = self._ns.get("pm_trade_metadata") or {}
                     accountant.record_fill_direct(
                         order_id=result.order_id or "",
                         symbol=order.symbol,
                         qty=signed_qty,
                         fill_price=result.fill_price or 0.0,
                         filled_at=result.filled_at,
+                        reasoning=pm_meta.get("reasoning", ""),
+                        strategy_tag=pm_meta.get("strategy_tag", order.strategy_tag),
+                        signal_snapshot=pm_meta.get("signal_snapshot"),
+                        conviction=pm_meta.get("conviction", order.conviction),
                     )
 
                 try:
@@ -248,6 +253,7 @@ class CryptoExecutionTrader(BasePodAgent):
 
             # Log trade to SessionLogger if available and order was filled
             if self._session_logger and result.status in ("FILLED", "PARTIAL"):
+                pm_meta = self._ns.get("pm_trade_metadata") or {}
                 self._session_logger.log_trade(
                     pod_id=self._pod_id,
                     order_info={
@@ -263,6 +269,9 @@ class CryptoExecutionTrader(BasePodAgent):
                             else datetime.now().isoformat()
                         ),
                         "status": result.status,
+                        "reasoning": pm_meta.get("reasoning", ""),
+                        "conviction": pm_meta.get("conviction", 0.5),
+                        "strategy_tag": pm_meta.get("strategy_tag", ""),
                     },
                 )
 

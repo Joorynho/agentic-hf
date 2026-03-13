@@ -18,10 +18,13 @@ _CIO_REVIEW_SYSTEM = """You are the Chief Investment Officer at an institutional
 You are conducting a DAILY POSITION REVIEW for the {pod_id} pod.
 
 Your job is to critically evaluate every open position. For each position, challenge the PM:
-- Is the original thesis still valid given current market conditions?
-- Has the risk/reward changed since entry?
+- Is the ORIGINAL ENTRY THESIS (shown below each position) still valid?
+- Has the risk/reward changed since entry? What specific data points invalidate the thesis?
 - Are there signs of thesis deterioration (adverse price action, changed macro, broken technicals)?
 - Should size be adjusted given conviction level and portfolio context?
+
+PAY ATTENTION to the entry thesis — the PM must defend WHY the original reason for the trade
+is still valid, not just that the position is profitable.
 
 Be specific and demanding. Reference the actual P&L, cost basis, and current price.
 Do NOT rubber-stamp positions. A good CIO kills bad ideas early."""
@@ -30,10 +33,13 @@ _PM_DEFEND_SYSTEM = """You are the Portfolio Manager for the {pod_id} pod.
 The CIO is conducting a daily position review and challenging your holdings.
 
 For EACH position, you must respond with one of:
-- HOLD: Position thesis remains valid. Explain WHY with current data.
-- ADD: Increase size. State the qty to add and the catalyst/thesis strengthening.
-- TRIM: Reduce size. State the qty to sell and the reason (reduced conviction, risk management, take profits).
-- EXIT: Close entirely. Explain what changed.
+- HOLD: The ORIGINAL ENTRY THESIS is still valid. Explain WHY with current data.
+- ADD: Thesis is strengthening. State the qty to add and the new catalyst.
+- TRIM: Thesis is weakening or risk/reward changed. State the qty to sell.
+- EXIT: Original thesis is invalidated. Explain what changed since entry.
+
+Reference your original entry thesis (shown with each position) and explain
+whether it is still valid or has been invalidated by new information.
 
 Be honest. If a position has deteriorated, admit it and recommend EXIT or TRIM.
 Do NOT defend losers out of ego. A good PM cuts losses and lets winners run.
@@ -108,10 +114,13 @@ class PositionReviewer:
         pos_lines = []
         for sym, snap in positions.items():
             pnl_pct = ((snap.current_price - snap.cost_basis) / snap.cost_basis * 100) if snap.cost_basis else 0
-            pos_lines.append(
+            line = (
                 f"  {sym}: qty={snap.qty:.4f}, cost=${snap.cost_basis:.2f}, "
                 f"current=${snap.current_price:.2f}, P&L=${snap.unrealized_pnl:+.2f} ({pnl_pct:+.1f}%)"
             )
+            if snap.entry_thesis:
+                line += f"\n    Entry thesis ({snap.entry_date}): {snap.entry_thesis}"
+            pos_lines.append(line)
         positions_text = "\n".join(pos_lines)
 
         # --- Step 1: CIO challenges PM ---
