@@ -7,7 +7,6 @@ from src.core.models.execution import Order
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
-_HAS_LLM = has_llm_key()
 BASE_QTY = 50.0
 SIGNAL_THRESHOLD = 0.5
 MAX_HOLD_BARS = 5
@@ -47,7 +46,7 @@ class DeltaPMAgent(BasePodAgent):
         if composite < SIGNAL_THRESHOLD:
             return {}
 
-        if _HAS_LLM:
+        if has_llm_key():
             return await self._llm_decision(composite, bar)
         return self._rule_based_decision(composite, bar)
 

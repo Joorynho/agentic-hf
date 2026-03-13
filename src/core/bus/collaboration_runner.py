@@ -55,7 +55,10 @@ class CollaborationRunner:
             for agent in participants:
                 if agent.agent_id == current_message.sender:
                     continue
-                response = await agent.handle_governance_message(current_message)
+                try:
+                    response = await agent.handle_governance_message(current_message, history=list(loop.messages))
+                except TypeError:
+                    response = await agent.handle_governance_message(current_message)
                 if response is not None:
                     responses.append(response)
                     loop.messages.append(response)

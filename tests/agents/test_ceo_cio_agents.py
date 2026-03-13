@@ -64,7 +64,9 @@ async def test_ceo_rule_based_mandate(bus, monkeypatch):
     assert mandate.narrative != ""
 
 
-async def test_ceo_governance_message_cio_proposal(bus):
+async def test_ceo_governance_message_cio_proposal(bus, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     ceo = CEOAgent(bus)
     msg = AgentMessage(
         timestamp=datetime.now(timezone.utc),
@@ -76,7 +78,9 @@ async def test_ceo_governance_message_cio_proposal(bus):
     assert response.payload["consensus"] is True
 
 
-async def test_ceo_unknown_message_returns_none(bus):
+async def test_ceo_unknown_message_returns_none(bus, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     ceo = CEOAgent(bus)
     msg = AgentMessage(
         timestamp=datetime.now(timezone.utc),
@@ -122,7 +126,9 @@ async def test_cio_rule_based_corrects_drift(bus, allocator, monkeypatch):
     assert all(abs(r.new_pct - target) < 0.01 for r in records)
 
 
-async def test_cio_governance_pod_pm_counter(bus, allocator):
+async def test_cio_governance_pod_pm_counter(bus, allocator, monkeypatch):
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     cio = CIOAgent(bus, allocator)
     msg = AgentMessage(
         timestamp=datetime.now(timezone.utc),

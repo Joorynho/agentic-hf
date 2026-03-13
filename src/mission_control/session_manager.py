@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ load_dotenv(str(_env_path))
 from src.agents.ceo.ceo_agent import CEOAgent
 from src.agents.cio.cio_agent import CIOAgent
 from src.agents.governance.governance_orchestrator import GovernanceOrchestrator
+from src.agents.governance.position_reviewer import PositionReviewer
 from src.agents.risk.cro_agent import CROAgent
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
@@ -167,6 +169,7 @@ class SessionManager:
         self._risk_halt: bool = False
         self._risk_halt_reason: Optional[str] = None
         self._governance_decisions: list = []
+        self._restored_memory: dict | None = None
 
         # Web server state
         self._web_app = None
@@ -178,6 +181,11 @@ class SessionManager:
         self._iteration = 0
         self._restartable = False
         self._stop_in_progress = False
+
+        # Position review state
+        self._position_reviewer: PositionReviewer | None = None
+        self._last_review_date: str | None = None
+        self._reports_dir = str(Path(__file__).parent.parent.parent / "reports")
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
@@ -399,6 +407,7 @@ class SessionManager:
             ceo = CEOAgent(bus=self._event_bus, session_logger=self._session_logger)
             cio = CIOAgent(bus=self._event_bus, allocator=self._allocator, session_logger=self._session_logger)
             cro = CROAgent(bus=self._event_bus)
+            self._cio_agent = cio
             self._governance = GovernanceOrchestrator(
                 ceo=ceo,
                 cio=cio,
@@ -406,6 +415,14 @@ class SessionManager:
                 session_logger=self._session_logger,
             )
             logger.info("[session_manager] GovernanceOrchestrator initialized: CEO, CIO, CRO")
+
+            # Initialize PositionReviewer for daily position reviews
+            self._position_reviewer = PositionReviewer(
+                event_bus=self._event_bus,
+                session_logger=self._session_logger,
+            )
+            os.makedirs(self._reports_dir, exist_ok=True)
+            logger.info("[session_manager] PositionReviewer initialized, reports dir: %s", self._reports_dir)
 
             # Fetch initial market snapshot (small sample across all pods)
             sample_symbols = ["SPY", "QQQ", "GLD", "BTC/USD", "UUP"]
@@ -422,6 +439,16 @@ class SessionManager:
             self._session_active = True
             logger.info("[session_manager] Session started: %d pods × $%.2f = $%.2f total capital",
                        len(POD_IDS), capital_per_pod, total_capital)
+
+            # Hydrate accountants from Alpaca (source of truth for live positions)
+            await self._hydrate_from_alpaca()
+
+            # Restore trade history + governance from previous session
+            self._restored_memory = self._load_memory()
+            if self._restored_memory and self._web_app:
+                lsnr = getattr(self._web_app.state, "listener", None)
+                if lsnr:
+                    lsnr.inject_restored_memory(self._restored_memory)
 
         except Exception as exc:
             logger.error("[session_manager] Failed to start session: %s", exc)
@@ -447,6 +474,42 @@ class SessionManager:
         except Exception as e:
             logger.error("[session_manager] Failed to start web server: %s", e)
             # Don't raise; allow session to continue without web server
+
+    def _build_pod_intelligence_briefs(self, pod_summaries: dict[str, PodSummary]) -> dict[str, dict]:
+        """Build intelligence briefs from each pod's namespace for CIO context."""
+        briefs: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            brief: dict = {}
+            ns = runtime._ns if hasattr(runtime, "_ns") else None
+            if ns:
+                features = ns.get("features") or {}
+                brief["macro_regime"] = features.get("macro_outlook", "unknown")
+                poly = features.get("polymarket_predictions", [])
+                brief["top_signals"] = [
+                    f"{p.get('question','?')} → {p.get('probability',0)*100:.0f}%"
+                    for p in (poly[:5] if poly else [])
+                ]
+                fred = features.get("fred_indicators", {})
+                if fred:
+                    brief["fred_highlights"] = ", ".join(
+                        f"{k}={v}" for k, v in list(fred.items())[:6] if v is not None
+                    )
+
+            summary = pod_summaries.get(pod_id)
+            if summary and summary.positions:
+                brief["key_positions"] = [
+                    f"{p.symbol}: qty={p.qty:.2f}, notional=${p.notional:,.0f}, pnl=${p.unrealized_pnl:+,.2f}"
+                    for p in summary.positions[:5]
+                ]
+
+            # Cross-pod conflict check (injected per pod)
+            if hasattr(self._governance, "check_cross_pod_conflicts"):
+                conflicts = self._governance.check_cross_pod_conflicts(pod_summaries)
+                if conflicts:
+                    brief["cross_pod_conflicts"] = conflicts
+
+            briefs[pod_id] = brief
+        return briefs
 
     async def _update_web_state(self, pod_summaries: dict[str, PodSummary]) -> None:
         """Update web server state with latest pod summaries and governance info.
@@ -527,8 +590,11 @@ class SessionManager:
                             risk_halt_reason=self._risk_halt_reason,
                         )
 
-                    # 2. Run researcher cycles for all pods (so they can update universe)
-                    for pod_id, runtime in self._pod_runtimes.items():
+                    # 1.5 Daily position review (fires once per calendar day)
+                    await self._maybe_run_position_review()
+
+                    # 2. Run researcher cycles for all pods IN PARALLEL
+                    async def _run_researcher(pod_id: str, runtime):
                         try:
                             researcher = runtime._researcher
                             if researcher:
@@ -543,6 +609,10 @@ class SessionManager:
                                 "[session_manager] [iter %d] %s researcher failed: %s",
                                 self._iteration, pod_id, e,
                             )
+
+                    await asyncio.gather(
+                        *[_run_researcher(pid, rt) for pid, rt in self._pod_runtimes.items()]
+                    )
 
                     # 3. Update gateway universes from namespace
                     for pod_id, gateway in self._pod_gateways.items():
@@ -593,7 +663,7 @@ class SessionManager:
                         if bar is None:
                             continue
                         try:
-                            await runtime.run_cycle(bar)
+                            await runtime.run_cycle(bar, skip_researcher=True)
                             logger.info("[session_manager] [iter %d] Pod %s: agent cycle complete", self._iteration, pod_id)
 
                             # Publish PM decision activity for live intelligence feed
@@ -616,8 +686,8 @@ class SessionManager:
                                         "agent_role": "PM",
                                         "pod_id": pod_id,
                                         "action": "trade_decision",
-                                        "summary": f"{pod_id.upper()} PM: {summary_text}"[:200],
-                                        "detail": detail_text[:500],
+                                        "summary": f"{pod_id.upper()} PM: {summary_text}"[:500],
+                                        "detail": detail_text,
                                     },
                                 )
                                 await self._event_bus.publish("agent.activity", activity_msg, publisher_id=f"{pod_id}.pm")
@@ -684,6 +754,11 @@ class SessionManager:
                     # 6. Every N iterations: run governance cycle
                     if self._iteration > 0 and self._iteration % governance_freq == 0:
                         try:
+                            # Inject pod intelligence briefs to CIO before governance
+                            if hasattr(self, "_cio_agent") and self._cio_agent:
+                                pod_briefs = self._build_pod_intelligence_briefs(pod_summaries)
+                                self._cio_agent.set_pod_intelligence(pod_briefs)
+
                             logger.info("[session_manager] [iter %d] Running governance cycle", self._iteration)
                             governance_result = await self._governance.run_full_cycle(pod_summaries)
 
@@ -755,7 +830,7 @@ class SessionManager:
                                         "agent_role": "CRO",
                                         "pod_id": "firm",
                                         "action": "governance_cycle",
-                                        "summary": gov_summary[:200],
+                                        "summary": gov_summary[:500],
                                         "detail": "",
                                     },
                                 )
@@ -784,7 +859,10 @@ class SessionManager:
 
                         await self._reconcile_positions()
 
-                    # 8. Sleep
+                    # 8. Persist session state to disk
+                    self._save_memory()
+
+                    # 9. Sleep
                     await asyncio.sleep(interval_seconds)
 
                 except asyncio.CancelledError:
@@ -797,6 +875,145 @@ class SessionManager:
 
         finally:
             await self.stop_session()
+
+    async def _maybe_run_position_review(self) -> None:
+        """Run position review if the date has changed since last review."""
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if today == self._last_review_date:
+            return
+
+        if not self._position_reviewer:
+            return
+
+        # Check if any pod has open positions
+        pod_accountants = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            if acct and acct.current_positions:
+                pod_accountants[pod_id] = acct
+
+        if not pod_accountants:
+            logger.info("[session_manager] No open positions — skipping daily review")
+            self._last_review_date = today
+            return
+
+        logger.info("[session_manager] Running daily position review for %d pod(s)", len(pod_accountants))
+
+        try:
+            review_result = await self._position_reviewer.run_review(
+                pod_runtimes=self._pod_runtimes,
+                pod_accountants=pod_accountants,
+            )
+
+            if not review_result.get("reviewed"):
+                self._last_review_date = today
+                return
+
+            # Execute agreed actions through risk pipeline
+            for pod_id, pod_result in review_result.get("pods", {}).items():
+                actions = pod_result.get("actions", [])
+                if not actions:
+                    continue
+                orders = self._position_reviewer.build_orders(actions, pod_id)
+                if orders:
+                    runtime = self._pod_runtimes.get(pod_id)
+                    if runtime:
+                        exec_results = await runtime.execute_review_orders(orders)
+                        logger.info("[session_manager] Review orders for %s: %s", pod_id, exec_results)
+
+            # Generate report
+            await self._generate_review_report(review_result)
+
+            self._last_review_date = today
+            logger.info("[session_manager] Daily position review complete")
+
+        except Exception as e:
+            logger.error("[session_manager] Position review failed: %s", e, exc_info=True)
+            self._last_review_date = today
+
+    async def _generate_review_report(self, review_result: dict) -> None:
+        """Generate an HTML report after position review and save to reports dir."""
+        try:
+            from src.reports.daily_report import DailyReportGenerator
+
+            pods_data = {}
+            for pid, runtime in self._pod_runtimes.items():
+                try:
+                    summary = await runtime.get_summary()
+                    pods_data[pid] = summary.model_dump(mode="json") if hasattr(summary, "model_dump") else {}
+                except Exception:
+                    pods_data[pid] = {}
+
+            # Build review dialogue list for the report
+            review_dialogue = []
+            for pod_id, pod_result in review_result.get("pods", {}).items():
+                if isinstance(pod_result, dict) and "error" not in pod_result:
+                    review_dialogue.append({
+                        "pod_id": pod_id,
+                        "positions_reviewed": pod_result.get("positions_reviewed", 0),
+                        "cio_challenge": pod_result.get("cio_challenge", ""),
+                        "pm_response": pod_result.get("pm_response", ""),
+                        "cio_decisions": pod_result.get("cio_decisions", ""),
+                        "actions": pod_result.get("actions", []),
+                        "summary": pod_result.get("summary", ""),
+                    })
+
+            report_html = DailyReportGenerator().generate(
+                session_dir=self._session_logger.session_dir if self._session_logger else "",
+                session_start=getattr(self, "_session_start", None),
+                session_end=datetime.now(),
+                pods_data=pods_data,
+                trades=self._session_logger._fill_log if self._session_logger else [],
+                governance=getattr(self, "_governance_decisions", []),
+                firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
+                initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
+                review_dialogue=review_dialogue,
+            )
+
+            # Save report
+            os.makedirs(self._reports_dir, exist_ok=True)
+            filename = f"review_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+            filepath = os.path.join(self._reports_dir, filename)
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(report_html)
+            logger.info("[session_manager] Review report saved: %s", filepath)
+
+            # Prune old reports (keep max 5)
+            report_files = sorted(
+                Path(self._reports_dir).glob("review_*.html"),
+                key=lambda f: f.stat().st_mtime,
+                reverse=True,
+            )
+            for old_file in report_files[5:]:
+                try:
+                    old_file.unlink()
+                    logger.info("[session_manager] Pruned old report: %s", old_file.name)
+                except Exception:
+                    pass
+
+            # Broadcast new report event via WebSocket
+            try:
+                report_msg = AgentMessage(
+                    timestamp=datetime.now(timezone.utc),
+                    sender="reports",
+                    recipient="dashboard",
+                    topic="agent.activity",
+                    payload={
+                        "agent_id": "reports",
+                        "agent_role": "SYSTEM",
+                        "pod_id": "firm",
+                        "action": "new_report",
+                        "summary": f"Position review report generated: {filename}",
+                        "detail": "",
+                        "filename": filename,
+                    },
+                )
+                await self._event_bus.publish("agent.activity", report_msg, publisher_id="reports")
+            except Exception:
+                pass
+
+        except Exception as e:
+            logger.warning("[session_manager] Review report generation failed: %s", e)
 
     async def publish_pod_summary(self, pod_id: str, summary: dict) -> None:
         """Publish pod summary to EventBus for TUI consumption.
@@ -877,6 +1094,192 @@ class SessionManager:
         except Exception as e:
             logger.debug("[reconcile] Stale order cleanup skipped: %s", e)
 
+    # ── Session memory persistence ────────────────────────────────────────
+
+    _MEMORY_DIR = Path(__file__).parent.parent.parent / "data"
+    _MEMORY_JSON = _MEMORY_DIR / "memory.json"
+    _MEMORY_MD = _MEMORY_DIR / "memory.md"
+
+    def _load_memory(self) -> dict | None:
+        """Load previous session state from data/memory.json if it exists."""
+        if not self._MEMORY_JSON.exists():
+            return None
+        try:
+            raw = self._MEMORY_JSON.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            logger.info("[session_manager] Loaded memory: %d trades, %d governance decisions",
+                        len(data.get("trades", [])), len(data.get("governance", [])))
+            return data
+        except Exception as e:
+            logger.warning("[session_manager] Failed to load memory.json: %s", e)
+            return None
+
+    def _save_memory(self) -> None:
+        """Persist session state to data/memory.json and data/memory.md."""
+        try:
+            self._MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+
+            pods_state: dict[str, dict] = {}
+            for pod_id, runtime in self._pod_runtimes.items():
+                acct = runtime._ns.get("accountant")
+                if acct:
+                    pods_state[pod_id] = acct.to_state_dict()
+
+            trades: list[dict] = []
+            if self._session_logger and hasattr(self._session_logger, "_fill_log"):
+                for t in self._session_logger._fill_log:
+                    trade = dict(t)
+                    for k, v in trade.items():
+                        if isinstance(v, datetime):
+                            trade[k] = v.isoformat()
+                    trades.append(trade)
+
+            # Merge with previously loaded trades to preserve cross-session history
+            prev = self._restored_memory or {}
+            prev_trades = prev.get("trades", [])
+            seen_ids = {t.get("order_id") for t in trades if t.get("order_id")}
+            for pt in prev_trades:
+                if pt.get("order_id") and pt["order_id"] not in seen_ids:
+                    trades.insert(0, pt)
+            trades = trades[-200:]  # cap at 200 entries
+
+            governance: list[dict] = []
+            for g in getattr(self, "_governance_decisions", []):
+                entry = dict(g) if isinstance(g, dict) else {}
+                for k, v in entry.items():
+                    if isinstance(v, datetime):
+                        entry[k] = v.isoformat()
+                governance.append(entry)
+            governance = governance[-50:]
+
+            total_nav = sum(ps.get("nav", 0) for ps in pods_state.values())
+            total_capital = sum(ps.get("starting_capital", 0) for ps in pods_state.values())
+
+            memory = {
+                "last_updated": datetime.now(timezone.utc).isoformat(),
+                "session_start": self._session_start.isoformat() if self._session_start else None,
+                "iteration": self._iteration,
+                "firm": {
+                    "total_nav": round(total_nav, 4),
+                    "total_pnl": round(total_nav - total_capital, 4),
+                    "initial_capital": round(total_capital, 4),
+                },
+                "pods": pods_state,
+                "trades": trades,
+                "governance": governance,
+            }
+
+            self._MEMORY_JSON.write_text(
+                json.dumps(memory, indent=2, default=str), encoding="utf-8"
+            )
+
+            # Human-readable markdown summary
+            md_lines = [
+                f"# Session Memory",
+                f"",
+                f"**Last updated:** {memory['last_updated']}",
+                f"**Iteration:** {self._iteration}",
+                f"",
+                f"## Firm Summary",
+                f"",
+                f"| Metric | Value |",
+                f"|--------|-------|",
+                f"| Total NAV | ${total_nav:.2f} |",
+                f"| Total P&L | ${total_nav - total_capital:+.2f} |",
+                f"| Initial Capital | ${total_capital:.2f} |",
+                f"",
+                f"## Pod Positions",
+                f"",
+            ]
+            for pod_id, ps in pods_state.items():
+                md_lines.append(f"### {pod_id.upper()}")
+                md_lines.append(f"")
+                md_lines.append(f"NAV: ${ps.get('nav', 0):.2f} | P&L: ${ps.get('daily_pnl', 0):+.2f}")
+                md_lines.append(f"")
+                positions = ps.get("positions", [])
+                if positions:
+                    md_lines.append(f"| Symbol | Qty | Avg Entry | Current | Unrl P&L |")
+                    md_lines.append(f"|--------|-----|-----------|---------|----------|")
+                    for p in positions:
+                        curr = p.get("current_price", p["avg_entry"])
+                        pnl = p["qty"] * (curr - p["avg_entry"])
+                        md_lines.append(
+                            f"| {p['symbol']} | {p['qty']:.2f} | ${p['avg_entry']:.2f} "
+                            f"| ${curr:.2f} | ${pnl:+.2f} |"
+                        )
+                else:
+                    md_lines.append("_No open positions_")
+                md_lines.append("")
+
+            if trades:
+                md_lines.append("## Recent Trades (last 20)")
+                md_lines.append("")
+                md_lines.append("| Time | Pod | Symbol | Side | Qty | Price |")
+                md_lines.append("|------|-----|--------|------|-----|-------|")
+                for t in trades[-20:]:
+                    md_lines.append(
+                        f"| {t.get('timestamp', '—')[:19]} | {t.get('pod_id', '—')} "
+                        f"| {t.get('symbol', '—')} | {t.get('side', '—')} "
+                        f"| {t.get('qty', '—')} | ${t.get('filled_price') or t.get('fill_price') or 0:.2f} |"
+                    )
+                md_lines.append("")
+
+            self._MEMORY_MD.write_text("\n".join(md_lines), encoding="utf-8")
+            logger.debug("[session_manager] Memory saved: %d pods, %d trades", len(pods_state), len(trades))
+        except Exception as e:
+            logger.warning("[session_manager] Failed to save memory: %s", e)
+
+    async def _hydrate_from_alpaca(self) -> None:
+        """Load real positions from Alpaca and inject into pod accountants."""
+        try:
+            positions = await self._alpaca.get_open_positions()
+            if not positions:
+                logger.info("[session_manager] Alpaca: no open positions to hydrate")
+                return
+
+            account = await self._alpaca.fetch_account()
+            logger.info("[session_manager] Hydrating from Alpaca: %d positions, equity=$%.2f",
+                        len(positions), account.get("equity", 0))
+
+            pod_universes: dict[str, set[str]] = {}
+            for pod_id in self._pod_runtimes:
+                ns = self._pod_runtimes[pod_id]._ns
+                universe = ns.get("universe") or POD_UNIVERSES.get(pod_id, [])
+                pod_universes[pod_id] = set(universe)
+
+            for symbol, pos_data in positions.items():
+                target_pod = None
+                for pod_id, universe in pod_universes.items():
+                    if symbol in universe:
+                        target_pod = pod_id
+                        break
+                if target_pod is None:
+                    for pod_id in self._pod_runtimes:
+                        target_pod = pod_id
+                        break
+
+                if target_pod and target_pod in self._pod_runtimes:
+                    acct = self._pod_runtimes[target_pod]._ns.get("accountant")
+                    if acct:
+                        acct.load_positions([{
+                            "symbol": symbol,
+                            "qty": pos_data["qty"],
+                            "avg_entry": pos_data["entry_price"],
+                            "current_price": pos_data["current_price"],
+                        }])
+                        # Ensure held symbols are in the pod universe so bars are fetched
+                        ns = self._pod_runtimes[target_pod]._ns
+                        current_universe = ns.get("universe") or list(POD_UNIVERSES.get(target_pod, []))
+                        if symbol not in current_universe:
+                            current_universe.append(symbol)
+                            ns.set("universe", current_universe)
+                            logger.info("[session_manager] Added %s to %s universe (held position)", symbol, target_pod)
+                        logger.info("[session_manager] Hydrated %s: %s %.2f @ $%.2f -> pod %s",
+                                    symbol, "LONG" if pos_data["qty"] > 0 else "SHORT",
+                                    abs(pos_data["qty"]), pos_data["entry_price"], target_pod)
+        except Exception as e:
+            logger.warning("[session_manager] Alpaca hydration failed (non-fatal): %s", e)
+
     async def stop_session(self) -> dict:
         """Stop event loop and gracefully shut down all pods.
 
@@ -888,6 +1291,9 @@ class SessionManager:
         self._stop_in_progress = True
         logger.info("[session_manager] Stopping live session")
         self._session_active = False
+
+        # Persist final state before shutdown
+        self._save_memory()
 
         # Give current iteration time to complete
         await asyncio.sleep(0.5)

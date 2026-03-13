@@ -132,6 +132,10 @@ class PortfolioAccountant:
             f"[{self._pod_id}] Fill recorded: {symbol} {qty:+.1f} @ ${fill_price:.2f}"
         )
 
+    def get_last_price(self, symbol: str, default: float = 0.0) -> float:
+        """Get the most recent market price for a symbol from bar data."""
+        return self._last_price.get(symbol, default)
+
     def _update_last_price(self, symbol: str, price: float) -> None:
         """Update market price for symbol (called during bar push)."""
         self._last_price[symbol] = price
@@ -230,3 +234,51 @@ class PortfolioAccountant:
 
     def all_positions(self) -> list[Position]:
         return [self.get_position(s) for s in self._positions if self.get_position(s)]
+
+    # ── Persistence helpers ──────────────────────────────────────────────
+
+    def to_state_dict(self) -> dict:
+        """Serialize accountant state for JSON persistence."""
+        positions = []
+        for sym, pos in self._positions.items():
+            if pos["quantity"] != 0:
+                positions.append({
+                    "symbol": sym,
+                    "qty": pos["quantity"],
+                    "avg_entry": self._cost_basis.get(sym, pos["avg_cost"]),
+                    "current_price": self._last_price.get(sym, pos["avg_cost"]),
+                })
+        return {
+            "pod_id": self._pod_id,
+            "nav": round(self.nav, 4),
+            "starting_capital": self._starting_capital,
+            "daily_pnl": round(self.daily_pnl, 4),
+            "realized_pnl": round(self._realized_pnl, 4),
+            "cash": round(self._cash, 4),
+            "positions": positions,
+            "fills": len(self._fill_log),
+        }
+
+    def load_positions(self, positions: list[dict]) -> None:
+        """Inject positions from Alpaca or memory into the accountant.
+
+        Each dict must have: symbol, qty, avg_entry, current_price.
+        Call this BEFORE the first mark_to_market cycle.
+        """
+        for p in positions:
+            sym = p["symbol"]
+            qty = float(p["qty"])
+            avg_entry = float(p["avg_entry"])
+            current_price = float(p.get("current_price", avg_entry))
+            if qty == 0:
+                continue
+            self._positions[sym] = {
+                "quantity": qty,
+                "avg_cost": avg_entry,
+                "market_value": qty * current_price,
+                "unrealised_pnl": qty * (current_price - avg_entry),
+            }
+            self._cost_basis[sym] = avg_entry
+            self._last_price[sym] = current_price
+        if positions:
+            logger.info("[%s] Loaded %d positions from memory/Alpaca", self._pod_id, len(positions))

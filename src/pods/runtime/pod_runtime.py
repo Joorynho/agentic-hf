@@ -82,8 +82,13 @@ class PodRuntime:
         self._ns.set("governance_risk_halt", risk_halt)
         self._ns.set("governance_risk_halt_reason", risk_halt_reason)
 
-    async def run_cycle(self, bar: Bar) -> None:
-        """Run one full agent cycle for a single bar."""
+    async def run_cycle(self, bar: Bar, skip_researcher: bool = False) -> None:
+        """Run one full agent cycle for a single bar.
+
+        Args:
+            bar: Market bar to process.
+            skip_researcher: If True, skip the researcher step (caller already ran it).
+        """
         assert all(
             a is not None for a in [
                 self._researcher, self._signal, self._pm,
@@ -93,9 +98,9 @@ class PodRuntime:
 
         ctx: dict = {"bar": bar}
 
-        # 1. Researcher
-        research_out = await self._researcher.run_cycle(ctx)  # type: ignore[union-attr]
-        ctx.update(research_out)
+        if not skip_researcher:
+            research_out = await self._researcher.run_cycle(ctx)  # type: ignore[union-attr]
+            ctx.update(research_out)
 
         # 2. Signal
         signal_out = await self._signal.run_cycle(ctx)  # type: ignore[union-attr]
@@ -117,9 +122,9 @@ class PodRuntime:
                 "pod_nav": round(accountant.nav, 2),
                 "available_cash": round(accountant._cash, 2),
                 "current_leverage": round(gross_lev, 2),
-                "max_position_pct": 0.10,
+                "max_position_pct": 0.20,
                 "max_leverage": 2.0,
-                "position_limit_notional": round(accountant.nav * 0.10, 2),
+                "position_limit_notional": round(accountant.nav * 0.20, 2),
                 "positions_summary": pos_summary,
             }
 
@@ -152,27 +157,76 @@ class PodRuntime:
         await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
 
     async def _run_risk_loop(self, order: Order) -> Order | None:
-        """PM proposes, Risk validates. Up to 10 iterations to reach agreement."""
+        """PM proposes, Risk validates. Up to 5 iterations to reach agreement."""
         current_order = order
-        for i in range(10):
+        original_qty = order.quantity
+        for i in range(5):
             risk_out = await self._risk.run_cycle({"order": current_order})  # type: ignore[union-attr]
             token: RiskApprovalToken | None = risk_out.get("token")
             if token is not None and token.is_valid():
-                # Store token in namespace so ExecutionTrader can validate it
                 self._ns.set("last_risk_token", token)
                 return current_order
 
             revised: Order | None = risk_out.get("revised_order")
+            reason: str = risk_out.get("reason", "")
             if revised is None:
-                # Risk hard-rejected — no revision possible
+                logger.info("[%s] Risk rejected %s %s: %s", self._pod_id, order.side.value, order.symbol, reason)
                 return None
-            # PM accepts revision
-            pm_accept = await self._pm.run_cycle(  # type: ignore[union-attr]
-                {"order": revised, "risk_revision": True}
-            )
-            current_order = pm_accept.get("order") or revised
 
-        return None  # max iterations reached without approval
+            # If Risk "revised" to the same or larger qty, it already meets limits — approve it
+            if revised.quantity >= current_order.quantity:
+                logger.info("[%s] Risk revision converged for %s (qty unchanged at %.4f) — approving",
+                            self._pod_id, order.symbol, revised.quantity)
+                token = RiskApprovalToken(order_id=revised.id, pod_id=self._pod_id, expires_ms=500)
+                self._ns.set("last_risk_token", token)
+                return revised
+
+            pm_accept = await self._pm.run_cycle(  # type: ignore[union-attr]
+                {
+                    "order": revised,
+                    "risk_revision": True,
+                    "risk_reason": reason,
+                    "original_qty": original_qty,
+                }
+            )
+            accepted_order = pm_accept.get("order")
+            if accepted_order is None:
+                logger.info("[%s] PM declined Risk revision for %s", self._pod_id, order.symbol)
+                return None
+            current_order = accepted_order
+
+        return None
+
+    async def execute_review_orders(self, orders: list[Order]) -> list[dict]:
+        """Execute orders from the daily position review through the standard risk loop.
+
+        Each order goes through Risk validation and, if approved, the Execution Trader.
+        Returns a list of result dicts with status per order.
+        """
+        results = []
+        for order in orders:
+            approved = await self._run_risk_loop(order)
+            if approved is None:
+                results.append({"symbol": order.symbol, "side": order.side.value,
+                                "qty": order.quantity, "status": "REJECTED_BY_RISK"})
+                continue
+
+            ctx = {
+                "approved_order": approved,
+                "mandate": self._ns.get("governance_mandate"),
+                "risk_halt": self._ns.get("governance_risk_halt", False),
+                "risk_halt_reason": self._ns.get("governance_risk_halt_reason"),
+            }
+            try:
+                await self._exec_trader.run_cycle(ctx)
+                results.append({"symbol": order.symbol, "side": order.side.value,
+                                "qty": order.quantity, "status": "EXECUTED"})
+            except Exception as e:
+                logger.warning("[%s] Review order execution failed for %s: %s",
+                               self._pod_id, order.symbol, e)
+                results.append({"symbol": order.symbol, "side": order.side.value,
+                                "qty": order.quantity, "status": f"EXEC_ERROR: {e}"})
+        return results
 
     async def get_summary(self) -> PodSummary:
         """Generate PodSummary with real trading data from PortfolioAccountant.

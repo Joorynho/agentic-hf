@@ -57,6 +57,13 @@ data_cache/
 *.duckdb
 *.duckdb.wal
 
+# Session memory (persisted state)
+data/memory.json
+data/memory.md
+
+# Generated reports
+reports/
+
 # Logs
 *.log
 logs/

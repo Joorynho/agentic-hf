@@ -91,6 +91,7 @@ class EventBusListener:
             'last_pod_summaries': {},
             'recent_trades': [],
             'recent_governance': [],
+            'position_reviews': [],
             'recent_activity': [],
             'recent_orders': [],
         }
@@ -229,6 +230,18 @@ class EventBusListener:
             self._app_state['recent_activity'].insert(0, msg)
             if len(self._app_state['recent_activity']) > 50:
                 self._app_state['recent_activity'] = self._app_state['recent_activity'][:50]
+
+            action = (message.payload or {}).get("action", "")
+            if action.startswith("position_review") or action in ("review_started", "review_completed"):
+                review_msg = {
+                    "type": "position_review",
+                    "timestamp": message.timestamp.isoformat(),
+                    "data": message.payload,
+                }
+                await self.manager.broadcast(review_msg)
+                self._app_state['position_reviews'].append(review_msg)
+                if len(self._app_state['position_reviews']) > 100:
+                    self._app_state['position_reviews'] = self._app_state['position_reviews'][-100:]
         except Exception as e:
             logger.error("[web] Error broadcasting agent activity: %s", e)
 
@@ -247,6 +260,35 @@ class EventBusListener:
         except Exception as e:
             logger.error("[web] Error broadcasting order update: %s", e)
 
+    def inject_restored_memory(self, memory: dict) -> None:
+        """Pre-populate app state from restored session memory (called on startup)."""
+        trades = memory.get("trades", [])
+        for t in trades:
+            self._app_state['recent_trades'].append({
+                "type": "trade",
+                "timestamp": t.get("timestamp", ""),
+                "data": {
+                    "pod_id": t.get("pod_id", "unknown"),
+                    "symbol": t.get("symbol", ""),
+                    "side": t.get("side", ""),
+                    "qty": t.get("qty", 0),
+                    "fill_price": t.get("filled_price") or t.get("fill_price", 0),
+                    "order_id": t.get("order_id"),
+                    "status": "FILLED",
+                },
+            })
+        self._app_state['recent_trades'] = self._app_state['recent_trades'][-50:]
+
+        governance = memory.get("governance", [])
+        for g in governance:
+            self._app_state['recent_governance'].append({
+                "type": "governance",
+                "timestamp": g.get("ts", g.get("timestamp", "")),
+                "data": g,
+            })
+        self._app_state['recent_governance'] = self._app_state['recent_governance'][-20:]
+        logger.info("[web] Injected restored memory: %d trades, %d governance", len(trades), len(governance))
+
     def get_snapshot(self) -> dict:
         """Build a session snapshot for new WebSocket clients."""
         return {
@@ -257,6 +299,7 @@ class EventBusListener:
                 "recent_governance": self._app_state.get('recent_governance', [])[:10],
                 "recent_activity": self._app_state.get('recent_activity', [])[:20],
                 "recent_orders": self._app_state.get('recent_orders', [])[:30],
+                "position_reviews": self._app_state.get('position_reviews', []),
             },
         }
 
@@ -349,6 +392,7 @@ def create_app(
         nonlocal listener
         if app.state.event_bus:
             listener = EventBusListener(app.state.event_bus, manager)
+            app.state.listener = listener
             await listener.subscribe()
             logger.info("[web] App startup complete, EventBus listener subscribed")
 
@@ -498,6 +542,39 @@ def create_app(
         except Exception as exc:
             logger.error("[web] start_session failed: %s", exc)
             raise HTTPException(status_code=500, detail=str(exc))
+
+    # --- Reports endpoints ---
+    _reports_dir = Path(os.path.join(os.path.dirname(__file__), "../../reports")).resolve()
+    _reports_dir.mkdir(parents=True, exist_ok=True)
+
+    @app.get("/api/reports")
+    async def list_reports():
+        """List available daily reports (max 5, most recent first)."""
+        files = sorted(_reports_dir.glob("review_*.html"), key=lambda f: f.stat().st_mtime, reverse=True)[:5]
+        result = []
+        for f in files:
+            stat = f.stat()
+            result.append({
+                "filename": f.name,
+                "date": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                "size_kb": round(stat.st_size / 1024, 1),
+            })
+        return {"reports": result}
+
+    @app.get("/api/reports/{filename}")
+    async def download_report(filename: str):
+        """Download a specific report file."""
+        if ".." in filename or "/" in filename or "\\" in filename:
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        fpath = _reports_dir / filename
+        if not fpath.is_file():
+            raise HTTPException(status_code=404, detail="Report not found")
+        return FileResponse(
+            str(fpath),
+            media_type="text/html",
+            filename=filename,
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
 
     # WebSocket endpoint
     @app.websocket("/ws")

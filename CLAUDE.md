@@ -59,6 +59,7 @@ You are my Technical Co-Founder. Help me build a real, working product I can use
 - Keep me in control and in the loop at all times
 - Always question what could make this project fail and take solutions into account
 - When unsure, ask questions rather than guessing
+- Do not default to agreeing with me. Prioritize accuracy over agreement. If my statement is incorrect, misleading, or incomplete, challenge it and explain why using data, research, and logical reasoning. Always verify claims, provide evidence-based responses, and correct me when necessary. The goal is to arrive at the most accurate conclusion, not to validate opinions
 
 ---
 
@@ -154,33 +155,44 @@ You are my Technical Co-Founder. Help me build a real, working product I can use
 ## Project: Agentic Hedge Fund Platform
 
 ### Overview
-Multi-agent hedge fund simulation OS. 5 isolated strategy pods + firm-level governance agents (CEO, CIO, Risk). Backtest-first, paper trading in MVP4.
+Multi-agent hedge fund simulation OS. 4 isolated strategy pods (equities, fx, crypto, commodities) + firm-level governance agents (CEO, CIO, CRO). Each pod has 6 agents: researcher, signal, PM, risk, exec_trader, ops. Backtest engine, Alpaca paper trading, live web dashboard.
 
 ### Tech Stack
 - **Python 3.12.10** — `C:\Users\PW1868\AppData\Local\Programs\Python\Python312\python.exe`
 - **Pydantic v2** — all data models; use `model_dump(mode="json")` for JSON-safe serialization
 - **asyncio** — all agents and bus operations are async
 - **DuckDB** — audit log and state store
-- **Textual + Rich** — Mission Control TUI
-- **OpenRouter** — LLM provider for CEO/CIO/PM agents (OpenAI-compatible API). All calls go through `src/core/llm.py` which handles retry + model rotation across free-tier models
+- **Textual + Rich** — Mission Control TUI (legacy, still functional)
+- **OpenRouter / OpenAI** — LLM provider for CEO/CIO/PM agents. All calls go through `src/core/llm.py` which handles retry + model rotation. Falls back to OpenAI API if OpenRouter fails
 - **yfinance** — primary market data (no API key, free)
-- **FastAPI + WebSocket** — web dashboard (live data broadcast)
+- **Alpaca** — paper trading execution (API key required)
+- **FRED API** — 30 macro indicators including 7 international central bank rates
+- **FastAPI + WebSocket** — web dashboard (live data broadcast, session control)
 - **pytest + pytest-asyncio** — `asyncio_mode = "auto"` required in `pyproject.toml`
 
 ### Project Structure
 ```
-src/core/models/     # All Pydantic schemas (18 models)
-src/core/bus/        # EventBus + AuditLog (DuckDB)
-src/core/clock/      # SimulationClock (backtest replay)
-src/pods/base/       # PodNamespace + PodGateway (isolation boundary)
-src/data/            # yfinance adapter + Parquet cache
-src/execution/       # ExecutionAdapter ABC + PaperAdapter
-src/backtest/        # PortfolioAccountant + BacktestRunner
-src/agents/risk/     # RiskManager (rule-based, never LLM)
-src/pods/templates/  # Pod strategy implementations
-src/mission_control/ # Textual TUI
-tests/isolation/     # Critical: 5 isolation proof tests
-tests/integration/   # End-to-end MVP tests
+src/core/models/         # Pydantic schemas (Bar, Order, TradeProposal, PodSummary, etc.)
+src/core/bus/            # EventBus + AuditLog (DuckDB) + CollaborationRunner (multi-agent loops)
+src/core/clock/          # SimulationClock (backtest replay)
+src/core/config/         # Pod universes, scoring weights
+src/core/scoring.py      # Macro scoring (FRED, Polymarket, activity blend)
+src/core/llm.py          # LLM abstraction (OpenRouter + OpenAI fallback, model rotation)
+src/pods/base/           # PodNamespace + PodGateway (isolation boundary)
+src/pods/templates/      # Per-asset pod implementations (equities, fx, crypto, commodities, gamma, epsilon)
+src/data/adapters/       # FRED, Polymarket, GDELT, RSS, X, yfinance, Alpaca, price feeds
+src/data/cache/          # Parquet cache for market data
+src/execution/           # ExecutionAdapter ABC + PaperAdapter + AlpacaAdapter
+src/backtest/            # PortfolioAccountant + BacktestRunner
+src/agents/ceo/          # CEO agent (LLM-powered governance + rule-based fallback)
+src/agents/cio/          # CIO agent (LLM allocation + governance + intelligence briefs)
+src/agents/risk/         # CRO (rule-based risk limits) + RiskManager
+src/agents/governance/   # GovernanceOrchestrator + PositionReviewer (daily CIO-PM reviews)
+src/mission_control/     # SessionManager + Textual TUI + DataProvider
+src/web/                 # FastAPI server (REST + WebSocket + session control)
+web/dist/                # Dashboard frontend (HTML/JS/CSS, single-page app)
+tests/isolation/         # Pod isolation proof tests
+tests/integration/       # End-to-end MVP tests
 ```
 
 ### Import Pattern
@@ -199,12 +211,21 @@ from src.core.bus.event_bus import EventBus
 ### Running Tests
 ```bash
 cd "C:/Users/PW1868/Agentic HF"
-python -m pytest tests/ -v --tb=short        # full suite
+python -m pytest tests/ -v --tb=short        # full suite (~80s)
 python -m pytest tests/isolation/ -v         # isolation proofs only
 python -m pytest tests/integration/ -v       # end-to-end
 ```
+- `tests/conftest.py` auto-clears LLM API keys so all agents use rule-based mode (no network calls)
+- yfinance is mocked in backtest/data tests with synthetic bars
+- Never add `asyncio.sleep(>0.5s)` in tests — event loops use 10ms intervals
 
-### Running the TUI
+### Running the Web Dashboard
+```bash
+python run.py
+# Opens http://localhost:8000 — live dashboard with session control (start/stop/iterate)
+```
+
+### Running the TUI (legacy)
 ```bash
 python -m src.mission_control.tui.app
 # F1=Firm, F2=Pods, F8=Audit, Q=Quit
@@ -213,26 +234,31 @@ python -m src.mission_control.tui.app
 ### Known Gotchas
 - **DuckDB on Windows:** Holds exclusive file lock — always call `audit_log.close()` before `tempfile.TemporaryDirectory` cleanup or you'll get `PermissionError`
 - **Pydantic v2.11:** Access `model_fields` on the **class** not the instance — `MyModel.model_fields`, not `instance.model_fields`
-- **textual TUI:** Cannot be pytest-tested directly (requires a terminal). Use import smoke tests only: instantiate the widget and verify no errors
+- **textual TUI:** Cannot be pytest-tested directly (requires a terminal). Use import smoke tests only
 - **Windows git:** LF→CRLF conversion warnings on commit are harmless, can be ignored
-- **OpenRouter free-tier:** Free models are rate-limited aggressively. `src/core/llm.py` auto-rotates through 8 free models. Agents fall back to rule-based mode on total failure
-- **yfinance:** Rate limiting can occur with parallel fetches — Parquet cache is mandatory, not optional. Always pre-fetch before the backtest loop
+- **OpenRouter free-tier:** Free models are rate-limited aggressively. `src/core/llm.py` auto-rotates through 8 free models. Falls back to OpenAI API key if available, then rule-based mode
+- **yfinance:** Rate limiting can occur with parallel fetches — Parquet cache is mandatory, not optional
+- **FRED international rates:** Some central bank rate series (INTDSRJPM193N, RBATCTR, etc.) update with multi-month lag. Adapter uses wider observation window (2020+) for GLOBAL_RATE_MAP series
 - **Nitter (X scraper):** Completely non-functional as of 2026. Social feed uses direct news RSS feeds instead (see `src/data/adapters/x_adapter.py`)
+- **Session manager tests:** Always mock `runtime._researcher.run_cycle` in integration tests that call `run_event_loop()`. Unmocked researchers attempt real network calls (FRED, Polymarket, RSS) which cause 10x slowdown and flaky failures
+- **Test LLM isolation:** `tests/conftest.py` clears all API keys via `pytest_configure` (before imports). Never use module-level `_HAS_LLM = has_llm_key()` — it evaluates at import time and bypasses conftest. Always call `has_llm_key()` inside methods
+- **Test yfinance:** Always mock `YFinanceAdapter._fetch_sync` in tests. Real yfinance calls are slow (5-18s) and flaky. Use synthetic bars with midnight timestamps if ParquetCache will filter
 
 ### MVP Progress
-- **MVP1** ✅ Complete — single pod + event bus + backtest engine + TUI (46 tests passing)
-- **MVP2** ✅ Complete — all 5 pods + LLM agents (CEO/CIO/PM via OpenRouter) + web dashboard + Polymarket integration
-- **MVP3** ✅ Complete — GDELT + FRED (23 series) + RSS + social feed (news RSS) + pod researchers (Gamma/Delta/Epsilon). EDGAR and Reddit skipped.
-- **MVP4** 🔜 Execution hardening + Alpaca paper trading + accountant sync + dashboard execution tab
+- **MVP1** ✅ Complete — single pod + event bus + backtest engine + TUI
+- **MVP2** ✅ Complete — 4 asset pods + LLM agents (CEO/CIO/PM) + web dashboard + Polymarket
+- **MVP3** ✅ Complete — GDELT + FRED (30 series incl. 7 global central bank rates) + RSS + pod researchers
+- **MVP4** ✅ Complete — Alpaca paper trading + execution tab + order lifecycle + position sizing + accountant sync
+- **Post-MVP** ✅ Complete — Dashboard overhaul (10 tabs), agent intelligence upgrade (LLM governance, conversation history, position reviewer challenge round, CIO intelligence briefs, cross-pod conflict detection, PM rolling memory, TradeProposal schema validation), daily performance reviews + reports, dashboard tab consistency fixes
 
 ### External API Keys
 **NEVER hardcode API keys. Always load from `.env` via `python-dotenv` or `os.environ`.**
-- `OPENROUTER_API_KEY` — LLM provider for all agents (CEO, CIO, PM). Free-tier models available.
+- `OPENROUTER_API_KEY` — primary LLM provider for all agents (CEO, CIO, PM). Free-tier models available
+- `OPENAI_API_KEY` — fallback LLM provider, used when OpenRouter is unavailable or rate-limited
 - `OPENROUTER_MODEL` — optional model override (default: `google/gemma-3-27b-it:free`)
 - `POLYMARKET_API_KEY` — Polymarket prediction market data for pod researchers
-- `FRED_API_KEY` — Federal Reserve Economic Data (23 macro indicators)
-- `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` — Alpaca paper trading (MVP4)
-- `OPENAI_API_KEY` — legacy fallback, only used if `OPENROUTER_API_KEY` is not set
+- `FRED_API_KEY` — Federal Reserve Economic Data (30 macro indicators + global central bank rates)
+- `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` — Alpaca paper trading execution
 
 ### Polymarket Integration Notes
 - Use the **CLOB API** (`clob.polymarket.com`) for real-time market odds
@@ -241,6 +267,26 @@ python -m src.mission_control.tui.app
 - Treat Polymarket odds as a **research signal only** — never as the sole trigger for a trade
 - Pod isolation applies: each pod's researcher fetches and processes independently; signals stay in `PodNamespace`
 - Circuit breaker required: API downtime must not block pod operation
+
+### Web Dashboard Architecture
+- **Backend:** `src/web/server.py` (FastAPI) — REST API + WebSocket + session control endpoints
+- **Frontend:** `web/dist/` — single-page dashboard (vanilla JS, no build step)
+  - `index.html` — 10 tabs: Command, Intelligence, Research, Performance, Execution, Operations, Risk, Attribution, Macro Indicators, Reports
+  - `dashboard.js` — WebSocket handler, all rendering logic, FRED macro display
+  - `tower.js` — shared global state variables
+  - `motion.js` — animations and visual effects
+  - `styles.css` — full styling
+- **Data flow:** SessionManager → EventBus → EventBusListener → WebSocket broadcast → dashboard.js
+- **Session snapshot:** On WebSocket connect, sends full state (pod summaries with fred_snapshot, recent trades, governance, activity, orders)
+- **Research data:** `fred_snapshot`, `polymarket_signals`, `x_feed`, `macro_score` are injected into pod summaries and broadcast as enrichment messages
+
+### Agent Intelligence Architecture
+- **CollaborationRunner:** Multi-agent deliberation with full message history passed to each agent
+- **CEO/CIO:** LLM-powered governance responses with rule-based fallback (when no API key available)
+- **CRO:** Always rule-based — never LLM. Enforces hard risk limits
+- **PM agents:** LLM-driven with rolling 5-decision memory, live prices, date context, universe list. Output validated via `TradeProposal` Pydantic schema
+- **PositionReviewer:** Daily CIO-PM review cycle with optional challenge round (PM counter-argues if CIO overrides)
+- **CIO Intelligence Briefs:** Before governance, SessionManager builds per-pod briefs (macro regime, top signals, positions, FRED highlights, cross-pod conflicts) and injects them into CIO context
 
 ### Skill Usage in This Project
 - `superpowers:brainstorming` — before any new feature/phase

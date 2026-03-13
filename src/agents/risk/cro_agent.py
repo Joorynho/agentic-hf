@@ -125,8 +125,12 @@ class CROAgent:
         )
         await self._bus.publish("risk.alert", msg, publisher_id="risk_manager")
 
-    async def handle_governance_message(self, msg: AgentMessage) -> AgentMessage | None:
-        """Respond in governance loops. CRO provides hard constraint validation."""
+    async def handle_governance_message(self, msg: AgentMessage, history: list[AgentMessage] | None = None) -> AgentMessage | None:
+        """Respond in governance loops. CRO provides hard constraint validation.
+
+        CRO is always rule-based (architectural contract). The history parameter
+        is accepted for API compatibility but not used.
+        """
         action = msg.payload.get("action", "")
 
         if action in ("cio_proposal", "ceo_strategy"):

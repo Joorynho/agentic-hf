@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -47,6 +48,7 @@ class RssAdapter:
         self._cache: list[NewsItem] = []
         self._cache_ts: datetime | None = None
         self._seen_hashes: set[str] = set()
+        self._lock = asyncio.Lock()
 
     async def fetch_news(self) -> list[NewsItem]:
         """Return recent financial news items from configured RSS feeds."""
@@ -54,39 +56,59 @@ class RssAdapter:
         if self._cache_ts and (now - self._cache_ts) < CACHE_TTL:
             return list(self._cache)
 
+        async with self._lock:
+            # Re-check after acquiring lock (another caller may have populated cache)
+            now = datetime.now(timezone.utc)
+            if self._cache_ts and (now - self._cache_ts) < CACHE_TTL:
+                return list(self._cache)
+
+            try:
+                items = await asyncio.wait_for(
+                    asyncio.to_thread(self._fetch_all_sync), timeout=12.0
+                )
+                self._cache = items
+                self._cache_ts = now
+                logger.info("[rss] Fetched %d articles from %d feeds", len(items), len(self._feeds))
+                return list(items)
+            except asyncio.TimeoutError:
+                logger.info("[rss] Fetch timed out — returning cached results")
+                return list(self._cache)
+            except Exception as exc:
+                logger.info("[rss] Fetch failed (non-critical): %s", exc)
+                return list(self._cache)
+
+    def _fetch_one_feed(self, url: str) -> list[NewsItem]:
+        """Fetch a single RSS feed (called in parallel from thread pool)."""
+        import feedparser
+
+        items: list[NewsItem] = []
         try:
-            items = await asyncio.wait_for(
-                asyncio.to_thread(self._fetch_all_sync), timeout=12.0
-            )
-            self._cache = items
-            self._cache_ts = now
-            logger.info("[rss] Fetched %d articles from %d feeds", len(items), len(self._feeds))
-            return list(items)
-        except asyncio.TimeoutError:
-            logger.info("[rss] Fetch timed out — returning cached results")
-            return list(self._cache)
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:30]:
+                item = self._entry_to_newsitem(entry, url)
+                if item:
+                    items.append(item)
         except Exception as exc:
-            logger.info("[rss] Fetch failed (non-critical): %s", exc)
-            return list(self._cache)
+            logger.debug("[rss] Feed %s failed: %s", url, exc)
+        return items
 
     def _fetch_all_sync(self) -> list[NewsItem]:
         import socket
-        import feedparser
 
         all_items: list[NewsItem] = []
         old_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(8)
+        socket.setdefaulttimeout(3)
 
         try:
-            for url in self._feeds:
-                try:
-                    feed = feedparser.parse(url)
-                    for entry in feed.entries[:30]:
-                        item = self._entry_to_newsitem(entry, url)
-                        if item:
-                            all_items.append(item)
-                except Exception as exc:
-                    logger.debug("[rss] Feed %s failed: %s", url, exc)
+            with ThreadPoolExecutor(max_workers=len(self._feeds)) as pool:
+                futures = {pool.submit(self._fetch_one_feed, url): url for url in self._feeds}
+                for future in as_completed(futures, timeout=8):
+                    try:
+                        all_items.extend(future.result())
+                    except Exception:
+                        pass
+        except TimeoutError:
+            logger.debug("[rss] Some feeds didn't complete in time")
         finally:
             socket.setdefaulttimeout(old_timeout)
 

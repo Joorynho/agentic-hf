@@ -1,6 +1,7 @@
 import pytest
 import tempfile
-from datetime import date
+from datetime import date, datetime
+from unittest.mock import patch
 
 from src.backtest.engine.backtest_runner import BacktestRunner
 from src.core.models.config import (
@@ -10,6 +11,7 @@ from src.core.models.config import (
     BacktestConfig,
 )
 from src.core.models.enums import TimeHorizon, AgentType
+from src.core.models.market import Bar
 
 
 def make_alpha_config():
@@ -48,11 +50,35 @@ def make_alpha_config():
     )
 
 
+def _fake_bars(symbol, start, end):
+    """Generate deterministic synthetic bars for backtest period."""
+    bars = []
+    current = datetime.combine(start, datetime.min.time())
+    end_dt = datetime.combine(end, datetime.min.time())
+    price = 180.0 if symbol == "AAPL" else 350.0
+    day = 0
+    while current < end_dt:
+        if current.weekday() < 5:  # weekdays only
+            p = price + day * 0.5
+            bars.append(Bar(
+                symbol=symbol, timestamp=current,
+                open=p, high=p + 2, low=p - 1, close=p + 1,
+                volume=1_000_000, source="test",
+            ))
+            day += 1
+        current += __import__("datetime").timedelta(days=1)
+    return bars
+
+
 @pytest.mark.asyncio
 async def test_backtest_runs_without_error():
     cache_dir = tempfile.mkdtemp()
     runner = BacktestRunner(cache_dir=cache_dir)
-    result = await runner.run(make_alpha_config())
+    with patch(
+        "src.data.adapters.yfinance_adapter.YFinanceAdapter._fetch_sync",
+        side_effect=lambda sym, s, e: _fake_bars(sym, s, e),
+    ):
+        result = await runner.run(make_alpha_config())
     assert result is not None
     assert "nav_final" in result
     assert "total_bars_processed" in result
@@ -63,6 +89,10 @@ async def test_backtest_runs_without_error():
 async def test_backtest_is_deterministic():
     cache_dir = tempfile.mkdtemp()
     config = make_alpha_config()
-    r1 = await BacktestRunner(cache_dir=cache_dir).run(config)
-    r2 = await BacktestRunner(cache_dir=cache_dir).run(config)
+    with patch(
+        "src.data.adapters.yfinance_adapter.YFinanceAdapter._fetch_sync",
+        side_effect=lambda sym, s, e: _fake_bars(sym, s, e),
+    ):
+        r1 = await BacktestRunner(cache_dir=cache_dir).run(config)
+        r2 = await BacktestRunner(cache_dir=cache_dir).run(config)
     assert abs(r1["nav_final"] - r2["nav_final"]) < 0.01

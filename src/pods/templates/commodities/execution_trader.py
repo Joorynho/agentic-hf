@@ -290,8 +290,8 @@ class CommoditiesExecutionTrader(BasePodAgent):
                         "agent_role": "Trader",
                         "pod_id": self._pod_id,
                         "action": action,
-                        "summary": summary[:200],
-                        "detail": f"Price: ${result.fill_price or 0:.2f}"[:500],
+                        "summary": summary[:500],
+                        "detail": f"Price: ${result.fill_price or 0:.2f}",
                     },
                 )
                 await self._bus.publish("agent.activity", act_msg, publisher_id=f"pod.{self._pod_id}")

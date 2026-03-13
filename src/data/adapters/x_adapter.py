@@ -18,6 +18,7 @@ import html
 import logging
 import re
 import socket
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
@@ -107,6 +108,7 @@ class XAdapter:
         self._all_headlines: list[dict] = []
         self._seen_hashes: set[str] = set()
         self._feed_health: dict[str, int] = {}
+        self._lock = asyncio.Lock()
 
     async def fetch_tweets(self) -> tuple[list[dict], list[NewsItem]]:
         """Return (raw_headline_dicts, NewsItem_list) for dashboard + agents.
@@ -117,67 +119,83 @@ class XAdapter:
         if self._last_fetch and (now - self._last_fetch) < COOLDOWN:
             return list(self._all_headlines), list(self._cache_news)
 
-        try:
-            raw_items = await asyncio.wait_for(
-                asyncio.to_thread(self._fetch_all_sync), timeout=45.0
-            )
+        async with self._lock:
+            # Re-check after acquiring lock
+            now = datetime.now(timezone.utc)
+            if self._last_fetch and (now - self._last_fetch) < COOLDOWN:
+                return list(self._all_headlines), list(self._cache_news)
 
-            self._merge_into_history(raw_items)
-            self._cache_news = [self._to_newsitem(t) for t in self._all_headlines]
-            self._last_fetch = now
+            try:
+                raw_items = await asyncio.wait_for(
+                    asyncio.to_thread(self._fetch_all_sync), timeout=15.0
+                )
 
-            logger.info(
-                "[news] Fetched %d new headlines from %d feeds, total stored=%d",
-                len(raw_items), len(self._feeds), len(self._all_headlines),
-            )
-            return list(self._all_headlines), list(self._cache_news)
+                self._merge_into_history(raw_items)
+                self._cache_news = [self._to_newsitem(t) for t in self._all_headlines]
+                self._last_fetch = now
 
-        except asyncio.TimeoutError:
-            logger.info("[news] Fetch timed out — returning cached results")
-            return list(self._all_headlines), list(self._cache_news)
-        except Exception as exc:
-            logger.info("[news] Fetch failed (non-critical): %s", exc)
-            return list(self._all_headlines), list(self._cache_news)
+                logger.info(
+                    "[news] Fetched %d new headlines from %d feeds, total stored=%d",
+                    len(raw_items), len(self._feeds), len(self._all_headlines),
+                )
+                return list(self._all_headlines), list(self._cache_news)
+
+            except asyncio.TimeoutError:
+                logger.info("[news] Fetch timed out — returning cached results")
+                return list(self._all_headlines), list(self._cache_news)
+            except Exception as exc:
+                logger.info("[news] Fetch failed (non-critical): %s", exc)
+                return list(self._all_headlines), list(self._cache_news)
 
     def get_dashboard_headlines(self) -> list[dict]:
         """Return the latest 100 headlines for dashboard display."""
         return self._all_headlines[:DASHBOARD_LIMIT]
 
-    def _fetch_all_sync(self) -> list[dict]:
-        """Synchronous fetch across all RSS feeds (runs in thread pool)."""
+    def _fetch_one_feed(self, feed_cfg: dict) -> list[dict]:
+        """Fetch a single RSS feed (called in parallel from thread pool)."""
         import feedparser
 
+        name = feed_cfg["name"]
+        url = feed_cfg["url"]
+        category = feed_cfg.get("category", "Markets")
+        items: list[dict] = []
+        try:
+            feed = feedparser.parse(
+                url,
+                request_headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+                },
+            )
+            if feed.entries:
+                self._feed_health[name] = 0
+                for entry in feed.entries[:15]:
+                    item = self._parse_entry(entry, name, category)
+                    if item:
+                        items.append(item)
+            else:
+                self._feed_health[name] = self._feed_health.get(name, 0) + 1
+        except Exception as exc:
+            self._feed_health[name] = self._feed_health.get(name, 0) + 1
+            logger.debug("[news] Feed %s error: %s", name, exc)
+        return items
+
+    def _fetch_all_sync(self) -> list[dict]:
+        """Fetch all RSS feeds in parallel using a thread pool."""
         old_timeout = socket.getdefaulttimeout()
-        socket.setdefaulttimeout(10)
+        socket.setdefaulttimeout(3)
 
         all_items: list[dict] = []
         try:
-            for feed_cfg in self._feeds:
-                name = feed_cfg["name"]
-                url = feed_cfg["url"]
-                category = feed_cfg.get("category", "Markets")
-                try:
-                    feed = feedparser.parse(
-                        url,
-                        request_headers={
-                            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                            "Accept": "application/rss+xml, application/xml, text/xml, */*",
-                        },
-                    )
-                    if feed.entries:
-                        self._feed_health[name] = 0
-                        for entry in feed.entries[:15]:
-                            item = self._parse_entry(entry, name, category)
-                            if item:
-                                all_items.append(item)
-                    else:
-                        self._feed_health[name] = self._feed_health.get(name, 0) + 1
-                        logger.debug("[news] Feed %s returned 0 entries", name)
-
-                except Exception as exc:
-                    self._feed_health[name] = self._feed_health.get(name, 0) + 1
-                    logger.debug("[news] Feed %s error: %s", name, exc)
-
+            with ThreadPoolExecutor(max_workers=min(len(self._feeds), 12)) as pool:
+                futures = {pool.submit(self._fetch_one_feed, cfg): cfg for cfg in self._feeds}
+                for future in as_completed(futures, timeout=10):
+                    try:
+                        all_items.extend(future.result())
+                    except Exception:
+                        pass
+        except TimeoutError:
+            logger.debug("[news] Some feeds didn't complete in time")
         finally:
             socket.setdefaulttimeout(old_timeout)
 

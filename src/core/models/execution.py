@@ -75,6 +75,14 @@ class OrderResult(BaseModel):
     filled_at: datetime | None = None
 
 
+class TradeProposal(BaseModel):
+    """Validated trade proposal from LLM output. Rejects malformed trades."""
+    action: Literal["BUY", "SELL"]
+    symbol: str
+    qty: float = Field(gt=0)
+    reasoning: str = ""
+
+
 class PositionSnapshot(BaseModel):
     """Snapshot of an open position with current market data."""
     symbol: str

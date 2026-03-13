@@ -110,17 +110,25 @@ class CEOAgent:
         logger.info("[ceo] Mandate approved (llm=%s): %s", self._has_llm, mandate.narrative[:80])
         return mandate
 
-    async def handle_governance_message(self, msg: AgentMessage) -> AgentMessage | None:
-        """Respond to CIO/CRO messages in collaboration loops."""
-        payload = msg.payload
-        action = payload.get("action", "")
+    async def handle_governance_message(self, msg: AgentMessage, history: list[AgentMessage] | None = None) -> AgentMessage | None:
+        """Respond to CIO/CRO messages in governance loops.
 
-        if action == "cio_proposal":
-            # CEO reviews CIO capital proposal and accepts or counter-proposes
-            response_text = (
-                f"CEO reviewing CIO proposal: {payload.get('summary', '')}. "
-                "Accepted with condition: maintain minimum 3 active pods."
-            )
+        Uses LLM reasoning when available, with full conversation history for context.
+        Falls back to rule-based responses when no LLM key is configured.
+        """
+        if self._has_llm:
+            try:
+                return await self._llm_governance_response(msg, history)
+            except Exception as exc:
+                logger.warning("[ceo] LLM governance response failed (%s) — rule-based fallback", exc)
+
+        return self._rule_based_governance_response(msg)
+
+    def _rule_based_governance_response(self, msg: AgentMessage) -> AgentMessage | None:
+        """Fallback rule-based governance handler."""
+        action = msg.payload.get("action", "")
+
+        if action in ("cio_proposal", "ceo_strategy", "cro_constraint"):
             return AgentMessage(
                 timestamp=datetime.now(timezone.utc),
                 sender=_AGENT_ID,
@@ -129,27 +137,66 @@ class CEOAgent:
                 payload={
                     "consensus": True,
                     "outcome": {"action": "approve", "conditions": ["min_3_pods_active"]},
-                    "response": response_text,
+                    "response": f"CEO acknowledges {action} and approves with standard conditions.",
                 },
                 correlation_id=msg.id,
             )
-
-        if action == "cro_constraint":
-            # CEO acknowledges CRO risk constraint
-            return AgentMessage(
-                timestamp=datetime.now(timezone.utc),
-                sender=_AGENT_ID,
-                recipient=msg.sender,
-                topic=msg.topic,
-                payload={
-                    "consensus": True,
-                    "outcome": {"action": "acknowledge_constraint"},
-                    "response": "CEO acknowledges CRO constraint and will update mandate.",
-                },
-                correlation_id=msg.id,
-            )
-
         return None
+
+    async def _llm_governance_response(self, msg: AgentMessage, history: list[AgentMessage] | None = None) -> AgentMessage | None:
+        """LLM-powered governance deliberation with full conversation context."""
+        transcript = ""
+        if history:
+            for h in history:
+                role = h.sender.upper()
+                content = h.payload.get("response") or h.payload.get("summary") or json.dumps(h.payload)
+                transcript += f"[{role}]: {content}\n"
+
+        latest_content = msg.payload.get("response") or msg.payload.get("summary") or json.dumps(msg.payload)
+
+        system_prompt = (
+            "You are the CEO of an institutional algorithmic hedge fund in a governance deliberation.\n"
+            "Your priorities: preserve capital, maintain diversification, enforce risk discipline.\n"
+            "You are discussing strategy with the CIO (capital allocation) and CRO (risk limits).\n\n"
+            "Respond with JSON: {\"consensus\": true/false, \"response\": \"your detailed reasoning\", "
+            "\"conditions\": [\"any conditions for approval\"]}\n"
+            "Set consensus=true when you agree with the direction. Set consensus=false if you want "
+            "to challenge or request changes. Be specific and data-driven."
+        )
+
+        user_prompt = ""
+        if transcript:
+            user_prompt += f"## Deliberation Transcript\n{transcript}\n\n"
+        user_prompt += f"## Latest Message (from {msg.sender.upper()})\n{latest_content}\n\n"
+        user_prompt += "Respond as CEO. Consider the full conversation history above."
+
+        raw = llm_chat(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user", "content": user_prompt}],
+            max_tokens=500,
+        )
+
+        if self._session_logger:
+            self._session_logger.log_reasoning("ceo", "governance_response", raw or "")
+
+        data = extract_json(raw)
+        consensus = bool(data.get("consensus", False))
+        response_text = data.get("response", "CEO reviewing proposal.")
+        conditions = data.get("conditions", [])
+
+        return AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender=_AGENT_ID,
+            recipient=msg.sender,
+            topic=msg.topic,
+            payload={
+                "consensus": consensus,
+                "outcome": {"action": "approve" if consensus else "challenge", "conditions": conditions},
+                "response": response_text,
+                "action": "ceo_response",
+            },
+            correlation_id=msg.id,
+        )
 
     def _rule_based_mandate(
         self, pod_summaries, cro_constraints: dict

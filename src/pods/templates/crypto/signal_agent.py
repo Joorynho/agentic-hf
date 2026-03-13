@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from src.data.adapters.fred_adapter import FredAdapter
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class CryptoSignalAgent(BasePodAgent):
                 "yield_curve_10y2y": yield_curve,
                 "credit_spread": credit_spread,
             },
+            "global_rate_table": FredAdapter.build_global_rate_table(fred),
             "polymarket_predictions": poly_summary,
             "news_headlines": headlines,
             "live_prices": price_snapshot,

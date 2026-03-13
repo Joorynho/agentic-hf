@@ -57,18 +57,19 @@ async def test_session_manager_handles_alpaca_fetch_failure(caplog):
                 session_dir=tmpdir,
             )
 
-            # Start session
             await manager.start_live_session(capital_per_pod=100.0)
             assert manager._session_active
 
-            # Run event loop for short time to trigger iterations
-            # We expect at least 2 iterations with the mocked side_effects
+            for runtime in manager._pod_runtimes.values():
+                runtime.run_cycle = AsyncMock(return_value=None)
+                if hasattr(runtime, '_researcher') and runtime._researcher:
+                    runtime._researcher.run_cycle = AsyncMock(return_value={})
+
             task = asyncio.create_task(
                 manager.run_event_loop(interval_seconds=0.01, governance_freq=10)
             )
 
-            # Give it enough time for researcher cycles + LLM universe review + bar fetches
-            await asyncio.sleep(3.0)
+            await asyncio.sleep(0.3)
 
             # Stop the session by cancelling the task
             task.cancel()
@@ -169,11 +170,14 @@ async def test_session_manager_handles_pod_push_failure(caplog):
                 session_dir=tmpdir,
             )
 
-            # Start session
             await manager.start_live_session(capital_per_pod=100.0)
             assert manager._session_active
 
-            # Get references to pod gateways
+            for runtime in manager._pod_runtimes.values():
+                runtime.run_cycle = AsyncMock(return_value=None)
+                if hasattr(runtime, '_researcher') and runtime._researcher:
+                    runtime._researcher.run_cycle = AsyncMock(return_value={})
+
             pod_gateways = manager._pod_gateways
             assert len(pod_gateways) == 4
 
@@ -207,8 +211,7 @@ async def test_session_manager_handles_pod_push_failure(caplog):
                 manager.run_event_loop(interval_seconds=0.01, governance_freq=10)
             )
 
-            # Give it time to complete at least one full iteration
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.3)
 
             # Stop the session
             task.cancel()
@@ -272,9 +275,10 @@ async def test_session_manager_continues_after_governance_failure(caplog):
             await manager.start_live_session(capital_per_pod=100.0)
             assert manager._session_active
 
-            # Mock run_cycle to speed up iterations (avoid slow LLM/agent calls)
             for runtime in manager._pod_runtimes.values():
                 runtime.run_cycle = AsyncMock(return_value=None)
+                if hasattr(runtime, '_researcher') and runtime._researcher:
+                    runtime._researcher.run_cycle = AsyncMock(return_value={})
 
             # Mock governance to fail
             manager._governance.run_full_cycle = AsyncMock(
@@ -286,8 +290,7 @@ async def test_session_manager_continues_after_governance_failure(caplog):
                 manager.run_event_loop(interval_seconds=0.01, governance_freq=1)
             )
 
-            # Give it time to complete at least one full iteration (all 4 pods + governance)
-            await asyncio.sleep(2.0)
+            await asyncio.sleep(0.3)
 
             # Stop the session
             manager._session_active = False
@@ -355,17 +358,18 @@ async def test_session_manager_continues_after_account_fetch_failure(caplog):
                 session_dir=tmpdir,
             )
 
-            # Start session
             await manager.start_live_session(capital_per_pod=100.0)
             assert manager._session_active
 
-            # Run event loop with short interval
-            # Account fetch happens every 10 iterations, so we need to run enough iterations
+            for runtime in manager._pod_runtimes.values():
+                runtime.run_cycle = AsyncMock(return_value=None)
+                if hasattr(runtime, '_researcher') and runtime._researcher:
+                    runtime._researcher.run_cycle = AsyncMock(return_value={})
+
             task = asyncio.create_task(
                 manager.run_event_loop(interval_seconds=0.01, governance_freq=50)
             )
 
-            # Give it time to reach iteration 10+ (where account fetch is called)
             await asyncio.sleep(0.3)
 
             # Stop the session

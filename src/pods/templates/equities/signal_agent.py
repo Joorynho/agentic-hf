@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+from src.data.adapters.fred_adapter import FredAdapter
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
@@ -22,7 +23,6 @@ class EquitiesSignalAgent(BasePodAgent):
         x_feed = self.recall("x_feed", [])
         live_quotes = self.recall("live_quotes", {})
 
-        # Full FRED macro indicators
         vix = fred.get("VIXCLS")
         yield_curve = fred.get("T10Y2Y")
         credit_spread = fred.get("BAMLH0A0HYM2")
@@ -91,6 +91,7 @@ class EquitiesSignalAgent(BasePodAgent):
                 "m2_money_supply": m2,
                 "breakeven_inflation_5y": breakeven_5y,
             },
+            "global_rate_table": FredAdapter.build_global_rate_table(fred),
             "polymarket_predictions": poly_summary,
             "news_headlines": headlines,
             "live_prices": price_snapshot,

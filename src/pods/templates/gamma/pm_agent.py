@@ -7,7 +7,6 @@ from src.core.models.execution import Order
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
-_HAS_LLM = has_llm_key()
 
 UNIVERSE = ["SPY", "TLT", "GLD", "UUP", "EEM"]
 BASE_QTY = 50.0
@@ -25,7 +24,7 @@ class GammaPMAgent(BasePodAgent):
         if bar is None or macro_score == 0.0:
             return {}
 
-        if _HAS_LLM:
+        if has_llm_key():
             return await self._llm_decision(macro_score, bar)
         return self._rule_based_decision(macro_score, bar)
 

@@ -230,6 +230,25 @@ class AlpacaAdapter:
             - filled_at: timestamp if filled, else None
         """
         try:
+            # Alpaca does not support fractional short sells -- round to whole shares
+            if side == "sell" and qty != int(qty):
+                try:
+                    pos = self._client.get_position(symbol)
+                    held_qty = float(pos.qty) if pos.side == "long" else 0.0
+                except Exception:
+                    held_qty = 0.0
+                if held_qty <= 0:
+                    import math
+                    whole_qty = math.floor(qty)
+                    if whole_qty < 1:
+                        logger.info("[alpaca] Skipping short sell %s: fractional qty %.4f rounds to 0", symbol, qty)
+                        return {
+                            "order_id": None, "symbol": symbol, "qty": qty, "side": side,
+                            "status": "REJECTED", "filled_qty": 0.0, "filled_avg_price": None, "filled_at": None,
+                        }
+                    logger.info("[alpaca] Rounded short sell %s: %.4f -> %d (whole shares required)", symbol, qty, whole_qty)
+                    qty = float(whole_qty)
+
             # Submit order with retry on transient network errors
             order = None
             last_submit_err = None

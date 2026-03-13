@@ -1,57 +1,80 @@
 from __future__ import annotations
 import json
 import logging
+import math
 from datetime import datetime, timezone
 import uuid
 
 from src.core.models.enums import Side, OrderType
-from src.core.models.execution import Order
+from src.core.models.execution import Order, TradeProposal
 from src.core.models.messages import AgentMessage
 from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
 
-_FX_SYSTEM = """You are an FX portfolio manager at a macro hedge fund.
-You receive real macro data, prediction market odds, and news headlines every cycle.
-Your job is to synthesize ALL of this information into disciplined FX trading decisions.
+PM_MAX_SINGLE_TRADE_PCT = 0.20
+PM_MAX_CYCLE_ALLOCATION_PCT = 0.40
 
-Decision framework:
+_FX_SYSTEM = """You are a senior FX portfolio manager at an institutional macro hedge fund.
+You receive real macro data, prediction market odds, and news headlines every cycle.
+Your job is to produce institutional-quality FX trade ideas with deep, differentiated reasoning.
+
+ANALYTICAL FRAMEWORK:
 1. RATE DIFFERENTIALS: Fed funds rate, 10Y yields, 2Y yields drive currency flows.
    - Higher rates attract capital → currency strengthens.
    - Rate cut expectations → currency weakens.
+   - Focus on CHANGES in rate expectations, not absolute levels.
 2. USD STRENGTH: DXY / trade-weighted USD index.
    - Strong USD pressures EM and commodity currencies.
    - Weak USD benefits non-USD assets.
 3. PREDICTION MARKETS: Polymarket odds on rate cuts, elections, geopolitics.
    - Rate cut probability directly impacts FX carry.
    - Political/geopolitical events can cause rapid FX moves.
-4. CENTRAL BANK DIVERGENCE: Compare Fed vs ECB/BoJ/BoE policy.
+4. CENTRAL BANK DIVERGENCE: Compare Fed vs ECB/BoJ/BoE policy direction.
+   - The DELTA in policy expectations matters more than current rates.
 5. CARRY TRADES: High-yield vs low-yield currency pairs.
+
+NEWS — THINK DEEPER, NOT SURFACE-LEVEL:
+- Do NOT simply state "rates are high so sell/buy X." Explain what is CHANGING.
+- If a central bank signals a pivot, think about which currencies have NOT yet repriced
+  the spillover — the second-order opportunity is in the pairs that lag.
+- Trade wars and tariff headlines: which currencies are directly exposed vs. indirectly
+  benefiting as safe havens or alternative trade routes?
+- Do NOT restate headlines. Explain the IMPLICATION and where the market is mispricing.
+
+REASONING STANDARD — every trade MUST include:
+- THESIS: The macro setup (rate diff, central bank divergence, carry) and why it favors this pair
+- EDGE: What is the market not pricing? What change in expectations isn't reflected yet?
+- SECOND-ORDER: Which related pairs or crosses benefit from the same dynamic but haven't moved?
+- RISK: What would invalidate this thesis? (surprise data, intervention, political event)
+- TIMING: Why enter now — is there a catalyst window (meeting, data release, event)?
+
+ANTI-PATTERNS (will get your trades rejected):
+- "DXY is high so sell USD" — this is level-based, not flow-based thinking
+- Generic rate commentary without specific pair implications
+- No edge: if you can't say what the market is mispricing, don't trade
+- Chasing a move that already happened
 
 Implementation uses currency/country ETFs: UUP, UDN, FXE, FXY, FXB, EWJ, EWG, etc.
 
 Rules:
-- HOLD is the right call most of the time. FX moves slowly unless there's a catalyst.
-- Max 3 trades per cycle. Reasoning must cite specific data points.
+- HOLD is the right call most of the time. Only trade when you have a clear edge.
+- Max 3 trades per cycle.
 
 ARTICLE DEEP-DIVE:
-Headlines include article URLs. If a headline is particularly relevant and you need the
-full article to make a decision, include "read_articles": ["url1", "url2"] (max 3) in your
-JSON. You will then receive the article text and make a final decision.
-Only request articles when the headline suggests a material catalyst you need detail on.
+If a headline suggests a material catalyst worth investigating, include "read_articles": ["url1", "url2"]
+(max 3). You will receive the full article text.
 
-Output JSON: {"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "reasoning": "..."}], "read_articles": ["url1"]}
-Omit read_articles if you don't need to read any articles.
+Output JSON:
+{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "reasoning": "THESIS: ... | EDGE: ... | RISK: ..."}], "read_articles": ["url1"]}
+Omit read_articles if not needed.
 
 POSITION SIZING:
-You receive your pod's NAV, cash, leverage, and position limits every cycle.
-Size your trades intentionally:
-- Consider the conviction level of your thesis (higher conviction = larger size)
-- Never exceed the position limit notional shown
-- Account for existing exposure when adding to positions
-- Scale size down in high-volatility / uncertain regimes
-- The Risk agent will reject orders that breach hard limits
+- Standard conviction: 5-10% of NAV
+- High conviction (with full THESIS/EDGE/RISK): up to 20% of NAV
+- Hard cap: 20% of NAV per position, 40% of cash per cycle
+- Scale down in high-vol regimes. The Risk agent enforces hard limits.
 Output qty as a specific number of shares/units, not a percentage."""
 
 
@@ -68,10 +91,11 @@ class FXPMAgent(BasePodAgent):
     ):
         super().__init__(agent_id=agent_id, pod_id=pod_id, namespace=namespace, bus=bus)
         self._session_logger = session_logger
+        self._decision_history: list[dict] = []
 
     async def run_cycle(self, context: dict) -> dict:
         if context.get("risk_revision"):
-            return {"order": context.get("order")}
+            return await self._evaluate_risk_revision(context)
 
         features = context.get("features") or self.recall("features", {})
         if not features:
@@ -83,18 +107,113 @@ class FXPMAgent(BasePodAgent):
             return await self._llm_decision(features, sizing)
         return self._rule_based_decision(features)
 
+    async def _evaluate_risk_revision(self, context: dict) -> dict:
+        """Evaluate whether a Risk-revised order is still worth trading."""
+        revised_order = context.get("order")
+        if not revised_order:
+            return {}
+        risk_reason = context.get("risk_reason", "unknown")
+        original_qty = context.get("original_qty", revised_order.quantity)
+
+        if not has_llm_key():
+            await self._broadcast_revision_decision(revised_order, True, "Auto-accepted (no LLM)", original_qty)
+            return {"order": revised_order}
+
+        try:
+            prompt = (
+                f"Risk reduced your proposed {revised_order.side.value} {revised_order.symbol} "
+                f"from {original_qty:.2f} to {revised_order.quantity:.4f} shares.\n"
+                f"Reason: {risk_reason}\n\n"
+                f"Is this reduced size still a worthwhile trade? Consider:\n"
+                f"- Does the thesis still hold at this smaller size?\n"
+                f"- Is the position too small to matter?\n"
+                f"- Would you rather skip and wait for a better entry?\n\n"
+                f'Reply JSON: {{"accept": true/false, "reasoning": "brief explanation"}}'
+            )
+            raw = llm_chat(
+                [{"role": "system", "content": "You are an FX PM evaluating a risk-adjusted trade size. Be concise."},
+                 {"role": "user", "content": prompt}],
+                max_tokens=150,
+            )
+            decision = extract_json(raw)
+            accept = decision.get("accept", True)
+            reasoning = decision.get("reasoning", "")
+
+            if self._session_logger:
+                self._session_logger.log_reasoning(
+                    f"pm:{self._pod_id}", "risk_revision_eval",
+                    f"Risk: {risk_reason} | PM: {'ACCEPT' if accept else 'REJECT'} — {reasoning}",
+                )
+
+            await self._broadcast_revision_decision(revised_order, accept, reasoning, original_qty)
+
+            if accept:
+                logger.info("[fx.pm] Accepted revision: %s %s %.4f (%s)", revised_order.side.value, revised_order.symbol, revised_order.quantity, reasoning)
+                return {"order": revised_order}
+            else:
+                logger.info("[fx.pm] Rejected revision: %s %s (%s)", revised_order.side.value, revised_order.symbol, reasoning)
+                return {}
+        except Exception as e:
+            logger.warning("[fx.pm] Revision eval failed, accepting: %s", e)
+            await self._broadcast_revision_decision(revised_order, True, f"Auto-accepted (eval error: {e})", original_qty)
+            return {"order": revised_order}
+
+    async def _broadcast_revision_decision(self, order, accepted: bool, reasoning: str, original_qty: float) -> None:
+        try:
+            action = "pm_accept_revision" if accepted else "pm_reject_revision"
+            summary = (
+                f"{'Accepted' if accepted else 'Rejected'} revision: {order.side.value} {order.symbol} "
+                f"{original_qty:.2f} -> {order.quantity:.4f}. {reasoning}"
+            )
+            msg = AgentMessage(
+                timestamp=datetime.now(timezone.utc),
+                sender=self._agent_id,
+                recipient="dashboard",
+                topic="agent.activity",
+                payload={
+                    "agent_id": self._agent_id,
+                    "agent_role": "PM",
+                    "pod_id": self._pod_id,
+                    "action": action,
+                    "summary": summary[:500],
+                    "detail": reasoning,
+                },
+            )
+            await self._bus.publish("agent.activity", msg, publisher_id=self._agent_id)
+        except Exception:
+            pass
+
     async def _llm_decision(self, features: dict, sizing_context: dict | None = None) -> dict:
         positions = self.recall("current_positions_summary", "none")
         sizing = sizing_context or {}
 
         sections = []
+
+        sections.append("## Current Date & Time")
+        sections.append(f"  {datetime.now(timezone.utc).strftime('%A, %B %d, %Y %H:%M UTC')}")
+
+        live_prices = features.get("live_prices", [])
+        if live_prices:
+            sections.append("\n## Live Price Snapshot")
+            for p in live_prices[:20]:
+                if isinstance(p, dict):
+                    chg = p.get("change_pct", 0)
+                    sections.append(f"  {p.get('symbol','?')}: ${p.get('price',0):.2f} ({chg:+.1f}%)")
+
+        if self._decision_history:
+            sections.append("\n## Recent Decision History (last 5)")
+            for dh in self._decision_history[-5:]:
+                sections.append(f"  [{dh.get('timestamp','')}] {dh.get('action_summary','hold')}")
+                if dh.get("reasoning_snippet"):
+                    sections.append(f"    Reasoning: {dh['reasoning_snippet']}")
+
         if sizing:
             sections.append("\n## Position Sizing Context")
             sections.append(f"  Pod NAV: ${sizing.get('pod_nav', 0):,.2f}")
             sections.append(f"  Available cash: ${sizing.get('available_cash', 0):,.2f}")
             sections.append(f"  Current leverage: {sizing.get('current_leverage', 0):.2f}x")
             sections.append(f"  Max leverage: {sizing.get('max_leverage', 2.0):.1f}x")
-            sections.append(f"  Max position size: ${sizing.get('position_limit_notional', 0):,.2f} (10% of NAV)")
+            sections.append(f"  Max position size: ${sizing.get('position_limit_notional', 0):,.2f} (20% of NAV — above 10% requires max conviction)")
             for p in sizing.get("positions_summary", []):
                 sections.append(f"  Position: {p['symbol']} qty={p['qty']:.1f} notional=${p['notional']:,.0f} pnl=${p['unrealized_pnl']:,.2f}")
 
@@ -105,6 +224,12 @@ class FXPMAgent(BasePodAgent):
                 if v is not None:
                     sections.append(f"  {k}: {v}")
         sections.append(f"  Macro outlook: {features.get('macro_outlook', 'unknown')}")
+
+        rate_table = features.get("global_rate_table", {})
+        if rate_table:
+            sections.append("\n## Global Central Bank Policy Rates")
+            for bank, info in rate_table.items():
+                sections.append(f"  {bank}: {info['value']:.2f}% ({info['rate_name']})")
 
         sections.append("\n## Prediction Market Odds (Polymarket)")
         poly = features.get("polymarket_predictions", [])
@@ -136,7 +261,7 @@ class FXPMAgent(BasePodAgent):
                     {"role": "system", "content": _FX_SYSTEM},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=800,
+                max_tokens=1200,
             )
             decision = extract_json(raw)
 
@@ -156,6 +281,21 @@ class FXPMAgent(BasePodAgent):
             parsed_trades = decision.get("trades", [])
             if isinstance(parsed_trades, dict):
                 parsed_trades = [parsed_trades]
+
+            validated_trades = []
+            for t in parsed_trades:
+                action = str(t.get("action", "HOLD")).upper()
+                if action == "HOLD":
+                    validated_trades.append(t)
+                    continue
+                try:
+                    TradeProposal(action=action, symbol=str(t.get("symbol", "")),
+                                  qty=float(t.get("qty", 0)), reasoning=t.get("reasoning", ""))
+                    validated_trades.append(t)
+                except Exception as ve:
+                    logger.warning("[fx.pm] Invalid trade proposal skipped: %s — %s", t, ve)
+            parsed_trades = validated_trades
+
             action_parts = []
             for t in parsed_trades:
                 action_parts.append(f"{t.get('action','')} {t.get('qty',0)} {t.get('symbol','')}")
@@ -163,15 +303,25 @@ class FXPMAgent(BasePodAgent):
             self.store("last_pm_decision", {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "trades": parsed_trades[:10],
-                "reasoning": (response_text or "")[:500],
-                "action_summary": action_summary[:200],
+                "reasoning": response_text or "",
+                "action_summary": action_summary[:500],
             })
+
+            self._decision_history.append({
+                "timestamp": datetime.now(timezone.utc).strftime("%H:%M"),
+                "action_summary": action_summary[:200],
+                "reasoning_snippet": (response_text or "")[:150],
+                "symbols": [t.get("symbol", "") for t in parsed_trades if t.get("action", "HOLD") != "HOLD"],
+            })
+            if len(self._decision_history) > 5:
+                self._decision_history = self._decision_history[-5:]
 
             trades = parsed_trades
             if not trades:
                 return {}
 
             orders = []
+            cycle_notional_used = 0.0
             for t in trades[:3]:
                 action = str(t.get("action", "HOLD")).upper()
                 if action == "HOLD":
@@ -182,6 +332,14 @@ class FXPMAgent(BasePodAgent):
                     continue
                 side = Side.BUY if action == "BUY" else Side.SELL
                 reasoning = t.get("reasoning", "")
+                qty, clamp_note = self._apply_sizing_discipline(
+                    qty, symbol, side, sizing, cycle_notional_used,
+                )
+                if qty <= 0:
+                    logger.info("[fx.pm] Skipped %s %s: %s", action, symbol, clamp_note)
+                    continue
+                est_price = self._estimate_price(symbol)
+                cycle_notional_used += qty * est_price
                 order = Order(
                     id=uuid.uuid4(), pod_id=self._pod_id, symbol=symbol,
                     side=side, order_type=OrderType.MARKET, quantity=qty,
@@ -189,7 +347,8 @@ class FXPMAgent(BasePodAgent):
                     strategy_tag=f"llm_fx_{action.lower()}",
                 )
                 orders.append(order)
-                logger.info("[fx.pm] LLM: %s %s %.0f (%s)", action, symbol, qty, reasoning)
+                log_suffix = f" [{clamp_note}]" if clamp_note else ""
+                logger.info("[fx.pm] LLM: %s %s %.2f (%s)%s", action, symbol, qty, reasoning, log_suffix)
 
             if not orders:
                 return {}
@@ -226,7 +385,7 @@ class FXPMAgent(BasePodAgent):
                     "pod_id": self._pod_id,
                     "action": "article_deep_dive",
                     "summary": f"Read {len(articles)} article(s)",
-                    "detail": "\n".join(f"[{url}]: {text[:200]}..." for url, text in articles.items()),
+                    "detail": "\n".join(f"[{url}]: {text[:500]}..." for url, text in articles.items()),
                     "urls": list(articles.keys())[:3],
                 },
             )
@@ -244,7 +403,7 @@ class FXPMAgent(BasePodAgent):
         try:
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
-                max_tokens=800,
+                max_tokens=1200,
             )
             logger.info("[fx.pm] Article deep-dive complete (%d articles read)", len(articles))
             if self._session_logger:
@@ -254,6 +413,61 @@ class FXPMAgent(BasePodAgent):
         except Exception as e:
             logger.warning("[fx.pm] Article deep-dive LLM failed: %s", e)
             return (first_decision, None)
+
+    def _apply_sizing_discipline(
+        self, qty: float, symbol: str, side: Side,
+        sizing: dict, cycle_notional_used: float,
+    ) -> tuple[float, str]:
+        """Clamp trade qty to PM-level budget limits before sending to Risk."""
+        nav = sizing.get("pod_nav", 0)
+        cash = sizing.get("available_cash", 0)
+        if nav <= 0:
+            return (qty, "")
+
+        est_price = self._estimate_price(symbol)
+        if est_price <= 0:
+            return (qty, "")
+        proposed_notional = qty * est_price
+
+        notes = []
+
+        max_single_notional = nav * PM_MAX_SINGLE_TRADE_PCT
+        if proposed_notional > max_single_notional:
+            clamped_qty = math.floor(max_single_notional / est_price * 100) / 100
+            if clamped_qty < 1 and est_price > max_single_notional:
+                clamped_qty = max_single_notional / est_price
+            notes.append(f"capped {qty:.2f}->{clamped_qty:.2f} (max {PM_MAX_SINGLE_TRADE_PCT*100:.0f}% NAV)")
+            qty = clamped_qty
+
+        if side == Side.BUY:
+            max_cycle_notional = cash * PM_MAX_CYCLE_ALLOCATION_PCT
+            remaining = max_cycle_notional - cycle_notional_used
+            if remaining <= 0:
+                return (0, "cycle budget exhausted")
+            trade_notional = qty * est_price
+            if trade_notional > remaining:
+                clamped_qty = math.floor(remaining / est_price * 100) / 100
+                if clamped_qty < 1 and est_price > remaining:
+                    clamped_qty = remaining / est_price
+                notes.append(f"capped to cycle budget ({PM_MAX_CYCLE_ALLOCATION_PCT*100:.0f}% cash)")
+                qty = clamped_qty
+
+        if qty * est_price < 1.0:
+            return (0, "trade too small (<$1 notional)")
+
+        return (round(qty, 4), "; ".join(notes))
+
+    def _estimate_price(self, symbol: str) -> float:
+        """Best-effort price estimate from accountant bar data, positions, or fallback."""
+        accountant = self._ns.get("accountant")
+        if accountant:
+            bar_price = accountant.get_last_price(symbol, 0.0)
+            if bar_price > 0:
+                return bar_price
+            pos = accountant.current_positions.get(symbol)
+            if pos and pos.current_price > 0:
+                return pos.current_price
+        return 100.0
 
     def _rule_based_decision(self, features: dict) -> dict:
         logger.debug("[fx.pm] Rule-based: HOLD (no LLM key)")

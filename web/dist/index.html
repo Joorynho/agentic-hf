@@ -39,6 +39,13 @@
       <span class="sb-label">ITER</span>
       <span id="iter-ctr" style="color:var(--text-primary);font-family:var(--font-mono)">—</span>
     </div>
+    <div class="sb-reports-wrap">
+      <button class="sb-btn sb-btn-reports" id="reports-btn" onclick="toggleReportsDropdown()">REPORTS</button>
+      <div class="sb-reports-dropdown" id="reports-dropdown">
+        <div class="reports-header">Recent Reports</div>
+        <div class="reports-list" id="reports-list">No reports yet</div>
+      </div>
+    </div>
     <span class="sb-spacer"></span>
     <span class="sb-clock" id="clock">—</span>
   </header>
@@ -81,6 +88,7 @@
       <button class="tab-btn" data-tab="execution">Execution</button>
       <button class="tab-btn" data-tab="governance">Governance</button>
       <button class="tab-btn" data-tab="research">Research</button>
+      <button class="tab-btn" data-tab="reports">Reports</button>
     </nav>
 
     <!-- OPERATIONS -->
@@ -501,6 +509,15 @@
           <div class="indicator-section-label">Liquidity</div>
           <div class="indicator-card"><div class="ic-header"><span class="ic-label">M2 MONEY SUPPLY</span><span class="ic-dot neutral" id="dot-M2SL"></span></div><div class="ic-value" id="val-M2SL">—</div><div class="ic-unit">$B · monthly</div></div>
           <div class="indicator-card"><div class="ic-header"><span class="ic-label">FED BALANCE SHEET</span><span class="ic-dot neutral" id="dot-WALCL"></span></div><div class="ic-value" id="val-WALCL">—</div><div class="ic-unit">Total Assets $M · weekly</div></div>
+
+          <div class="indicator-section-label">Global Central Bank Rates</div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">ECB MAIN REFI</span><span class="ic-dot neutral" id="dot-ECBMRRFR"></span></div><div class="ic-value" id="val-ECBMRRFR">—</div><div class="ic-unit">ECB Main Refinancing % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">ECB DEPOSIT</span><span class="ic-dot neutral" id="dot-ECBDFR"></span></div><div class="ic-value" id="val-ECBDFR">—</div><div class="ic-unit">ECB Deposit Facility % · daily</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">BOE RATE</span><span class="ic-dot neutral" id="dot-IRSTCI01GBM156N"></span></div><div class="ic-value" id="val-IRSTCI01GBM156N">—</div><div class="ic-unit">Bank of England % · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">BOJ RATE</span><span class="ic-dot neutral" id="dot-IRSTCB01JPM156N"></span></div><div class="ic-value" id="val-IRSTCB01JPM156N">—</div><div class="ic-unit">Bank of Japan % · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">RBA RATE</span><span class="ic-dot neutral" id="dot-IRSTCI01AUM156N"></span></div><div class="ic-value" id="val-IRSTCI01AUM156N">—</div><div class="ic-unit">Reserve Bank of Australia % · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">BOC RATE</span><span class="ic-dot neutral" id="dot-IRSTCB01CAM156N"></span></div><div class="ic-value" id="val-IRSTCB01CAM156N">—</div><div class="ic-unit">Bank of Canada % · monthly</div></div>
+          <div class="indicator-card"><div class="ic-header"><span class="ic-label">SNB RATE</span><span class="ic-dot neutral" id="dot-IRSTCI01CHM156N"></span></div><div class="ic-value" id="val-IRSTCI01CHM156N">—</div><div class="ic-unit">Swiss National Bank % · monthly</div></div>
         </div>
 
         <div class="fred-composite" id="fred-composite">
@@ -560,6 +577,31 @@
         </div>
       </div>
 
+    </div>
+
+    <!-- REPORTS -->
+    <div class="tab-pane" id="tab-reports">
+      <div class="sec-hdr">
+        <span class="sec-title">Daily Position Reviews</span>
+        <span class="sec-badge" id="review-badge">0 reviews</span>
+      </div>
+      <div id="review-list">
+        <div class="empty">
+          <div class="empty-txt">No position reviews yet</div>
+          <div class="empty-hint">Reviews run daily when positions are held</div>
+        </div>
+      </div>
+      <div style="margin-top:24px">
+        <div class="sec-hdr">
+          <span class="sec-title">Saved Reports</span>
+          <button class="sec-btn" onclick="loadSavedReports()" style="cursor:pointer;background:var(--card);border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;font-size:10px;letter-spacing:1px">REFRESH</button>
+        </div>
+        <div id="saved-reports-list">
+          <div class="empty">
+            <div class="empty-txt">Loading saved reports…</div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- INTELLIGENCE FEED -->

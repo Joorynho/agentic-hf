@@ -1,5 +1,6 @@
 import pytest, tempfile, asyncio
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from unittest.mock import patch
 
 # Backtest runner
 from src.backtest.engine.backtest_runner import BacktestRunner
@@ -41,15 +42,37 @@ def make_alpha_config():
         pm_agent_type=AgentType.RULE_BASED)
 
 
+def _fake_bars(symbol, start, end):
+    bars = []
+    current = datetime.combine(start, datetime.min.time())
+    end_dt = datetime.combine(end, datetime.min.time())
+    price = 180.0 if symbol == "AAPL" else 350.0
+    day = 0
+    while current < end_dt:
+        if current.weekday() < 5:
+            p = price + day * 0.5
+            bars.append(Bar(
+                symbol=symbol, timestamp=current,
+                open=p, high=p + 2, low=p - 1, close=p + 1,
+                volume=1_000_000, source="test",
+            ))
+            day += 1
+        current += timedelta(days=1)
+    return bars
+
+
 @pytest.mark.asyncio
 async def test_mvp1_backtest_full_run():
     """Full backtest run: data fetch + replay + accounting."""
     cache_dir = tempfile.mkdtemp()
-    result = await BacktestRunner(cache_dir=cache_dir).run(make_alpha_config())
+    with patch(
+        "src.data.adapters.yfinance_adapter.YFinanceAdapter._fetch_sync",
+        side_effect=lambda sym, s, e: _fake_bars(sym, s, e),
+    ):
+        result = await BacktestRunner(cache_dir=cache_dir).run(make_alpha_config())
     assert result["total_bars_processed"] > 0
     assert result["nav_final"] > 0
     assert result["pod_id"] == "alpha"
-    print(f"\nMVP1 Backtest Result: {result}")
 
 
 @pytest.mark.asyncio

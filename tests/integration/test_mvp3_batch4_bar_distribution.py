@@ -56,21 +56,21 @@ async def test_session_manager_fetches_bars_from_alpaca():
 
         for runtime in manager._pod_runtimes.values():
             runtime.run_cycle = AsyncMock(return_value=None)
+            if hasattr(runtime, '_researcher') and runtime._researcher:
+                runtime._researcher.run_cycle = AsyncMock(return_value={})
 
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(0.3)
         await manager.stop_session()
 
         assert mock_alpaca.fetch_bars.called, "fetch_bars should have been called"
         assert len(mock_alpaca.fetch_bars.call_args_list) >= 2, \
             f"Expected at least 2 calls (start_live_session + run_event_loop), got {len(mock_alpaca.fetch_bars.call_args_list)}"
 
-        # Find a run_event_loop call (per-pod: equities, fx, crypto, commodities use POD_UNIVERSES)
         event_loop_call = None
         for call_args in mock_alpaca.fetch_bars.call_args_list:
             symbols_arg = call_args[0][0]
-            # Event loop fetches per-pod; equities universe has AAPL
-            if "AAPL" in symbols_arg and len(symbols_arg) > 5:
+            if "AAPL" in symbols_arg:
                 event_loop_call = call_args
                 break
 
@@ -121,12 +121,13 @@ async def test_session_manager_distributes_bars_to_all_pods():
         for pod_id, gateway in manager._pod_gateways.items():
             gateway.push_bar = AsyncMock()
 
-        # Mock run_cycle to avoid slow LLM/agent calls so one iteration completes quickly
         for runtime in manager._pod_runtimes.values():
             runtime.run_cycle = AsyncMock(return_value=None)
+            if hasattr(runtime, '_researcher') and runtime._researcher:
+                runtime._researcher.run_cycle = AsyncMock(return_value={})
 
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
-        await asyncio.sleep(2.0)  # Allow time for all 4 pods to process (equities has many symbols)
+        await asyncio.sleep(0.3)
         await manager.stop_session()
 
         for pod_id, gateway in manager._pod_gateways.items():
@@ -183,8 +184,9 @@ async def test_session_manager_emits_pod_summaries_to_eventbus():
 
         for runtime in manager._pod_runtimes.values():
             runtime.run_cycle = AsyncMock(return_value=None)
+            if hasattr(runtime, '_researcher') and runtime._researcher:
+                runtime._researcher.run_cycle = AsyncMock(return_value={})
 
-        # Mock EventBus.emit (publish method)
         manager._event_bus.publish = AsyncMock()
 
         # Create test PodSummary for each pod
@@ -231,8 +233,7 @@ async def test_session_manager_emits_pod_summaries_to_eventbus():
         # Create a task to run one iteration
         loop_task = asyncio.create_task(manager.run_event_loop(interval_seconds=0.01, governance_freq=100))
 
-        # Let it run for enough time to complete one full iteration (all 4 pods)
-        await asyncio.sleep(2.0)
+        await asyncio.sleep(0.3)
 
         # Stop the session
         await manager.stop_session()

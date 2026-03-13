@@ -155,6 +155,12 @@ class MarketTracker:
             if tm.status == "new" and (now - tm.first_seen) >= NEW_WINDOW:
                 tm.status = "watching"
 
+            if tm.status == "resolved":
+                continue
+
+            if tm.end_date and tm.end_date < now:
+                continue
+
             prob_change = round(tm.implied_prob - tm.prob_at_first_seen, 6)
             end_iso = tm.end_date.isoformat() if tm.end_date else None
 

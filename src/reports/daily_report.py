@@ -20,6 +20,7 @@ class DailyReportGenerator:
         governance: list | None = None,
         firm_nav: float = 0.0,
         initial_capital: float = 0.0,
+        review_dialogue: list[dict] | None = None,
     ) -> str:
         """Generate a complete HTML report string.
 
@@ -124,6 +125,45 @@ class DailyReportGenerator:
 
         pnl_color = "#00d68f" if total_pnl >= 0 else "#e84040"
 
+        # Build position review section
+        review_section = ""
+        if review_dialogue:
+            review_cards = ""
+            for rv in review_dialogue:
+                if not isinstance(rv, dict):
+                    continue
+                rpod = str(rv.get("pod_id", "UNKNOWN")).upper()
+                positions_reviewed = rv.get("positions_reviewed", 0)
+                cio_ch = str(rv.get("cio_challenge", "")).replace("<", "&lt;").replace(">", "&gt;")
+                pm_resp = str(rv.get("pm_response", "")).replace("<", "&lt;").replace(">", "&gt;")
+                cio_dec = str(rv.get("cio_decisions", "")).replace("<", "&lt;").replace(">", "&gt;")
+                actions_taken = rv.get("actions", [])
+                action_summary = rv.get("summary", "no actions")
+
+                action_rows = ""
+                for act in actions_taken:
+                    if isinstance(act, dict):
+                        a_sym = act.get("symbol", "")
+                        a_action = act.get("action", "")
+                        a_side = act.get("side", "")
+                        a_qty = act.get("qty", 0)
+                        a_reason = str(act.get("reasoning", ""))[:150]
+                        a_color = "#00d68f" if a_action in ("ADD", "HOLD") else "#e84040"
+                        action_rows += f'<div style="padding:6px 0;border-bottom:1px solid #1a2535;font-size:11px"><span style="color:{a_color};font-weight:600">{a_action}</span> {a_sym} — {a_side} {a_qty} — <span style="color:#8aa0b8">{a_reason}</span></div>'
+
+                if not action_rows:
+                    action_rows = '<div style="padding:6px 0;font-size:11px;color:#6a90aa">All positions held — no changes</div>'
+
+                review_cards += f'''<div style="background:#13202f;border:1px solid #2a3a50;border-radius:6px;padding:16px;margin-bottom:16px">
+                    <div style="font-size:13px;font-weight:700;color:#00cfe8;margin-bottom:12px">{rpod} — {positions_reviewed} position(s) reviewed</div>
+                    <div style="margin-bottom:10px"><div style="font-size:10px;letter-spacing:1px;color:#6a90aa;margin-bottom:4px">CIO CHALLENGE</div><div style="font-size:11px;white-space:pre-wrap;color:#c0d0e0;max-height:200px;overflow-y:auto">{cio_ch}</div></div>
+                    <div style="margin-bottom:10px"><div style="font-size:10px;letter-spacing:1px;color:#6a90aa;margin-bottom:4px">PM DEFENSE</div><div style="font-size:11px;white-space:pre-wrap;color:#c0d0e0;max-height:200px;overflow-y:auto">{pm_resp}</div></div>
+                    <div style="margin-bottom:10px"><div style="font-size:10px;letter-spacing:1px;color:#6a90aa;margin-bottom:4px">CIO FINAL DECISION</div><div style="font-size:11px;white-space:pre-wrap;color:#c0d0e0;max-height:200px;overflow-y:auto">{cio_dec}</div></div>
+                    <div><div style="font-size:10px;letter-spacing:1px;color:#6a90aa;margin-bottom:4px">ACTIONS TAKEN</div>{action_rows}</div>
+                </div>'''
+
+            review_section = f'''<div style="margin-bottom:28px"><div style="font-size:11px;letter-spacing:1.5px;color:#6a90aa;margin-bottom:10px;border-bottom:1px solid #2a3a50;padding-bottom:6px">POSITION REVIEW</div>{review_cards}</div>'''
+
         gov_section = ""
         if gov_rows:
             gov_section = f'''<div style="margin-bottom:28px"><div style="font-size:11px;letter-spacing:1.5px;color:#6a90aa;margin-bottom:10px;border-bottom:1px solid #2a3a50;padding-bottom:6px">GOVERNANCE DECISIONS</div><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="color:#6a90aa;font-size:10px;letter-spacing:0.5px"><th style="text-align:left;padding:6px 8px;border-bottom:1px solid #2a3a50">Agent</th><th style="text-align:left;padding:6px 8px;border-bottom:1px solid #2a3a50">Decision</th><th style="text-align:left;padding:6px 8px;border-bottom:1px solid #2a3a50">Reasoning</th></tr></thead><tbody>{gov_rows}</tbody></table></div>'''
@@ -172,6 +212,8 @@ class DailyReportGenerator:
     <tbody>{pod_rows if pod_rows else '<tr><td colspan="5" style="text-align:center;color:#6a90aa;padding:12px">No pod data</td></tr>'}</tbody>
   </table>
 </div>
+
+{review_section}
 
 <div style="margin-bottom:28px">
   <div style="font-size:11px;letter-spacing:1.5px;color:#6a90aa;margin-bottom:10px;border-bottom:1px solid #2a3a50;padding-bottom:6px">TRADE LOG</div>

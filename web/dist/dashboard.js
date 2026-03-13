@@ -70,6 +70,63 @@ function toggleSession() {
     .catch(function() {});
 })();
 
+// ─── Reports Dropdown ────────────────────────────────────────────────────
+function toggleReportsDropdown() {
+  var dd = document.getElementById('reports-dropdown');
+  if (!dd) return;
+  var isOpen = dd.classList.contains('open');
+  if (isOpen) {
+    dd.classList.remove('open');
+  } else {
+    dd.classList.add('open');
+    fetchReports();
+  }
+}
+
+document.addEventListener('click', function(e) {
+  var wrap = document.querySelector('.sb-reports-wrap');
+  var dd = document.getElementById('reports-dropdown');
+  if (wrap && dd && !wrap.contains(e.target)) {
+    dd.classList.remove('open');
+  }
+});
+
+function fetchReports() {
+  var list = document.getElementById('reports-list');
+  if (!list) return;
+  fetch('/api/reports')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var reports = data.reports || [];
+      if (reports.length === 0) {
+        list.innerHTML = '<div style="padding:12px 14px;color:var(--text-dim)">No reports generated yet</div>';
+        return;
+      }
+      list.innerHTML = reports.map(function(r) {
+        return '<div class="report-item" onclick="window.open(\'/api/reports/' + r.filename + '\')">' +
+          '<div><span class="report-item-date">' + r.date + '</span>' +
+          '<span class="report-item-size">' + r.size_kb + ' KB</span></div>' +
+          '<a class="report-item-dl" href="/api/reports/' + r.filename + '" target="_blank" onclick="event.stopPropagation()">DOWNLOAD</a>' +
+          '</div>';
+      }).join('');
+    })
+    .catch(function() {
+      list.innerHTML = '<div style="padding:12px 14px;color:var(--text-dim)">Failed to load reports</div>';
+    });
+}
+
+function onNewReport(filename) {
+  var btn = document.getElementById('reports-btn');
+  if (btn) {
+    btn.classList.add('has-new');
+    setTimeout(function() { btn.classList.remove('has-new'); }, 5000);
+  }
+  var dd = document.getElementById('reports-dropdown');
+  if (dd && dd.classList.contains('open')) {
+    fetchReports();
+  }
+}
+
 // ─── 3. Tab Switching ─────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -170,6 +227,16 @@ function renderCurrentMarkets(signals) {
   const countEl = document.getElementById('market-count');
   const timeEl = document.getElementById('last-fetch-time');
   if (!tbody) return;
+
+  const now = new Date();
+  signals = signals.filter(function(s) {
+    if (s.status && String(s.status).toLowerCase() === 'resolved') return false;
+    if (s.end_date) {
+      var end = typeof s.end_date === 'string' ? new Date(s.end_date) : s.end_date;
+      if (end < now) return false;
+    }
+    return true;
+  });
 
   document.getElementById('kpi-market-count').textContent = signals.length || '—';
   const avgProb = signals.length
@@ -420,6 +487,13 @@ const FRED_INDICATORS = [
   { key: 'DTWEXBGS', label: 'USD INDEX', fmt: v => v != null ? v.toFixed(1) : '—', status: () => 'neutral' },
   { key: 'M2SL', label: 'M2 MONEY SUPPLY', fmt: v => v != null ? '$' + (v / 1000).toFixed(0) + 'T' : '—', status: () => 'neutral' },
   { key: 'WALCL', label: 'FED BALANCE SHEET', fmt: v => v != null ? '$' + (v / 1e6).toFixed(0) + 'T' : '—', status: () => 'neutral' },
+  { key: 'ECBMRRFR', label: 'ECB MAIN REFI', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'ECBDFR', label: 'ECB DEPOSIT', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'IRSTCI01GBM156N', label: 'BOE RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'IRSTCB01JPM156N', label: 'BOJ RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'IRSTCI01AUM156N', label: 'RBA RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'IRSTCB01CAM156N', label: 'BOC RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
+  { key: 'IRSTCI01CHM156N', label: 'SNB RATE', fmt: v => v != null ? v.toFixed(2) + '%' : '—', status: () => 'neutral' },
 ];
 
 function renderMacroIndicators() {
@@ -559,13 +633,28 @@ function handleMessage(msg) {
       if (m && m.data) {
         pods[m.pod_id || pid] = Object.assign(pods[m.pod_id || pid] || {}, m.data);
       }
+      var pData = (m && m.data) ? m.data : m;
+      if (pData) {
+        if (pData.fred_snapshot) {
+          researchFredSnapshot = Object.assign(researchFredSnapshot || {}, pData.fred_snapshot);
+        }
+        if (pData.fred_score !== undefined) researchFredScore = pData.fred_score || 0;
+        if (pData.poly_sentiment !== undefined) researchPolySentiment = pData.poly_sentiment || 0;
+        if (pData.social_score !== undefined) researchSocialScore = pData.social_score || 0;
+        if (pData.macro_score !== undefined) researchMacroScore = pData.macro_score;
+        if (pData.polymarket_signals && pData.polymarket_signals.length > 0) {
+          if (!window._allPolySignals) window._allPolySignals = {};
+          window._allPolySignals[pid] = pData.polymarket_signals;
+        }
+        if (pData.x_feed && pData.x_feed.length > 0) {
+          researchXFeed = (researchXFeed || []).concat(pData.x_feed);
+        }
+      }
     }
     (snap.recent_trades || []).forEach(function(t) {
-      if (t.data) {
-        trades.unshift(t.data);
-        if (t.data.symbol && t.data.side && t.data.qty) {
-          addTrade(t.data.pod_id || 'unknown', t.data.symbol, t.data.side, t.data.qty, t.data.fill_price || 0);
-        }
+      if (t.data && t.data.symbol && t.data.side && t.data.qty) {
+        var oid = t.data.order_id || t.data.id || null;
+        addTrade(t.data.pod_id || 'unknown', t.data.symbol, t.data.side, t.data.qty, t.data.fill_price || 0, 'FILLED', oid);
       }
     });
     (snap.recent_governance || []).forEach(function(g) {
@@ -586,6 +675,10 @@ function handleMessage(msg) {
     (snap.recent_orders || []).forEach(function(o) {
       if (o.data && o.data.order_id) orderBook[o.data.order_id] = o.data;
     });
+    (snap.position_reviews || []).forEach(function(rv) {
+      addReviewEvent(rv);
+    });
+    updateExecTable();
     updatePodsTable();
     updateFirmMetrics();
     updatePerfTable();
@@ -595,6 +688,19 @@ function handleMessage(msg) {
     updateActivityFeed();
     updateDecisionTimeline();
     updateGovHub();
+    renderMacroIndicators();
+    updateVixKpi();
+    var mergedPoly = [];
+    if (window._allPolySignals) {
+      var seenQ = {};
+      for (var pkey in window._allPolySignals) {
+        (window._allPolySignals[pkey] || []).forEach(function(s) {
+          var q = s.question || s.market || JSON.stringify(s);
+          if (!seenQ[q]) { seenQ[q] = true; mergedPoly.push(s); }
+        });
+      }
+    }
+    updateResearchTab(mergedPoly, researchPolyConf, researchMacroScore);
     return;
   }
   if (msg.type === 'session_status') {
@@ -665,10 +771,8 @@ function handleMessage(msg) {
     }
   } else if (msg.type === 'trade') {
     const t = msg.data;
-    trades.unshift(t);
-    if (trades.length > 20) trades.pop();
     if (t.symbol && t.side && t.qty)
-      addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0);
+      addTrade(t.pod_id || 'unknown', t.symbol, t.side, t.qty, t.fill_price || 0, 'FILLED', t.order_id || t.id || null);
     if (typeof triggerTradePulse === 'function') triggerTradePulse(podFloorMap[t.pod_id] ?? 0);
     if (t.pod_id && typeof triggerPodHeartbeat === 'function') {
       triggerPodHeartbeat(t.pod_id);
@@ -697,14 +801,22 @@ function handleMessage(msg) {
     updateActivityFeed();
     updateDecisionTimeline();
     if (typeof triggerAgentActivity === 'function') triggerAgentActivity(act.pod_id, act.agent_role);
+    if (act.action === 'new_report' && act.filename) {
+      onNewReport(act.filename);
+    }
   } else if (msg.type === 'order_update') {
     var od = msg.data;
     if (od.order_id) {
       orderBook[od.order_id] = od;
       if (od.status === 'FILLED' || od.status === 'PARTIAL') {
-        addTrade(od.pod_id || 'unknown', od.symbol, od.side, od.fill_qty || od.qty, od.fill_price || 0, od.status);
+        addTrade(od.pod_id || 'unknown', od.symbol, od.side, od.fill_qty || od.qty, od.fill_price || 0, od.status, od.order_id);
       }
       updateExecTable();
+    }
+  } else if (msg.type === 'position_review') {
+    addReviewEvent(msg);
+    if (msg.data && msg.data.action === 'new_report' && msg.data.filename) {
+      loadSavedReports();
     }
   }
 }
@@ -886,7 +998,8 @@ function updatePerfTable() {
   document.getElementById('perf-table').innerHTML = ids.map(id => {
     const d   = pods[id];
     const nav = d.nav || 0;
-    const ret = ((nav - 100) / 100 * 100);
+    const sc  = d.starting_capital || (initialCapital / Math.max(Object.keys(pods).length, 1)) || 100;
+    const ret = sc > 0 ? ((nav - sc) / sc * 100) : 0;
     const pnl = d.daily_pnl || 0;
     return `<tr>
       <td class="pod-name">${id.toUpperCase()}</td>
@@ -974,8 +1087,14 @@ function updateRiskTable() {
 }
 
 // ─── 10. Execution ─────────────────────────────────────────────────────────
-function addTrade(podId, symbol, side, qty, price, status = 'FILLED') {
-  executedTrades.unshift({ podId, symbol, side: side.toUpperCase(), qty, price, status, ts: new Date().toISOString() });
+function addTrade(podId, symbol, side, qty, price, status, orderId) {
+  status = status || 'FILLED';
+  orderId = orderId || null;
+  if (orderId) {
+    var exists = executedTrades.some(function(t) { return t.orderId === orderId; });
+    if (exists) return;
+  }
+  executedTrades.unshift({ podId: podId, symbol: symbol, side: (side || '').toUpperCase(), qty: qty, price: price, status: status, ts: new Date().toISOString(), orderId: orderId });
   if (executedTrades.length > 50) executedTrades.pop();
   updateExecTable();
 }
@@ -1008,7 +1127,11 @@ function updateExecTable() {
     allItems = allItems.filter(function(t) { return t.status === execFilter.toUpperCase(); });
   }
 
-  document.getElementById('kpi-trades').textContent = executedTrades.length + obKeys.length;
+  var pendingRejectCount = obKeys.filter(function(oid) {
+    var o = orderBook[oid];
+    return o && o.status !== 'FILLED' && o.status !== 'PARTIAL' && !filledIds.has(oid);
+  }).length;
+  document.getElementById('kpi-trades').textContent = executedTrades.length + pendingRejectCount;
   document.getElementById('kpi-filled').textContent = executedTrades.filter(function(t) { return t.status === 'FILLED'; }).length;
   if (allItems.length === 0) {
     document.getElementById('exec-table').innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr>';
@@ -1154,7 +1277,7 @@ function updateDecisionTimeline() {
   var badge = document.getElementById('timeline-badge');
   if (!container) return;
   var events = activityFeed.filter(function(a) {
-    return a.action === 'trade_decision' || a.action === 'mandate_update' || a.action === 'allocation' || a.action === 'order_executed';
+    return a.action === 'trade_decision' || a.action === 'mandate_update' || a.action === 'allocation' || a.action === 'order_executed' || a.action === 'position_review' || a.action === 'position_review_decision' || a.action === 'new_report';
   });
   if (badge) badge.textContent = events.length + ' event' + (events.length !== 1 ? 's' : '');
   if (events.length === 0) {
@@ -1165,7 +1288,12 @@ function updateDecisionTimeline() {
     var roleColor = ROLE_COLORS[ev.agent_role] || '#6a90aa';
     var ts = ev.ts ? new Date(ev.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
     var detailText = ev.detail || '';
-    var hasDetail = detailText.length > 0;
+    var fullSummary = ev.summary || '';
+    var shortSummary = fullSummary.length > 120 ? fullSummary.substring(0, 120) + '…' : fullSummary;
+    var hasExpandable = detailText.length > 0 || fullSummary.length > 120;
+    var expandContent = detailText.length > 0
+      ? (fullSummary.length > 120 ? escapeHtml(fullSummary) + '\n\n───\n\n' + escapeHtml(detailText) : escapeHtml(detailText))
+      : escapeHtml(fullSummary);
     var cardId = 'tl-' + (ev.ts || '') + '-' + (ev.agent_role || '');
     return '<div class="tl-card" id="' + cardId + '">' +
       '<div class="tl-header">' +
@@ -1173,10 +1301,10 @@ function updateDecisionTimeline() {
         '<span class="feed-badge" style="background:' + roleColor + '">' + escapeHtml(ev.agent_role || '?') + '</span>' +
         '<span class="tl-pod">' + escapeHtml((ev.pod_id || '').toUpperCase()) + '</span>' +
         '<span class="tl-action">' + escapeHtml((ev.action || '').replace(/_/g, ' ')) + '</span>' +
-        (hasDetail ? '<span class="tl-expand" onclick="toggleTlDetail(\'' + cardId + '\')">&#9660;</span>' : '') +
+        (hasExpandable ? '<span class="tl-expand" onclick="toggleTlDetail(\'' + cardId + '\')">&#9660;</span>' : '') +
       '</div>' +
-      '<div class="tl-summary">' + escapeHtml(ev.summary || '') + '</div>' +
-      (hasDetail ? '<div class="tl-detail" style="display:none">' + escapeHtml(detailText).slice(0, 500) + '</div>' : '') +
+      '<div class="tl-summary">' + escapeHtml(shortSummary) + '</div>' +
+      (hasExpandable ? '<div class="tl-detail" style="display:none">' + expandContent + '</div>' : '') +
       '</div>';
   }).join('');
 }
@@ -1193,7 +1321,7 @@ function toggleTlDetail(cardId) {
 }
 
 // ─── 15. Activity Feed ─────────────────────────────────────────────────────
-var ROLE_COLORS = { CEO: '#f5a623', CIO: '#00d4f0', CRO: '#e84040', PM: '#00d68f', Trader: '#8b6cff', Researcher: '#6a90aa' };
+var ROLE_COLORS = { CEO: '#f5a623', CIO: '#00d4f0', CRO: '#e84040', PM: '#00d68f', Trader: '#8b6cff', Researcher: '#6a90aa', Risk: '#ff6b35' };
 
 function toggleIntelFeed() {
   var el = document.getElementById('activity-feed');
@@ -1209,27 +1337,53 @@ function updateActivityFeed() {
     list.innerHTML = '<div class="feed-empty">Waiting for agent activity&hellip;</div>';
     return;
   }
-  list.innerHTML = activityFeed.slice(0, 20).map(function(item) {
+  list.innerHTML = activityFeed.slice(0, 30).map(function(item, idx) {
     var roleColor = ROLE_COLORS[item.agent_role] || '#6a90aa';
     var ts = item.ts ? new Date(item.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
     var actionLabel = (item.action || '').replace(/_/g, ' ');
-    var summaryHtml;
+    var fullSummary = item.summary || '';
+    var detail = item.detail || '';
+    var hasExpandable = fullSummary.length > 80 || detail.length > 0;
+    var shortSummary;
     if (item.action === 'article_deep_dive' && item.urls) {
-      summaryHtml = escapeHtml(item.summary || '') + ' ' +
+      shortSummary = escapeHtml(fullSummary) + ' ' +
         (item.urls || []).map(function(u) {
-          return '<a href="' + escapeHtml(u) + '" target="_blank" rel="noopener" style="color:var(--cyan);font-size:9px">[source]</a>';
+          return '<a href="' + escapeHtml(u) + '" target="_blank" rel="noopener" style="color:var(--cyan);font-size:9px" onclick="event.stopPropagation()">[source]</a>';
         }).join(' ');
     } else {
-      summaryHtml = escapeHtml(truncate(item.summary || '', 80));
+      shortSummary = escapeHtml(truncate(fullSummary, 80));
     }
-    return '<div class="feed-item">' +
+    var expandIcon = hasExpandable ? '<span class="feed-expand-icon">&#9654;</span>' : '';
+    var detailHtml = '';
+    if (hasExpandable) {
+      var detailParts = [];
+      if (fullSummary.length > 80) detailParts.push('<div class="feed-detail-summary">' + escapeHtml(fullSummary) + '</div>');
+      if (detail) detailParts.push('<div class="feed-detail-text">' + escapeHtml(detail) + '</div>');
+      detailHtml = '<div class="feed-detail" id="feed-detail-' + idx + '" style="display:none">' + detailParts.join('') + '</div>';
+    }
+    return '<div class="feed-item-wrap' + (hasExpandable ? ' feed-expandable' : '') + '" onclick="toggleFeedDetail(' + idx + ')">' +
+      '<div class="feed-item">' +
+      expandIcon +
       '<span class="feed-badge" style="background:' + roleColor + '">' + escapeHtml(item.agent_role || '?') + '</span>' +
       '<span class="feed-pod">' + escapeHtml((item.pod_id || '').toUpperCase()) + '</span>' +
       '<span class="feed-action">' + escapeHtml(actionLabel) + '</span>' +
-      '<span class="feed-summary">' + summaryHtml + '</span>' +
+      '<span class="feed-summary">' + shortSummary + '</span>' +
       '<span class="feed-ts">' + ts + '</span>' +
+      '</div>' +
+      detailHtml +
       '</div>';
   }).join('');
+}
+
+function toggleFeedDetail(idx) {
+  var el = document.getElementById('feed-detail-' + idx);
+  if (!el) return;
+  var wrap = el.parentElement;
+  var isHidden = el.style.display === 'none';
+  el.style.display = isHidden ? 'block' : 'none';
+  if (wrap) wrap.classList.toggle('feed-expanded', isHidden);
+  var icon = wrap ? wrap.querySelector('.feed-expand-icon') : null;
+  if (icon) icon.innerHTML = isHidden ? '&#9660;' : '&#9654;';
 }
 
 // ─── 16. CSV Export ─────────────────────────────────────────────────────────
@@ -1470,9 +1624,8 @@ function updateAttribution() {
     firmPnl += pnl;
     var podTrades = executedTrades.filter(function(t) { return (t.podId || '').toLowerCase() === id.toLowerCase(); });
     var tradeCount = podTrades.length;
-    var wins = podTrades.filter(function(t) { return (t.price || 0) > 0; }).length;
     var ret = sc > 0 ? (pnl / sc * 100) : 0;
-    return { id: id, pnl: pnl, ret: ret, trades: tradeCount, wins: wins, nav: nav };
+    return { id: id, pnl: pnl, ret: ret, trades: tradeCount, nav: nav };
   });
   var maxAbsPnl = Math.max.apply(null, podStats.map(function(p) { return Math.abs(p.pnl); })) || 1;
 
@@ -1481,19 +1634,112 @@ function updateAttribution() {
     var pct = firmPnl !== 0 ? (p.pnl / Math.abs(firmPnl) * 100) : 0;
     var barW = Math.abs(p.pnl) / maxAbsPnl * 100;
     var col = p.pnl >= 0 ? '#00d68f' : '#e84040';
-    var wr = p.trades > 0 ? (p.wins / p.trades * 100).toFixed(0) + '%' : '—';
+    var status = p.pnl > 0 ? 'Positive' : p.pnl < 0 ? 'Negative' : 'Flat';
     html += '<div class="attr-row">' +
       '<span class="attr-pod">' + p.id.toUpperCase() + '</span>' +
       '<div class="attr-bar-wrap"><div class="attr-bar" style="width:' + barW.toFixed(0) + '%;background:' + col + '"></div></div>' +
       '<span class="attr-val" style="color:' + col + '">' + (p.pnl >= 0 ? '+' : '') + '$' + p.pnl.toFixed(2) + '</span>' +
       '<span class="attr-pct">' + (pct >= 0 ? '+' : '') + pct.toFixed(0) + '%</span>' +
-      '<span class="attr-stat">' + p.trades + ' trades · WR ' + wr + '</span>' +
+      '<span class="attr-stat">' + p.trades + ' trades · ' + (p.ret >= 0 ? '+' : '') + p.ret.toFixed(1) + '% return</span>' +
       '</div>';
   });
   html += '</div>';
   container.innerHTML = html;
 }
 
-// ─── 21. Init ──────────────────────────────────────────────────────────────
+// ─── 21. Position Review / Reports Tab ──────────────────────────────────────
+var reviewEvents = [];
+
+function addReviewEvent(ev) {
+  reviewEvents.push(ev);
+  renderReviews();
+}
+
+function renderReviews() {
+  var container = document.getElementById('review-list');
+  var badge = document.getElementById('review-badge');
+  if (!container) return;
+
+  var pods = {};
+  reviewEvents.forEach(function(ev) {
+    var d = ev.data || {};
+    var podId = d.pod_id || 'firm';
+    var action = d.action || '';
+    if (!pods[podId]) pods[podId] = { challenge: '', pm_defense: '', cio_decision: '', counter: '', final: '', summary: '' };
+    if (action === 'position_review') pods[podId].challenge = d.detail || d.summary || '';
+    if (action === 'position_review' && d.agent_role === 'PM') pods[podId].pm_defense = d.detail || d.summary || '';
+    if (action === 'position_review_decision') pods[podId].cio_decision = d.detail || d.summary || '';
+    if (action === 'position_review_counter') pods[podId].counter = d.detail || d.summary || '';
+    if (action === 'position_review_final') pods[podId].final = d.detail || d.summary || '';
+    if (action === 'review_completed') pods[podId].summary = d.detail || d.summary || '';
+    if (action === 'position_review_override') pods[podId].override = d.detail || d.summary || '';
+  });
+
+  var podIds = Object.keys(pods).filter(function(p) { return p !== 'firm'; }).sort();
+  if (badge) badge.textContent = podIds.length + ' review' + (podIds.length !== 1 ? 's' : '');
+
+  if (podIds.length === 0) {
+    container.innerHTML = '<div class="empty"><div class="empty-txt">No position reviews yet</div><div class="empty-hint">Reviews run daily when positions are held</div></div>';
+    return;
+  }
+
+  container.innerHTML = podIds.map(function(pid) {
+    var r = pods[pid];
+    var sections = '';
+
+    if (r.challenge) {
+      sections += '<div class="review-section"><div class="review-label">CIO CHALLENGE</div><div class="review-text">' + escapeHtml(r.challenge) + '</div></div>';
+    }
+    if (r.pm_defense) {
+      sections += '<div class="review-section"><div class="review-label">PM DEFENSE</div><div class="review-text">' + escapeHtml(r.pm_defense) + '</div></div>';
+    }
+    if (r.cio_decision) {
+      sections += '<div class="review-section"><div class="review-label">CIO DECISION</div><div class="review-text">' + escapeHtml(r.cio_decision) + '</div></div>';
+    }
+    if (r.override) {
+      sections += '<div class="review-section"><div class="review-label">CIO OVERRIDE</div><div class="review-text review-override">' + escapeHtml(r.override) + '</div></div>';
+    }
+    if (r.counter) {
+      sections += '<div class="review-section"><div class="review-label">PM COUNTER-ARGUMENT</div><div class="review-text">' + escapeHtml(r.counter) + '</div></div>';
+    }
+    if (r.final) {
+      sections += '<div class="review-section"><div class="review-label">CIO FINAL RULING</div><div class="review-text">' + escapeHtml(r.final) + '</div></div>';
+    }
+
+    return '<div class="review-card"><div class="review-pod-header">' + pid.toUpperCase() + ' — Position Review</div>' + sections + '</div>';
+  }).join('');
+}
+
+function escapeHtml(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+}
+
+function loadSavedReports() {
+  var container = document.getElementById('saved-reports-list');
+  if (!container) return;
+  container.innerHTML = '<div class="empty"><div class="empty-txt">Loading…</div></div>';
+  fetch('/api/reports')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      var reports = data.reports || [];
+      if (reports.length === 0) {
+        container.innerHTML = '<div class="empty"><div class="empty-txt">No saved reports</div><div class="empty-hint">Reports are generated after daily position reviews</div></div>';
+        return;
+      }
+      container.innerHTML = reports.map(function(r) {
+        return '<div class="saved-report-item" onclick="window.open(\'/api/reports/' + r.filename + '\', \'_blank\')">' +
+          '<div class="saved-report-icon">&#128196;</div>' +
+          '<div class="saved-report-info"><div class="saved-report-date">' + r.date + '</div><div class="saved-report-size">' + r.size_kb + ' KB</div></div>' +
+          '<a class="saved-report-dl" href="/api/reports/' + r.filename + '" target="_blank" onclick="event.stopPropagation()">OPEN</a>' +
+          '</div>';
+      }).join('');
+    })
+    .catch(function() {
+      container.innerHTML = '<div class="empty"><div class="empty-txt">Failed to load reports</div></div>';
+    });
+}
+
+// ─── 22. Init ──────────────────────────────────────────────────────────────
 initResearchHistoryChart();
 updateGovHub();
+loadSavedReports();

@@ -2,7 +2,6 @@
 
 // Shared state (accessible from motion.js and dashboard.js)
 var pods = {};
-var trades = [];
 var navHistory = [];
 var riskAlerts = [];
 var executedTrades = [];

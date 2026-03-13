@@ -49,20 +49,40 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 
 ## Testing
 
+### Global conftest.py disables LLM keys (critical for speed)
+- `tests/conftest.py` clears `OPENROUTER_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` via `pytest_configure` (runs before imports)
+- This forces all CEO/CIO/PM agents into rule-based mode — no network calls, no 15s timeouts
+- Without this, tests that touch governance or PM agents make real API calls (8 models × 15s timeout each)
+- Impact: test suite went from 773s → 78s (10x speedup)
+- If a test specifically needs LLM behavior, mock `llm_chat` directly instead of using real API keys
+
+### Never cache has_llm_key() at module level
+- `_HAS_LLM = has_llm_key()` at module top-level evaluates at import time, before conftest can clear env vars
+- Always call `has_llm_key()` at runtime (inside methods) so conftest patching works
+- Fixed in gamma/delta PM agents; equities/fx/crypto/commodities already call at runtime
+
 ### Tests must not depend on .env secrets
-- Tests that force rule-based mode must clear `OPENROUTER_API_KEY` (not just `OPENAI_API_KEY`)
-- Use `monkeypatch.delenv()` or `patch.dict(os.environ, {...})` in fixtures
-- Lesson: when switching LLM providers, update ALL test patches
+- `tests/conftest.py` handles this globally now — no need for per-test `monkeypatch.delenv()`
+- Individual tests can still override if they need specific key behavior
+
+### Mock yfinance in tests
+- Real yfinance calls add 5-18s per test and are flaky (rate limits, network)
+- Patch `YFinanceAdapter._fetch_sync` with deterministic synthetic bars
+- Use midnight timestamps for bars if the ParquetCache will filter by date range
 
 ### Log message assertions are fragile
 - Tests that assert on log message content break when log formats change
 - Use substring matching (`"Failed to process" in msg`) not exact strings
 - When updating log messages in production code, grep tests for the old string
 
+### Keep asyncio.sleep short in event loop tests
+- `run_event_loop(interval_seconds=0.01)` iterates every 10ms — no need to sleep 2-3s
+- Use `asyncio.sleep(0.3)` for event loop tests (gives 30+ iterations)
+- Longer sleeps only add wall-clock time without improving coverage
+
 ### Timing-sensitive async tests
 - Tests using `asyncio.sleep(0.15)` with `governance_freq=1` can miss governance calls if `fetch_bars` runs out of `side_effect` entries
 - Use `return_value` (never exhausts) instead of short `side_effect` lists
-- Give generous sleep time (0.5s+) for integration tests
 
 ---
 

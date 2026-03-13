@@ -133,6 +133,97 @@ button { font-family: inherit; cursor: pointer; }
   background: rgba(232,64,64,0.12);
 }
 
+/* Reports dropdown */
+.sb-reports-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.sb-btn-reports {
+  color: var(--accent, #00cfe8);
+  border-color: var(--accent, #00cfe8);
+}
+.sb-btn-reports:hover {
+  background: rgba(0,207,232,0.12);
+}
+.sb-btn-reports.has-new {
+  animation: reportPulse 1.5s ease-in-out 3;
+}
+@keyframes reportPulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: 0 0 8px rgba(0,207,232,0.5); }
+}
+.sb-reports-dropdown {
+  display: none;
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  min-width: 300px;
+  background: var(--bg-card, #1a2535);
+  border: 1px solid var(--border, #2a3a50);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 200;
+  overflow: hidden;
+  animation: dropSlide 0.2s ease-out;
+}
+.sb-reports-dropdown.open {
+  display: block;
+}
+@keyframes dropSlide {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.reports-header {
+  padding: 10px 14px 8px;
+  font-size: 10px;
+  letter-spacing: 1.5px;
+  color: var(--text-dim, #6a90aa);
+  border-bottom: 1px solid var(--border, #2a3a50);
+  text-transform: uppercase;
+}
+.reports-list {
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 4px 0;
+  font-size: 12px;
+  color: var(--text-secondary, #8aa0b8);
+}
+.report-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+.report-item:hover {
+  background: rgba(255,255,255,0.04);
+}
+.report-item-date {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-primary, #e0e8f0);
+}
+.report-item-size {
+  font-size: 10px;
+  color: var(--text-dim, #6a90aa);
+  margin-left: 8px;
+}
+.report-item-dl {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  color: var(--accent, #00cfe8);
+  text-decoration: none;
+  padding: 2px 8px;
+  border: 1px solid var(--accent, #00cfe8);
+  border-radius: 3px;
+  transition: background 0.15s;
+}
+.report-item-dl:hover {
+  background: rgba(0,207,232,0.12);
+}
+
 /* ============================================================
    LEFT PANEL — 3D VIEWPORT
 ============================================================ */
@@ -263,7 +354,8 @@ button { font-family: inherit; cursor: pointer; }
   flex-direction: column;
   background: var(--bg-base);
   border-left: 1px solid var(--border-base);
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* Floor header */
@@ -1050,12 +1142,10 @@ button { font-family: inherit; cursor: pointer; }
 #activity-feed {
   border-top: 1px solid var(--border-dim);
   background: var(--bg-surface);
-  flex-shrink: 0;
-  overflow: hidden;
-  transition: max-height 0.25s ease;
-  max-height: 260px;
+  flex-shrink: 1;
+  min-height: 28px;
 }
-#activity-feed.collapsed { max-height: 28px; }
+#activity-feed.collapsed { max-height: 28px; overflow: hidden; }
 #activity-feed.collapsed #feed-list { display: none; }
 .feed-header {
   font-size: 9px;
@@ -1088,7 +1178,7 @@ button { font-family: inherit; cursor: pointer; }
   font-weight: 400;
 }
 #feed-list {
-  max-height: 230px;
+  max-height: 50vh;
   overflow-y: auto;
 }
 .feed-empty {
@@ -1097,6 +1187,12 @@ button { font-family: inherit; cursor: pointer; }
   padding: 12px;
   text-align: center;
 }
+.feed-item-wrap {
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.feed-item-wrap.feed-expandable { cursor: pointer; }
+.feed-item-wrap.feed-expandable:hover { background: rgba(255,255,255,0.02); }
+.feed-item-wrap.feed-expanded { background: rgba(255,255,255,0.03); }
 .feed-item {
   display: flex;
   align-items: center;
@@ -1104,10 +1200,17 @@ button { font-family: inherit; cursor: pointer; }
   padding: 3px 12px;
   font-size: 10px;
   font-family: var(--font-mono);
-  border-bottom: 1px solid rgba(255,255,255,0.03);
   line-height: 1.4;
 }
-.feed-item:hover { background: rgba(255,255,255,0.02); }
+.feed-expand-icon {
+  font-size: 7px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+  width: 10px;
+  text-align: center;
+  transition: color 0.15s;
+}
+.feed-expandable:hover .feed-expand-icon { color: var(--cyan); }
 .feed-badge {
   font-size: 8px;
   font-weight: 700;
@@ -1145,6 +1248,35 @@ button { font-family: inherit; cursor: pointer; }
   flex-shrink: 0;
   margin-left: auto;
 }
+.feed-detail {
+  padding: 4px 12px 8px 28px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  line-height: 1.5;
+  border-top: 1px solid rgba(255,255,255,0.04);
+  animation: feedDetailIn 0.15s ease-out;
+  max-height: 400px;
+  overflow-y: auto;
+}
+@keyframes feedDetailIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.feed-detail-summary {
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  margin-bottom: 4px;
+}
+.feed-detail-text {
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  padding: 4px 8px;
+  background: rgba(0,0,0,0.2);
+  border-radius: 3px;
+  border-left: 2px solid rgba(255,255,255,0.08);
+}
 
 /* ============================================================
    DRAWDOWN CHART
@@ -1158,7 +1290,7 @@ button { font-family: inherit; cursor: pointer; }
    DECISION TIMELINE
 ============================================================ */
 .decision-timeline {
-  max-height: 360px;
+  max-height: 500px;
   overflow-y: auto;
   padding: 4px 0;
 }
@@ -1207,6 +1339,8 @@ button { font-family: inherit; cursor: pointer; }
   font-size: 10px;
   color: var(--text-primary);
   line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 .tl-detail {
   font-size: 10px;
@@ -1219,7 +1353,7 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 3px;
   white-space: pre-wrap;
   word-break: break-word;
-  max-height: 200px;
+  max-height: 300px;
   overflow-y: auto;
 }
 
@@ -1395,3 +1529,94 @@ button { font-family: inherit; cursor: pointer; }
 .attr-val { font-size: 11px; font-weight: 600; text-align: right; }
 .attr-pct { font-size: 10px; color: var(--text-dim); text-align: right; }
 .attr-stat { font-size: 9px; color: var(--text-dim); }
+
+/* ============================================================
+   REPORTS TAB — POSITION REVIEWS & SAVED REPORTS
+============================================================ */
+.review-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+.review-pod-header {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--cyan);
+  margin-bottom: 14px;
+  letter-spacing: 0.5px;
+}
+.review-section {
+  margin-bottom: 12px;
+}
+.review-label {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  text-transform: uppercase;
+}
+.review-text {
+  font-size: 11px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 8px 10px;
+  background: rgba(13, 21, 32, 0.6);
+  border-radius: 4px;
+  border: 1px solid rgba(42, 58, 80, 0.3);
+}
+.review-text.review-override {
+  border-left: 3px solid #e84040;
+}
+.saved-report-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+.saved-report-item:hover {
+  border-color: var(--cyan);
+}
+.saved-report-icon {
+  font-size: 22px;
+  opacity: 0.6;
+}
+.saved-report-info {
+  flex: 1;
+}
+.saved-report-date {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+.saved-report-size {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.saved-report-dl {
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--cyan);
+  text-decoration: none;
+  padding: 4px 10px;
+  border: 1px solid var(--cyan);
+  border-radius: 4px;
+  transition: background 0.15s;
+}
+.saved-report-dl:hover {
+  background: rgba(0, 207, 232, 0.15);
+}
+.sec-btn {
+  cursor: pointer;
+}
