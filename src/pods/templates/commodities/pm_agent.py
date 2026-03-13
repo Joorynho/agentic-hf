@@ -378,11 +378,15 @@ class CommoditiesPMAgent(BasePodAgent):
             neut_count = len(headlines) - bull_count - bear_count
             sents = [h.get("sentiment", 0.0) for h in headlines]
             avg_sent = sum(sents) / len(sents) if sents else 0.0
-            sections.append(f"  Sentiment summary: avg={avg_sent:+.2f} | {bull_count} bullish, {bear_count} bearish, {neut_count} neutral")
+            avg_rel = sum(h.get("relevancy", 0.5) for h in headlines) / len(headlines)
+            avg_imp = sum(h.get("impact", 0.3) for h in headlines) / len(headlines)
+            sections.append(f"  Summary: sentiment={avg_sent:+.2f} | relevancy={avg_rel:.2f} | impact={avg_imp:.2f} | {bull_count} bullish, {bear_count} bearish, {neut_count} neutral")
             for h in headlines[:15]:
                 sl = h.get("sentiment_label", "neutral")
                 sv = h.get("sentiment", 0.0)
-                line = f"  - [{h.get('source','')} | {sl} {sv:+.2f}] {h.get('title','')}"
+                rel = h.get("relevancy", 0.5)
+                imp = h.get("impact", 0.3)
+                line = f"  - [{h.get('source','')} | {sl} {sv:+.2f} | rel:{rel:.1f} imp:{imp:.1f}] {h.get('title','')}"
                 if h.get("url"):
                     line += f"  ({h['url']})"
                 sections.append(line)

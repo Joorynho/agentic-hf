@@ -8,6 +8,7 @@ from src.core.config.universes import COMMODITIES_SEED
 from src.core.models.messages import AgentMessage
 from src.core.scoring import compute_macro_score
 from src.data.adapters.fred_adapter import FredAdapter
+from src.data.adapters.sentiment import score_items
 from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.data.adapters.market_tracker import MarketTracker
 from src.data.adapters.rss_adapter import RssAdapter
@@ -141,9 +142,27 @@ class CommoditiesResearcher(BasePodAgent):
                 logger.info("[commodities.researcher] Live price fetch failed: %s", e)
         self.store("live_quotes", live_quotes)
 
-        news_sents = [getattr(n, "sentiment", 0.0) for n in news_items]
-        social_sents = [t.get("sentiment", 0.0) if isinstance(t, dict) else getattr(t, "sentiment", 0.0) for t in x_feed]
-        regime = compute_macro_score(fred_snapshot, poly_signals, news_sents, social_sents)
+        # LLM-score headlines and predictions for accurate sentiment
+        headline_dicts = []
+        for n in news_items[:15]:
+            title = getattr(n, "title", "") if hasattr(n, "title") else (n.get("title", "") if isinstance(n, dict) else "")
+            source = getattr(n, "source", "") if hasattr(n, "source") else (n.get("source", "") if isinstance(n, dict) else "")
+            if title:
+                headline_dicts.append({"title": title, "source": source, "url": ""})
+        for t in x_feed[:15 - len(headline_dicts)]:
+            text = t.get("text", t.get("title", "")) if isinstance(t, dict) else getattr(t, "text", "")
+            if text:
+                headline_dicts.append({"title": text, "source": "news", "url": ""})
+
+        pred_dicts = [{"question": s.get("question", s.get("market", "?")), "probability": s.get("implied_prob", 0.5)} for s in poly_signals[:10]]
+        scored_headlines, scored_preds = score_items(headline_dicts, pred_dicts, "commodities")
+
+        news_sents = [h.get("sentiment", 0.0) for h in scored_headlines]
+        social_sents = []
+        poly_sents = [p.get("sentiment", 0.0) for p in scored_preds]
+        poly_override = sum(poly_sents) / len(poly_sents) if poly_sents else None
+
+        regime = compute_macro_score(fred_snapshot, poly_signals, news_sents, social_sents, poly_sentiment_override=poly_override)
         for key, val in regime.items():
             self.store(key, val)
         self.store("researcher_ok", True)

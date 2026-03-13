@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 from src.core.regime import classify_regime
 from src.data.adapters.fred_adapter import FredAdapter
+from src.data.adapters.sentiment import score_items
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
@@ -55,18 +56,16 @@ class FXSignalAgent(BasePodAgent):
             title = item.get("title", "") if isinstance(item, dict) else getattr(item, "title", "")
             source = item.get("source", "") if isinstance(item, dict) else getattr(item, "source", "")
             url = item.get("url", "") if isinstance(item, dict) else getattr(item, "url", "")
-            sent = item.get("sentiment", 0.0) if isinstance(item, dict) else getattr(item, "sentiment", 0.0)
             if title:
-                label = "bullish" if sent > 0.1 else ("bearish" if sent < -0.1 else "neutral")
-                headlines.append({"title": title, "source": source, "url": url, "sentiment": sent, "sentiment_label": label})
+                headlines.append({"title": title, "source": source, "url": url})
         for tweet in x_feed[:_MAX_HEADLINES - len(headlines)]:
             text = tweet.get("text", tweet.get("title", "")) if isinstance(tweet, dict) else getattr(tweet, "text", "")
             username = tweet.get("username", "") if isinstance(tweet, dict) else getattr(tweet, "username", "")
             url = tweet.get("url", "") if isinstance(tweet, dict) else getattr(tweet, "url", "")
-            sent = tweet.get("sentiment", 0.0) if isinstance(tweet, dict) else getattr(tweet, "sentiment", 0.0)
-            sent_label = tweet.get("sentiment_label", "neutral") if isinstance(tweet, dict) else "neutral"
             if text:
-                headlines.append({"title": text, "source": username or "news", "url": url, "sentiment": sent, "sentiment_label": sent_label})
+                headlines.append({"title": text, "source": username or "news", "url": url})
+
+        headlines, poly_summary = score_items(headlines, poly_summary, "fx")
 
         price_snapshot = []
         for sym, q in live_quotes.items():

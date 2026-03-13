@@ -394,7 +394,7 @@
           <br>
           <b style="color:var(--text-primary)">2. FRED Score (30%)</b> — composite of yield curve slope, VIX stress, and credit spread from the Federal Reserve.
           <br>
-          <b style="color:var(--text-primary)">3. News Score (20%)</b> — average sentiment polarity from financial news headlines across all asset classes (keyword-scored from RSS, GDELT, and news feeds).
+          <b style="color:var(--text-primary)">3. News Score (20%)</b> — average sentiment polarity from financial news headlines across all asset classes (LLM-scored for relevancy and impact, with keyword fallback).
           <br><br>
           <span style="color:var(--text-primary); font-family:var(--font-mono); font-size:10px;">
             macro_score = 0.5 × poly_sentiment + 0.3 × fred_score + 0.2 × news_score

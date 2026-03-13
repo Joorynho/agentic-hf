@@ -52,7 +52,7 @@ class TestSentimentScoring:
 
     def test_bearish_text(self):
         from src.data.adapters.sentiment import compute_keyword_sentiment
-        score = compute_keyword_sentiment("Crash fears as recession risk grows amid crisis")
+        score = compute_keyword_sentiment("Crash fears as recession deepens amid crisis")
         assert score < 0
 
     def test_neutral_text(self):

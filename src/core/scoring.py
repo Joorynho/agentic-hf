@@ -156,15 +156,22 @@ def compute_macro_score(
     *,
     news_count: int = 0,
     social_count: int = 0,
+    poly_sentiment_override: float | None = None,
 ) -> dict:
     """Compute the full macro regime score and sub-components.
 
     Accepts either sentiment value lists (preferred) or item counts
     (backward-compat fallback). Returns dict with: macro_score,
     fred_score, poly_sentiment, social_score, polymarket_confidence.
+
+    If poly_sentiment_override is provided (e.g. from LLM scoring),
+    it replaces the keyword-based compute_poly_score result.
     """
     fred_score = compute_fred_score(fred_snapshot)
-    poly_score = compute_poly_score(poly_signals)
+    if poly_sentiment_override is not None:
+        poly_score = max(-1.0, min(1.0, poly_sentiment_override))
+    else:
+        poly_score = compute_poly_score(poly_signals)
 
     if news_sentiments is not None or social_sentiments is not None:
         news_score = compute_news_sentiment_score(
