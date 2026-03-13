@@ -8,7 +8,7 @@ Produces a macro_score in [-1, +1] where:
 Components:
   fred_score (50%): Hard economic data — yield curve, VIX, credit, real rates, inflation
   poly_score (30%): Market-implied expectations from prediction markets
-  activity_score (20%): News activity level — elevated attention often signals risk
+  news_sentiment (20%): Average sentiment polarity from financial news headlines
 """
 from __future__ import annotations
 
@@ -116,46 +116,72 @@ def compute_poly_score(signals: list) -> float:
     return max(-1.0, min(1.0, (avg_prob - 0.5) * 0.5))
 
 
-def compute_activity_score(news_count: int, social_count: int) -> float:
-    """News activity level, scaled to [-1, +1].
+def compute_news_sentiment_score(
+    news_sentiments: list[float],
+    social_sentiments: list[float],
+) -> float:
+    """Aggregate news sentiment score, scaled to [-1, +1].
 
-    Baseline ~20 items/cycle is neutral. Elevated activity suggests
-    market-moving events (slightly bearish — uncertainty/attention spikes
-    during stress). Very low activity = calm (slightly bullish).
+    Averages actual sentiment values from news items. Falls back to an
+    activity-based heuristic if all sentiments are zero (backward compat
+    with adapters that haven't been updated yet).
     """
-    total = news_count + social_count
-    if total == 0:
-        return 0.2  # Calm, no news is mildly positive
+    all_vals = list(news_sentiments) + list(social_sentiments)
+    if not all_vals:
+        return 0.2  # No news is mildly positive
 
-    # Log scale: 5 items → +0.3, 20 → 0.0, 50 → -0.3, 200+ → -0.7
+    has_real_sentiment = any(v != 0.0 for v in all_vals)
+    if has_real_sentiment:
+        return max(-1.0, min(1.0, sum(all_vals) / len(all_vals)))
+
+    # Fallback: activity heuristic (all sentiments are 0.0)
+    total = len(all_vals)
     log_items = math.log1p(total)
-    baseline = math.log1p(20)  # ~3.0
+    baseline = math.log1p(20)
     deviation = (baseline - log_items) / baseline
     return max(-1.0, min(1.0, deviation))
+
+
+# Keep old name as alias for backward compatibility
+compute_activity_score = lambda news_count, social_count: compute_news_sentiment_score(
+    [0.0] * news_count, [0.0] * social_count
+)
 
 
 def compute_macro_score(
     fred_snapshot: dict,
     poly_signals: list,
-    news_count: int,
-    social_count: int,
+    news_sentiments: list[float] | None = None,
+    social_sentiments: list[float] | None = None,
+    *,
+    news_count: int = 0,
+    social_count: int = 0,
 ) -> dict:
     """Compute the full macro regime score and sub-components.
 
-    Returns dict with: macro_score, fred_score, poly_sentiment,
-    activity_score, polymarket_confidence.
+    Accepts either sentiment value lists (preferred) or item counts
+    (backward-compat fallback). Returns dict with: macro_score,
+    fred_score, poly_sentiment, social_score, polymarket_confidence.
     """
     fred_score = compute_fred_score(fred_snapshot)
     poly_score = compute_poly_score(poly_signals)
-    activity = compute_activity_score(news_count, social_count)
 
-    # Weighted blend: hard data 50%, market expectations 30%, activity 20%
+    if news_sentiments is not None or social_sentiments is not None:
+        news_score = compute_news_sentiment_score(
+            news_sentiments or [], social_sentiments or []
+        )
+    else:
+        news_score = compute_news_sentiment_score(
+            [0.0] * news_count, [0.0] * social_count
+        )
+
+    # Weighted blend: hard data 50%, market expectations 30%, news sentiment 20%
     available = []
     if fred_snapshot:
         available.append((0.50, fred_score))
     if poly_signals:
         available.append((0.30, poly_score))
-    available.append((0.20, activity))
+    available.append((0.20, news_score))
 
     if available:
         total_weight = sum(w for w, _ in available)
@@ -170,6 +196,6 @@ def compute_macro_score(
         "macro_score": round(macro_score, 6),
         "fred_score": round(fred_score, 6),
         "poly_sentiment": round(poly_score, 6),
-        "social_score": round(activity, 6),
+        "social_score": round(news_score, 6),
         "polymarket_confidence": round(confidence, 6),
     }

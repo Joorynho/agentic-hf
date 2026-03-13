@@ -252,8 +252,16 @@ class FXPMAgent(BasePodAgent):
         sections.append("\n## News Headlines")
         headlines = features.get("news_headlines", [])
         if headlines:
+            bull_count = sum(1 for h in headlines if h.get("sentiment_label") == "bullish")
+            bear_count = sum(1 for h in headlines if h.get("sentiment_label") == "bearish")
+            neut_count = len(headlines) - bull_count - bear_count
+            sents = [h.get("sentiment", 0.0) for h in headlines]
+            avg_sent = sum(sents) / len(sents) if sents else 0.0
+            sections.append(f"  Sentiment summary: avg={avg_sent:+.2f} | {bull_count} bullish, {bear_count} bearish, {neut_count} neutral")
             for h in headlines[:15]:
-                line = f"  - [{h.get('source','')}] {h.get('title','')}"
+                sl = h.get("sentiment_label", "neutral")
+                sv = h.get("sentiment", 0.0)
+                line = f"  - [{h.get('source','')} | {sl} {sv:+.2f}] {h.get('title','')}"
                 if h.get("url"):
                     line += f"  ({h['url']})"
                 sections.append(line)

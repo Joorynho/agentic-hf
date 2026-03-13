@@ -141,12 +141,14 @@ class CommoditiesResearcher(BasePodAgent):
                 logger.info("[commodities.researcher] Live price fetch failed: %s", e)
         self.store("live_quotes", live_quotes)
 
-        regime = compute_macro_score(fred_snapshot, poly_signals, len(news_items), len(x_feed))
+        news_sents = [getattr(n, "sentiment", 0.0) for n in news_items]
+        social_sents = [t.get("sentiment", 0.0) if isinstance(t, dict) else getattr(t, "sentiment", 0.0) for t in x_feed]
+        regime = compute_macro_score(fred_snapshot, poly_signals, news_sents, social_sents)
         for key, val in regime.items():
             self.store(key, val)
         self.store("researcher_ok", True)
 
-        logger.info("[commodities.researcher] fred=%.3f poly=%.3f activity=%.3f -> macro=%.3f | news=%d x=%d prices=%d",
+        logger.info("[commodities.researcher] fred=%.3f poly=%.3f sentiment=%.3f -> macro=%.3f | news=%d x=%d prices=%d",
                     regime["fred_score"], regime["poly_sentiment"], regime["social_score"],
                     regime["macro_score"], len(news_items), len(x_feed), len(live_quotes))
 

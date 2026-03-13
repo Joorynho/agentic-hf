@@ -23,6 +23,12 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from src.core.models.market import NewsItem
+from src.data.adapters.sentiment import (
+    BULLISH_WORDS,
+    BEARISH_WORDS,
+    compute_keyword_sentiment,
+    sentiment_label as _sentiment_label,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,21 +69,6 @@ FEED_SOURCES: list[dict] = [
     {"name": "Agriculture",    "category": "Commodities",  "url": "https://news.google.com/rss/search?q=wheat+corn+soybean+agriculture+commodity+prices&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Kitco",          "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:kitco.com+gold&hl=en-US&gl=US&ceid=US:en"},
     {"name": "OilPrice",       "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:oilprice.com&hl=en-US&gl=US&ceid=US:en"},
-]
-
-BULLISH_WORDS = [
-    "rally", "surge", "breakout", "bullish", "upside", "beat", "strong",
-    "growth", "soar", "boom", "gain", "record high", "all-time high",
-    "recovery", "optimism", "dovish", "easing", "stimulus", "upgrade",
-    "outperform", "accelerat", "expand", "positive", "green",
-]
-
-BEARISH_WORDS = [
-    "crash", "plunge", "bearish", "downside", "miss", "weak", "recession",
-    "crisis", "collapse", "sell-off", "selloff", "tumble", "slump", "drop",
-    "decline", "fear", "hawkish", "tightening", "downgrade", "default",
-    "underperform", "contract", "negative", "red", "warning", "risk",
-    "inflation surge", "rate hike", "layoff", "bankruptcy",
 ]
 
 COOLDOWN = timedelta(minutes=5)
@@ -225,13 +216,8 @@ class XAdapter:
         link = getattr(entry, "link", "") or ""
         ts = self._parse_timestamp(entry)
 
-        sentiment = self._compute_sentiment(text)
-        if sentiment > 0.1:
-            sentiment_label = "bullish"
-        elif sentiment < -0.1:
-            sentiment_label = "bearish"
-        else:
-            sentiment_label = "neutral"
+        sentiment = compute_keyword_sentiment(text)
+        sent_label = _sentiment_label(sentiment)
 
         return {
             "username": source_name,
@@ -239,7 +225,7 @@ class XAdapter:
             "timestamp": ts.isoformat(),
             "url": link,
             "sentiment": round(sentiment, 3),
-            "sentiment_label": sentiment_label,
+            "sentiment_label": sent_label,
             "category": category,
             "dedupe_hash": dhash,
         }
@@ -287,17 +273,6 @@ class XAdapter:
             reliability_score=0.6,
             dedupe_hash=dhash,
         )
-
-    @staticmethod
-    def _compute_sentiment(text: str) -> float:
-        """Keyword-based sentiment scoring, clamped to [-1, +1]."""
-        lower = text.lower()
-        bullish = sum(1 for w in BULLISH_WORDS if w in lower)
-        bearish = sum(1 for w in BEARISH_WORDS if w in lower)
-        total = bullish + bearish
-        if total == 0:
-            return 0.0
-        return max(-1.0, min(1.0, (bullish - bearish) / total))
 
     @staticmethod
     def _clean_html(raw: str) -> str:

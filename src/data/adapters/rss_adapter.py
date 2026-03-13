@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 
 from src.core.models.market import NewsItem
+from src.data.adapters.sentiment import compute_keyword_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +138,8 @@ class RssAdapter:
         reliability = self._domain_reliability(domain)
         entities = self._extract_entities(title)
 
+        sentiment = compute_keyword_sentiment(f"{title} {snippet}")
+
         return NewsItem(
             timestamp=ts,
             source=f"rss:{domain}",
@@ -144,7 +147,7 @@ class RssAdapter:
             url=link,
             body_snippet=snippet,
             entities=entities,
-            sentiment=0.0,
+            sentiment=sentiment,
             event_tags=["rss", "finance"],
             reliability_score=reliability,
             dedupe_hash=dhash,

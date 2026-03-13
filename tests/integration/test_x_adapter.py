@@ -46,25 +46,30 @@ class TestXAdapterInit:
 
 class TestSentimentScoring:
     def test_bullish_text(self):
-        score = XAdapter._compute_sentiment("Markets surge to record high on strong growth data")
+        from src.data.adapters.sentiment import compute_keyword_sentiment
+        score = compute_keyword_sentiment("Markets surge to record high on strong growth data")
         assert score > 0
 
     def test_bearish_text(self):
-        score = XAdapter._compute_sentiment("Crash fears as recession risk grows amid crisis")
+        from src.data.adapters.sentiment import compute_keyword_sentiment
+        score = compute_keyword_sentiment("Crash fears as recession risk grows amid crisis")
         assert score < 0
 
     def test_neutral_text(self):
-        score = XAdapter._compute_sentiment("The meeting is scheduled for 3pm today")
+        from src.data.adapters.sentiment import compute_keyword_sentiment
+        score = compute_keyword_sentiment("The meeting is scheduled for 3pm today")
         assert score == 0.0
 
     def test_mixed_text(self):
-        score = XAdapter._compute_sentiment("Rally fades into crash territory")
+        from src.data.adapters.sentiment import compute_keyword_sentiment
+        score = compute_keyword_sentiment("Rally fades into crash territory")
         assert -1.0 <= score <= 1.0
 
     def test_clamp_bounds(self):
-        score = XAdapter._compute_sentiment("surge rally breakout strong growth bullish")
+        from src.data.adapters.sentiment import compute_keyword_sentiment
+        score = compute_keyword_sentiment("surge rally breakout strong growth bullish")
         assert score <= 1.0
-        score = XAdapter._compute_sentiment("crash plunge bearish recession crisis collapse")
+        score = compute_keyword_sentiment("crash plunge bearish recession crisis collapse")
         assert score >= -1.0
 
 

@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from src.core.models.market import NewsItem
+from src.data.adapters.sentiment import compute_keyword_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -99,13 +100,23 @@ class GdeltAdapter:
             domain = str(row.get("domain", "gdelt"))
             entities = self._extract_entities(title)
 
+            tone_raw = row.get("tone")
+            if tone_raw is not None:
+                try:
+                    tone_val = float(str(tone_raw).split(",")[0])
+                    sentiment = max(-1.0, min(1.0, tone_val / 10.0))
+                except (ValueError, TypeError, IndexError):
+                    sentiment = compute_keyword_sentiment(title)
+            else:
+                sentiment = compute_keyword_sentiment(title)
+
             item = NewsItem(
                 timestamp=ts,
                 source=f"gdelt:{domain}",
                 headline=title,
                 body_snippet=title[:500],
                 entities=entities,
-                sentiment=0.0,
+                sentiment=sentiment,
                 event_tags=["gdelt", "finance"],
                 reliability_score=0.6,
                 dedupe_hash=dhash,

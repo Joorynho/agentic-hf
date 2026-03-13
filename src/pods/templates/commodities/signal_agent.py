@@ -56,14 +56,18 @@ class CommoditiesSignalAgent(BasePodAgent):
             title = item.get("title", "") if isinstance(item, dict) else getattr(item, "title", "")
             source = item.get("source", "") if isinstance(item, dict) else getattr(item, "source", "")
             url = item.get("url", "") if isinstance(item, dict) else getattr(item, "url", "")
+            sent = item.get("sentiment", 0.0) if isinstance(item, dict) else getattr(item, "sentiment", 0.0)
             if title:
-                headlines.append({"title": title, "source": source, "url": url})
+                label = "bullish" if sent > 0.1 else ("bearish" if sent < -0.1 else "neutral")
+                headlines.append({"title": title, "source": source, "url": url, "sentiment": sent, "sentiment_label": label})
         for tweet in x_feed[:_MAX_HEADLINES - len(headlines)]:
             text = tweet.get("text", tweet.get("title", "")) if isinstance(tweet, dict) else getattr(tweet, "text", "")
-            handle = tweet.get("handle", "") if isinstance(tweet, dict) else getattr(tweet, "handle", "")
+            username = tweet.get("username", "") if isinstance(tweet, dict) else getattr(tweet, "username", "")
             url = tweet.get("url", "") if isinstance(tweet, dict) else getattr(tweet, "url", "")
+            sent = tweet.get("sentiment", 0.0) if isinstance(tweet, dict) else getattr(tweet, "sentiment", 0.0)
+            sent_label = tweet.get("sentiment_label", "neutral") if isinstance(tweet, dict) else "neutral"
             if text:
-                headlines.append({"title": text, "source": f"@{handle}" if handle else "news", "url": url})
+                headlines.append({"title": text, "source": username or "news", "url": url, "sentiment": sent, "sentiment_label": sent_label})
 
         price_snapshot = []
         for sym, q in live_quotes.items():
