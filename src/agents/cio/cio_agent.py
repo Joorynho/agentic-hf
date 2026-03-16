@@ -153,6 +153,15 @@ class CIOAgent:
                     f"realized PnL {perf['total_realized_pnl']}, "
                     f"avg {perf['avg_pnl_per_trade']}/trade"
                 )
+            perf_metrics = brief.get("performance_metrics")
+            if perf_metrics:
+                lines.append(
+                    f"  Analytics: Sharpe={perf_metrics.get('sharpe', 0):.2f}, "
+                    f"Sortino={perf_metrics.get('sortino', 0):.2f}, "
+                    f"MaxDD={perf_metrics.get('max_drawdown', 0):.2%}, "
+                    f"Vol={perf_metrics.get('current_vol', 0):.2%}, "
+                    f"Return={perf_metrics.get('total_return_pct', 0):.1f}%"
+                )
             if brief.get("cross_pod_conflicts"):
                 for conflict in brief["cross_pod_conflicts"]:
                     lines.append(f"  WARNING: {conflict}")

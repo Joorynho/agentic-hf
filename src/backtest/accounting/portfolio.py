@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
+import math
+from datetime import date, datetime, timezone
 
 from src.core.models.execution import Fill, Position, PositionSnapshot
 from src.core.models.enums import Side
@@ -25,6 +26,7 @@ class PortfolioAccountant:
         self._entry_dates: dict[str, str] = {}
         self._entry_metadata: dict[str, dict] = {}
         self._closed_trades: list[dict] = []
+        self._daily_nav_snapshots: list[tuple[date, float]] = [(date.today(), initial_nav)]
 
     def record_fill(self, fill: Fill) -> None:
         """Record a fill from the execution layer (original method - updated to track cost basis)."""
@@ -63,6 +65,10 @@ class PortfolioAccountant:
         strategy_tag: str = "",
         signal_snapshot: dict | None = None,
         conviction: float = 0.5,
+        stop_loss_pct: float | None = None,
+        take_profit_pct: float | None = None,
+        exit_when: str = "",
+        max_hold_days: int = 30,
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -107,6 +113,10 @@ class PortfolioAccountant:
                 "conviction": conviction,
                 "strategy_tag": strategy_tag,
                 "signal_snapshot": signal_snapshot or {},
+                "stop_loss_pct": stop_loss_pct if stop_loss_pct is not None else 0.05,
+                "take_profit_pct": take_profit_pct if take_profit_pct is not None else 0.15,
+                "exit_when": exit_when,
+                "max_hold_days": max_hold_days,
             }
 
         # Calculate realized PnL for any position reduction
@@ -244,11 +254,9 @@ class PortfolioAccountant:
         return self._realized_pnl
 
     def mark_to_market(self, prices: dict[str, float]) -> float:
-        # Update last prices first
         for sym, price in prices.items():
             self._update_last_price(sym, price)
 
-        # Update position market values and unrealized PnL
         total_market_value = 0.0
         for sym, pos in self._positions.items():
             price = prices.get(sym, pos["avg_cost"])
@@ -256,11 +264,38 @@ class PortfolioAccountant:
             pos["unrealised_pnl"] = pos["quantity"] * (price - pos["avg_cost"])
             total_market_value += pos["market_value"]
 
-        # NAV includes unrealized from current_positions property
         nav = self.nav
         self._hwm = max(self._hwm, nav)
         self._nav_history.append(nav)
+
+        today = date.today()
+        if not self._daily_nav_snapshots or self._daily_nav_snapshots[-1][0] != today:
+            self._daily_nav_snapshots.append((today, nav))
+        else:
+            self._daily_nav_snapshots[-1] = (today, nav)
+
         return nav
+
+    def daily_returns(self, window: int = 20) -> list[float]:
+        """Percentage daily returns from NAV snapshots."""
+        snaps = self._daily_nav_snapshots[-(window + 1):]
+        if len(snaps) < 2:
+            return []
+        returns = []
+        for i in range(1, len(snaps)):
+            prev_nav = snaps[i - 1][1]
+            if prev_nav > 0:
+                returns.append((snaps[i][1] - prev_nav) / prev_nav)
+        return returns
+
+    def annualized_volatility(self, window: int = 20) -> float:
+        """Annualized volatility from daily NAV returns."""
+        rets = self.daily_returns(window)
+        if len(rets) < 2:
+            return 0.0
+        mean = sum(rets) / len(rets)
+        variance = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
+        return math.sqrt(variance) * math.sqrt(252)
 
     def get_position(self, symbol: str) -> Position | None:
         pos = self._positions.get(symbol)
@@ -287,6 +322,21 @@ class PortfolioAccountant:
 
     def all_positions(self) -> list[Position]:
         return [self.get_position(s) for s in self._positions if self.get_position(s)]
+
+    def performance_summary(self) -> dict:
+        """Compute Sharpe, Sortino, max drawdown, vol, and total return."""
+        from src.core.performance import sharpe_ratio, sortino_ratio, max_drawdown
+
+        rets = self.daily_returns(window=252)
+        nav_series = [snap[1] for snap in self._daily_nav_snapshots]
+        total_ret = (self.nav - self._starting_capital) / self._starting_capital if self._starting_capital > 0 else 0.0
+        return {
+            "sharpe": round(sharpe_ratio(rets), 3),
+            "sortino": round(sortino_ratio(rets), 3),
+            "max_drawdown": round(max_drawdown(nav_series), 4),
+            "current_vol": round(self.annualized_volatility(), 4),
+            "total_return_pct": round(total_ret * 100, 2),
+        }
 
     # ── Persistence helpers ──────────────────────────────────────────────
 

@@ -121,3 +121,21 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 - News/social adapters should only initialize when `enable_news_adapters=True`
 - Prevents test slowdowns from network calls
 - `SessionManager.__init__` checks this flag before creating adapters
+
+### Keyword sentiment fails on financial news
+- Keyword-based sentiment scores almost every financial headline as -1.0 (bearish)
+- Words like "risk", "warning", "decline", "drop" appear in neutral contexts constantly ("risk management", "inflation risk easing", "decline slows")
+- Solution: LLM batch scoring via `src/data/adapters/sentiment.py`. One call per pod, scores up to 25 items for sentiment, relevancy, and impact
+- Keyword scoring retained as fallback when no LLM key is available, with ambiguous words removed
+
+### Macro score must use LLM-scored sentiment, not adapter-level
+- Researchers compute `compute_macro_score` from news/prediction sentiment
+- If researchers use raw adapter-level keyword sentiment, the dashboard shows -1.000
+- Researchers must call `score_items()` to get LLM-scored sentiment BEFORE calling `compute_macro_score`
+- The signal agent's LLM scoring only reaches PM prompts — it does NOT flow back to the macro score unless the researcher also scores
+
+### LLM JSON parsing needs robustness
+- Free-tier LLMs often return truncated JSON (hit max_tokens) or wrap responses in markdown fences
+- `_parse_scores` must handle: markdown fences, JSON with surrounding text, truncated arrays, dict wrappers
+- Set `max_tokens` high enough for the expected output (25 items × ~60 chars each = 1500+ chars; use 2000)
+- Always have a keyword fallback path when LLM parsing fails

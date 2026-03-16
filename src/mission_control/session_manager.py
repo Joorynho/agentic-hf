@@ -22,6 +22,7 @@ from src.agents.governance.position_reviewer import PositionReviewer
 from src.agents.risk.cro_agent import CROAgent
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
+from src.core.position_monitor import PositionMonitor
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
 from src.data.adapters.fred_adapter import FredAdapter
@@ -186,6 +187,9 @@ class SessionManager:
         self._position_reviewer: PositionReviewer | None = None
         self._last_review_date: str | None = None
         self._reports_dir = str(Path(__file__).parent.parent.parent / "reports")
+
+        # Intraday position monitor
+        self._position_monitor = PositionMonitor()
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
@@ -530,6 +534,12 @@ class SessionManager:
                     "avg_pnl_per_trade": f"${tracker.avg_pnl:.2f}",
                 }
 
+            # Performance analytics (Sharpe, vol, drawdown)
+            if ns:
+                perf_summary = ns.get("performance_summary")
+                if perf_summary:
+                    brief["performance_metrics"] = perf_summary
+
             # Cross-pod conflict check (injected per pod)
             if hasattr(self._governance, "check_cross_pod_conflicts"):
                 conflicts = self._governance.check_cross_pod_conflicts(pod_summaries)
@@ -684,6 +694,9 @@ class SessionManager:
                         pod_latest_bars[pod_id] = latest_bar
                         logger.info("[session_manager] [iter %d] Pod %s: ingested %d bars, mark-to-market done",
                                     self._iteration, pod_id, bars_count)
+
+                    # 5b. Position monitor — check for stop-loss / take-profit / max-hold breaches
+                    await self._run_position_monitor()
 
                     # 5. Build cross-pod intelligence memos and run agent cycles
                     self._inject_firm_memos()
@@ -987,7 +1000,10 @@ class SessionManager:
                         "summary": pod_result.get("summary", ""),
                     })
 
-            report_html = DailyReportGenerator().generate(
+            perf_data, pos_data, sq_data, events_data = self._collect_report_data()
+
+            report_gen = DailyReportGenerator()
+            report_html = report_gen.generate(
                 session_dir=self._session_logger.session_dir if self._session_logger else "",
                 session_start=getattr(self, "_session_start", None),
                 session_end=datetime.now(),
@@ -997,6 +1013,21 @@ class SessionManager:
                 firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
                 initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
                 review_dialogue=review_dialogue,
+                performance_data=perf_data,
+                positions_data=pos_data,
+                signal_quality_data=sq_data,
+                upcoming_events=events_data,
+            )
+
+            report_gen.generate_markdown(
+                session_dir=self._reports_dir,
+                pods_data=pods_data,
+                trades=self._session_logger._fill_log if self._session_logger else [],
+                firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
+                initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
+                performance_data=perf_data,
+                positions_data=pos_data,
+                signal_quality_data=sq_data,
             )
 
             # Save report
@@ -1077,6 +1108,102 @@ class SessionManager:
                 logger.warning("[session_manager] Error collecting summary for pod %s: %s", pod_id, exc)
                 # Continue with next pod even if one fails
         return summaries
+
+    def _collect_report_data(self) -> tuple[dict, dict, dict, list]:
+        """Collect performance, positions, signal quality, and events for reports."""
+        perf_data: dict = {}
+        pos_data: dict = {}
+        sq_data: dict = {}
+        events_data: list = []
+        today = datetime.now(timezone.utc).date()
+
+        for pod_id, runtime in self._pod_runtimes.items():
+            ns = runtime._ns if hasattr(runtime, "_ns") else None
+            if not ns:
+                continue
+
+            perf = ns.get("performance_summary")
+            if perf:
+                perf_data[pod_id] = perf
+
+            accountant = ns.get("accountant")
+            if accountant:
+                pod_positions = []
+                for sym, snap in accountant.current_positions.items():
+                    meta = accountant._entry_metadata.get(sym, {})
+                    entry_time = meta.get("entry_time", "")
+                    days_held = 0
+                    if entry_time:
+                        try:
+                            days_held = (today - datetime.fromisoformat(entry_time).date()).days
+                        except (ValueError, TypeError):
+                            pass
+                    pod_positions.append({
+                        "symbol": sym,
+                        "qty": snap.qty,
+                        "cost_basis": snap.cost_basis,
+                        "current_price": snap.current_price,
+                        "unrealized_pnl": snap.unrealized_pnl,
+                        "pnl_pct": snap.pnl_pct,
+                        "days_held": days_held,
+                        "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
+                        "take_profit_pct": meta.get("take_profit_pct", 0.15),
+                        "entry_thesis": meta.get("reasoning", "")[:100],
+                    })
+                if pod_positions:
+                    pos_data[pod_id] = pod_positions
+
+            scorer = getattr(runtime, "_signal_scorer", None)
+            if scorer:
+                sq_text = scorer.format_for_prompt()
+                if sq_text:
+                    sq_data[pod_id] = sq_text
+
+            events = ns.get("upcoming_events")
+            if events:
+                events_data.extend(events)
+
+        return perf_data, pos_data, sq_data, events_data
+
+    async def _run_position_monitor(self) -> None:
+        """Check all pod positions for stop-loss / take-profit / max-hold breaches."""
+        for pod_id, runtime in self._pod_runtimes.items():
+            accountant = runtime._ns.get("accountant")
+            if not accountant:
+                continue
+            try:
+                exit_orders = self._position_monitor.check_positions(accountant)
+                if exit_orders:
+                    for eo in exit_orders:
+                        exit_ctx = {
+                            "approved_order": eo,
+                            "mandate": runtime._ns.get("governance_mandate"),
+                            "risk_halt": False,
+                            "auto_exit": True,
+                        }
+                        try:
+                            await runtime._exec_trader.run_cycle(exit_ctx)
+                            logger.info("[session_manager] Position monitor auto-exit: %s %s %.4f in %s",
+                                        eo.side.value, eo.symbol, eo.quantity, pod_id)
+                            activity_msg = AgentMessage(
+                                timestamp=datetime.now(timezone.utc),
+                                sender="position_monitor",
+                                recipient="dashboard",
+                                topic="agent.activity",
+                                payload={
+                                    "agent_id": "position_monitor",
+                                    "agent_role": "PositionMonitor",
+                                    "pod_id": pod_id,
+                                    "action": "position_monitor_exit",
+                                    "summary": f"Auto-exit: {eo.side.value} {eo.quantity:.4f} {eo.symbol}",
+                                    "detail": f"Position breached exit condition in {pod_id}",
+                                },
+                            )
+                            await self._event_bus.publish("agent.activity", activity_msg, publisher_id="position_monitor")
+                        except Exception as e:
+                            logger.warning("[session_manager] Position monitor exit failed for %s/%s: %s", pod_id, eo.symbol, e)
+            except Exception as e:
+                logger.warning("[session_manager] Position monitor check failed for %s: %s", pod_id, e)
 
     def _inject_firm_memos(self) -> None:
         """Build cross-pod intelligence memos and inject into each pod's namespace.
@@ -1418,7 +1545,10 @@ class SessionManager:
                 except Exception:
                     pods_data[pid] = {}
 
-            report_html = DailyReportGenerator().generate(
+            perf_data, pos_data, sq_data, events_data = self._collect_report_data()
+
+            report_gen = DailyReportGenerator()
+            report_html = report_gen.generate(
                 session_dir=self._session_logger.session_dir if self._session_logger else "",
                 session_start=getattr(self, "_session_start", None),
                 session_end=datetime.now(),
@@ -1427,10 +1557,24 @@ class SessionManager:
                 governance=getattr(self, "_governance_decisions", []),
                 firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
                 initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
+                performance_data=perf_data,
+                positions_data=pos_data,
+                signal_quality_data=sq_data,
+                upcoming_events=events_data,
             )
 
             session_dir = self._session_logger.session_dir if self._session_logger else None
             if session_dir:
+                report_gen.generate_markdown(
+                    session_dir=session_dir,
+                    pods_data=pods_data,
+                    trades=self._session_logger._fill_log if self._session_logger else [],
+                    firm_nav=sum(p.get("risk_metrics", {}).get("nav", 0) for p in pods_data.values()),
+                    initial_capital=sum(p.get("risk_metrics", {}).get("starting_capital", 0) for p in pods_data.values()),
+                    performance_data=perf_data,
+                    positions_data=pos_data,
+                    signal_quality_data=sq_data,
+                )
                 report_path = os.path.join(
                     session_dir, f"daily_report_{datetime.now().strftime('%Y%m%d')}.html"
                 )

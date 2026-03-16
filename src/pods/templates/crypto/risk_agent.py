@@ -1,7 +1,8 @@
 from __future__ import annotations
 import logging
+import uuid
 from datetime import datetime, timezone
-from src.core.models.enums import Side
+from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order, RiskApprovalToken
 from src.core.models.messages import AgentMessage
 from src.pods.base.agent import BasePodAgent
@@ -9,7 +10,9 @@ from src.pods.base.agent import BasePodAgent
 logger = logging.getLogger(__name__)
 
 MAX_LEVERAGE = 2.0
-MIN_FRACTIONAL_QTY = 0.0001  # crypto supports very small fractions
+MIN_FRACTIONAL_QTY = 0.0001
+STOP_LOSS_PCT = 0.05
+TAKE_PROFIT_PCT = 0.15
 
 
 def _conviction_limit(conviction: float) -> float:
@@ -19,6 +22,38 @@ def _conviction_limit(conviction: float) -> float:
 
 class CryptoRiskAgent(BasePodAgent):
     """Position-level risk checks for crypto. Tighter limits than equities."""
+
+    def _check_stop_loss_take_profit(self, accountant) -> list[Order]:
+        exit_orders: list[Order] = []
+        regime = self._ns.get("market_regime") or {}
+        regime_label = regime.get("label", "").lower()
+        sl_pct = 0.03 if "crisis" in regime_label else STOP_LOSS_PCT
+
+        for sym, snap in accountant.current_positions.items():
+            if snap.cost_basis <= 0 or snap.qty == 0:
+                continue
+            meta = accountant._entry_metadata.get(sym, {})
+            pos_sl = meta.get("stop_loss_pct", sl_pct)
+            pos_tp = meta.get("take_profit_pct", TAKE_PROFIT_PCT)
+            pnl_pct = (snap.current_price - snap.cost_basis) / snap.cost_basis
+
+            reason = ""
+            if pnl_pct < -pos_sl:
+                reason = f"Stop-loss triggered: {sym} at {pnl_pct:+.2%} (limit -{pos_sl:.0%})"
+            elif pnl_pct > pos_tp:
+                reason = f"Take-profit triggered: {sym} at {pnl_pct:+.2%} (limit +{pos_tp:.0%})"
+
+            if reason:
+                side = Side.SELL if snap.qty > 0 else Side.BUY
+                order = Order(
+                    id=uuid.uuid4(), pod_id=self._pod_id, symbol=sym,
+                    side=side, order_type=OrderType.MARKET,
+                    quantity=abs(snap.qty), timestamp=datetime.now(timezone.utc),
+                    strategy_tag="risk_auto_exit", conviction=1.0,
+                )
+                exit_orders.append(order)
+                logger.info("[crypto.risk] %s", reason)
+        return exit_orders
 
     async def run_cycle(self, context: dict) -> dict:
         order: Order | None = context.get("order")
@@ -30,6 +65,10 @@ class CryptoRiskAgent(BasePodAgent):
             token = RiskApprovalToken(order_id=order.id, pod_id=self._pod_id, expires_ms=500)
             await self._broadcast("risk_approval", order, f"Approved {order.side.value} {order.quantity:.4f} {order.symbol} (no accountant)")
             return {"token": token}
+
+        exit_orders = self._check_stop_loss_take_profit(accountant)
+        for eo in exit_orders:
+            await self._broadcast("risk_auto_exit", eo, f"Auto-exit {eo.side.value} {eo.quantity:.4f} {eo.symbol}")
 
         nav = accountant.nav
         existing = accountant.current_positions.get(order.symbol)
@@ -98,7 +137,10 @@ class CryptoRiskAgent(BasePodAgent):
         # --- Approved ---
         token = RiskApprovalToken(order_id=order.id, pod_id=self._pod_id, expires_ms=500)
         await self._broadcast("risk_approval", order, f"Approved {order.side.value} {order.quantity:.4f} {order.symbol}")
-        return {"token": token}
+        result: dict = {"token": token}
+        if exit_orders:
+            result["exit_orders"] = exit_orders
+        return result
 
     async def _broadcast(self, action: str, order: Order, summary: str, revised_qty: float | None = None) -> None:
         try:

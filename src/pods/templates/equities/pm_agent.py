@@ -58,9 +58,17 @@ ARTICLE DEEP-DIVE:
 If a headline suggests a material catalyst worth investigating, include "read_articles": ["url1", "url2"]
 (max 3) in your JSON. You will receive the full article text and make a final decision.
 
+WEB SEARCH:
+If you need information not provided (e.g. a specific earnings date, a policy announcement, a company event),
+include "search_queries": ["query1", "query2"] (max 2). Results will be provided before your final decision.
+
 Output JSON:
-{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ..."}], "read_articles": ["url1"]}
+{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ...", "stop_loss_pct": 0.05, "take_profit_pct": 0.15, "exit_when": "", "max_hold_days": 30}], "read_articles": ["url1"], "search_queries": ["query1"]}
 conviction: 0.0 = no confidence, 0.5 = moderate, 0.8+ = high conviction, 1.0 = maximum.
+stop_loss_pct: auto-exit if loss exceeds this % (default 5%). Use tighter stops (3%) in volatile setups.
+take_profit_pct: auto-exit if gain exceeds this % (default 15%).
+exit_when: free-text condition for exit (e.g. "exit if VIX > 35").
+max_hold_days: maximum days to hold (default 30).
 Only trades with conviction >= 0.7 should be above 10% of NAV.
 Omit read_articles if not needed.
 
@@ -239,6 +247,13 @@ class EquitiesPMAgent(BasePodAgent):
             for bank, info in rate_table.items():
                 sections.append(f"  {bank}: {info['value']:.2f}% ({info['rate_name']})")
 
+        upcoming_events = features.get("upcoming_events", [])
+        if upcoming_events:
+            sections.append("\n## Upcoming Events (next 14 days)")
+            for evt in upcoming_events:
+                sections.append(f"  - {evt.get('symbol', '?')} {evt.get('event_type', '')} in {evt.get('days_until', '?')} days ({evt.get('date', '')})")
+            sections.append("  WARNING: Do not enter new positions in symbols with earnings within 2 days unless conviction > 0.8.")
+
         sections.append("\n## Prediction Market Odds (Polymarket)")
         poly = features.get("polymarket_predictions", [])
         if poly:
@@ -278,6 +293,15 @@ class EquitiesPMAgent(BasePodAgent):
         if signal_quality:
             sections.append(f"\n## Signal Quality\n{signal_quality}")
 
+        perf = self._ns.get("performance_summary")
+        if perf:
+            sections.append("\n## Performance Metrics")
+            sections.append(f"  Sharpe ratio: {perf.get('sharpe', 0):.2f}")
+            sections.append(f"  Sortino ratio: {perf.get('sortino', 0):.2f}")
+            sections.append(f"  Max drawdown: {perf.get('max_drawdown', 0):.2%}")
+            sections.append(f"  Current volatility (ann.): {perf.get('current_vol', 0):.2%}")
+            sections.append(f"  Total return: {perf.get('total_return_pct', 0):.1f}%")
+
         firm_memo = self._ns.get("firm_memo") or ""
         if firm_memo:
             sections.append(f"\n## Firm Intelligence\n{firm_memo}")
@@ -300,6 +324,13 @@ class EquitiesPMAgent(BasePodAgent):
             if self._session_logger:
                 self._session_logger.log_reasoning(f"pm:{self._pod_id}", "prompt", user_content)
                 self._session_logger.log_reasoning(f"pm:{self._pod_id}", "response", raw or "")
+
+            search_queries = decision.get("search_queries", [])
+            if search_queries and isinstance(search_queries, list):
+                decision, raw_search = await self._web_search_and_decide(
+                    search_queries[:2], user_content, _EQUITIES_SYSTEM, decision
+                )
+                raw = raw_search or raw
 
             read_urls = decision.get("read_articles", [])
             if read_urls and isinstance(read_urls, list):
@@ -408,6 +439,42 @@ class EquitiesPMAgent(BasePodAgent):
         except Exception as e:
             logger.warning("[equities.pm] LLM failed, falling back: %s", e)
             return self._rule_based_decision(features)
+
+    async def _web_search_and_decide(
+        self, queries: list[str], base_prompt: str, system: str, first_decision: dict
+    ) -> tuple[dict, str | None]:
+        """Execute web searches and re-prompt LLM with results."""
+        from src.data.adapters.web_search import WebSearchAdapter
+
+        if not hasattr(self, "_web_searcher"):
+            self._web_searcher = WebSearchAdapter()
+
+        all_results: list[dict] = []
+        for q in queries[:2]:
+            results = await self._web_searcher.search(q)
+            all_results.extend(results)
+
+        if not all_results:
+            return (first_decision, None)
+
+        search_section = "\n\n## Web Search Results (requested by you)\n"
+        for r in all_results[:10]:
+            search_section += f"\n- **{r.get('title', '')}**\n  {r.get('snippet', '')}\n  URL: {r.get('url', '')}\n"
+
+        enriched = base_prompt + search_section
+        enriched += '\n\nYou have the search results. Make your FINAL trading decision.\nOutput JSON only: {"trades": [...]}'
+
+        try:
+            raw = llm_chat(
+                [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
+                max_tokens=1200,
+            )
+            if self._session_logger:
+                self._session_logger.log_reasoning(f"pm:{self._pod_id}", "web_search_response", raw or "")
+            return (extract_json(raw), raw)
+        except Exception as e:
+            logger.warning("[equities.pm] Web search re-prompt failed: %s", e)
+            return (first_decision, None)
 
     async def _read_articles_and_decide(
         self, urls: list[str], base_prompt: str, system: str, first_decision: dict

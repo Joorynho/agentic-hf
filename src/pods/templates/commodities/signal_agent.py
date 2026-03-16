@@ -119,6 +119,10 @@ class CommoditiesSignalAgent(BasePodAgent):
         }
         self._ns.set("market_regime", features["regime"])
 
+        upcoming_events = self._ns.get("upcoming_events") or []
+        if upcoming_events:
+            features["upcoming_events"] = upcoming_events
+
         self.store("features", features)
         logger.debug("[commodities.signal] features assembled: %d FRED, %d poly, %d headlines, regime=%s",
                      len(fred), len(poly_summary), len(headlines), regime.regime)

@@ -94,6 +94,10 @@ class TradeProposal(BaseModel):
     conviction: ClampedFloat = 0.5
     strategy_tag: str = ""
     signal_snapshot: dict = Field(default_factory=dict)
+    stop_loss_pct: float = 0.05
+    take_profit_pct: float = 0.15
+    exit_when: str = ""
+    max_hold_days: int = 30
 
 
 class PositionSnapshot(BaseModel):

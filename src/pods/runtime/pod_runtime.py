@@ -133,6 +133,12 @@ class PodRuntime:
                 "positions_summary": pos_summary,
             }
 
+        # Store performance metrics in namespace for PM/CIO access
+        if accountant and hasattr(accountant, "performance_summary"):
+            perf = accountant.performance_summary()
+            self._ns.set("performance_summary", perf)
+            ctx["performance_summary"] = perf
+
         # Feed closed trades to outcome tracker + signal scorer, inject into PM context
         if accountant:
             closed = accountant.closed_trades
@@ -174,15 +180,40 @@ class PodRuntime:
 
         # Carry PM decision metadata so exec trader can attach it to fills
         last_pm = self._ns.get("last_pm_decision") or {}
+        trades = last_pm.get("trades", [])
+        matching_trade = next(
+            (t for t in trades if isinstance(t, dict) and t.get("symbol") == order.symbol),
+            {},
+        )
         self._ns.set("pm_trade_metadata", {
             "reasoning": last_pm.get("reasoning", "")[:500],
             "conviction": order.conviction,
             "strategy_tag": order.strategy_tag,
             "signal_snapshot": last_pm.get("signal_snapshot", {}),
+            "stop_loss_pct": matching_trade.get("stop_loss_pct"),
+            "take_profit_pct": matching_trade.get("take_profit_pct"),
+            "exit_when": matching_trade.get("exit_when", ""),
+            "max_hold_days": matching_trade.get("max_hold_days", 30),
         })
 
         # 4. Risk sign-off loop (PM↔Risk, max 10 iter)
-        approved_order = await self._run_risk_loop(order)
+        approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
+
+        # Execute exit orders first (stop-loss / take-profit)
+        if exit_orders:
+            for eo in exit_orders:
+                exit_ctx = {
+                    "approved_order": eo,
+                    "mandate": self._ns.get("governance_mandate"),
+                    "risk_halt": False,
+                    "auto_exit": True,
+                }
+                try:
+                    await self._exec_trader.run_cycle(exit_ctx)  # type: ignore[union-attr]
+                    logger.info("[%s] Auto-exit executed: %s %s %.4f", self._pod_id, eo.side.value, eo.symbol, eo.quantity)
+                except Exception as e:
+                    logger.warning("[%s] Auto-exit failed for %s: %s", self._pod_id, eo.symbol, e)
+
         if approved_order is None:
             logger.info("[%s] Order rejected by Risk after deliberation", self._pod_id)
             await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
@@ -198,6 +229,50 @@ class PodRuntime:
 
         # 6. Ops
         await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
+
+    async def _run_risk_loop_with_exits(self, order: Order) -> tuple[Order | None, list[Order]]:
+        """Run the risk loop and collect any exit orders. Returns (approved_order, exit_orders)."""
+        current_order = order
+        all_exit_orders: list[Order] = []
+        original_qty = order.quantity
+        for i in range(5):
+            risk_out = await self._risk.run_cycle({"order": current_order})  # type: ignore[union-attr]
+            exit_orders = risk_out.get("exit_orders", [])
+            if exit_orders and i == 0:
+                all_exit_orders.extend(exit_orders)
+            token: RiskApprovalToken | None = risk_out.get("token")
+            if token is not None and token.is_valid():
+                self._ns.set("last_risk_token", token)
+                return current_order, all_exit_orders
+
+            revised: Order | None = risk_out.get("revised_order")
+            reason: str = risk_out.get("reason", "")
+            if revised is None:
+                logger.info("[%s] Risk rejected %s %s: %s", self._pod_id, order.side.value, order.symbol, reason)
+                return None, all_exit_orders
+
+            if revised.quantity >= current_order.quantity:
+                logger.info("[%s] Risk revision converged for %s (qty unchanged at %.4f) — approving",
+                            self._pod_id, order.symbol, revised.quantity)
+                token = RiskApprovalToken(order_id=revised.id, pod_id=self._pod_id, expires_ms=500)
+                self._ns.set("last_risk_token", token)
+                return revised, all_exit_orders
+
+            pm_accept = await self._pm.run_cycle(  # type: ignore[union-attr]
+                {
+                    "order": revised,
+                    "risk_revision": True,
+                    "risk_reason": reason,
+                    "original_qty": original_qty,
+                }
+            )
+            accepted_order = pm_accept.get("order")
+            if accepted_order is None:
+                logger.info("[%s] PM declined Risk revision for %s", self._pod_id, order.symbol)
+                return None, all_exit_orders
+            current_order = accepted_order
+
+        return None, all_exit_orders
 
     async def _run_risk_loop(self, order: Order) -> Order | None:
         """PM proposes, Risk validates. Up to 5 iterations to reach agreement."""
@@ -388,11 +463,10 @@ class PodRuntime:
         return summary
 
     def _calculate_volatility(self) -> float:
-        """Calculate annualized volatility from recent NAV history.
-
-        For MVP4, returns placeholder 0.0. Enhanced in future phases
-        with actual return calculations.
-        """
+        """Calculate annualized volatility from recent NAV history."""
+        accountant = self._ns.get("accountant")
+        if accountant and hasattr(accountant, "annualized_volatility"):
+            return accountant.annualized_volatility()
         return 0.0
 
     def _calculate_var(self, nav: float) -> float:

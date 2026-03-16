@@ -228,6 +228,10 @@ class CryptoExecutionTrader(BasePodAgent):
                         strategy_tag=pm_meta.get("strategy_tag", order.strategy_tag),
                         signal_snapshot=pm_meta.get("signal_snapshot"),
                         conviction=pm_meta.get("conviction", order.conviction),
+                        stop_loss_pct=pm_meta.get("stop_loss_pct"),
+                        take_profit_pct=pm_meta.get("take_profit_pct"),
+                        exit_when=pm_meta.get("exit_when", ""),
+                        max_hold_days=pm_meta.get("max_hold_days", 30),
                     )
 
                 try:

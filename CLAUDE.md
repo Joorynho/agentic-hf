@@ -176,11 +176,11 @@ src/core/models/         # Pydantic schemas (Bar, Order, TradeProposal, PodSumma
 src/core/bus/            # EventBus + AuditLog (DuckDB) + CollaborationRunner (multi-agent loops)
 src/core/clock/          # SimulationClock (backtest replay)
 src/core/config/         # Pod universes, scoring weights
-src/core/scoring.py      # Macro scoring (FRED, Polymarket, activity blend)
+src/core/scoring.py      # Macro scoring (FRED, Polymarket, LLM sentiment blend)
 src/core/llm.py          # LLM abstraction (OpenRouter + OpenAI fallback, model rotation)
 src/pods/base/           # PodNamespace + PodGateway (isolation boundary)
 src/pods/templates/      # Per-asset pod implementations (equities, fx, crypto, commodities, gamma, epsilon)
-src/data/adapters/       # FRED, Polymarket, GDELT, RSS, X, yfinance, Alpaca, price feeds
+src/data/adapters/       # FRED, Polymarket, GDELT, RSS, X, yfinance, Alpaca, price feeds, sentiment (LLM + keyword)
 src/data/cache/          # Parquet cache for market data
 src/execution/           # ExecutionAdapter ABC + PaperAdapter + AlpacaAdapter
 src/backtest/            # PortfolioAccountant + BacktestRunner
@@ -249,7 +249,7 @@ python -m src.mission_control.tui.app
 - **MVP2** ✅ Complete — 4 asset pods + LLM agents (CEO/CIO/PM) + web dashboard + Polymarket
 - **MVP3** ✅ Complete — GDELT + FRED (30 series incl. 7 global central bank rates) + RSS + pod researchers
 - **MVP4** ✅ Complete — Alpaca paper trading + execution tab + order lifecycle + position sizing + accountant sync
-- **Post-MVP** ✅ Complete — Dashboard overhaul (10 tabs), agent intelligence upgrade (LLM governance, conversation history, position reviewer challenge round, CIO intelligence briefs, cross-pod conflict detection, PM rolling memory, TradeProposal schema validation), daily performance reviews + reports, dashboard tab consistency fixes
+- **Post-MVP** ✅ Complete — Dashboard overhaul (10 tabs), agent intelligence upgrade (LLM governance, conversation history, position reviewer challenge round, CIO intelligence briefs, cross-pod conflict detection, PM rolling memory, TradeProposal schema validation), daily performance reviews + reports, dashboard tab consistency fixes, conviction-based sizing, trade feedback loops (TradeOutcomeTracker + SignalScorer), regime-aware risk scaling, cross-pod intelligence memos, LLM-powered sentiment scoring (headlines + predictions), session persistence (memory.md)
 
 ### External API Keys
 **NEVER hardcode API keys. Always load from `.env` via `python-dotenv` or `os.environ`.**
@@ -284,9 +284,21 @@ python -m src.mission_control.tui.app
 - **CollaborationRunner:** Multi-agent deliberation with full message history passed to each agent
 - **CEO/CIO:** LLM-powered governance responses with rule-based fallback (when no API key available)
 - **CRO:** Always rule-based — never LLM. Enforces hard risk limits
-- **PM agents:** LLM-driven with rolling 5-decision memory, live prices, date context, universe list. Output validated via `TradeProposal` Pydantic schema
-- **PositionReviewer:** Daily CIO-PM review cycle with optional challenge round (PM counter-argues if CIO overrides)
-- **CIO Intelligence Briefs:** Before governance, SessionManager builds per-pod briefs (macro regime, top signals, positions, FRED highlights, cross-pod conflicts) and injects them into CIO context
+- **PM agents:** LLM-driven with rolling 5-decision memory, live prices, date context, universe list. Output validated via `TradeProposal` Pydantic schema. Conviction (0-1) output scales position sizing
+- **PositionReviewer:** Daily CIO-PM review cycle with optional challenge round (PM counter-argues if CIO overrides). References original entry thesis
+- **CIO Intelligence Briefs:** Before governance, SessionManager builds per-pod briefs (macro regime, top signals, positions, FRED highlights, cross-pod conflicts) and injects them into CIO context. Includes per-pod performance attribution
+- **TradeOutcomeTracker:** Tracks closed-trade statistics (win rate, avg PnL) for PM feedback loop
+- **SignalScorer:** Tracks signal-to-outcome hit rates (VIX level, yield curve, macro outlook) for PM feedback
+- **MarketRegimeClassifier:** Classifies regime (risk-on/risk-off/neutral/crisis) from VIX + yield curve + credit spread; scales risk limits dynamically
+- **Cross-Pod Intelligence:** SessionManager aggregates macro views from all pods into a firm-level memo injected into PM prompts
+
+### Sentiment Scoring Architecture
+- **LLM Batch Scoring:** `src/data/adapters/sentiment.py` scores up to 25 items (15 headlines + 10 predictions) per LLM call. Returns per-item sentiment (-1 to +1), relevancy (0-1), and impact (0-1). Asset-class-aware prompts
+- **Researcher Integration:** All 4 pod researchers call `score_items()` before `compute_macro_score`, so the dashboard macro score uses LLM-scored sentiment (not keyword)
+- **Signal Agent Integration:** All 4 signal agents call `score_items()` to enrich headlines/predictions with LLM scores before passing to PM agents
+- **Keyword Fallback:** When no LLM key is available, falls back to keyword-based scoring with softened word lists (ambiguous words like "risk", "warning", "drop" removed)
+- **Caching:** SHA-256 hash of item texts, 10-minute TTL. Same headlines shared across pods in the same cycle are scored once
+- **Macro Score Formula:** `macro_score = 0.5 × fred_score + 0.3 × poly_sentiment + 0.2 × news_score`, where `poly_sentiment` and `news_score` come from LLM-scored items
 
 ### Skill Usage in This Project
 - `superpowers:brainstorming` — before any new feature/phase

@@ -207,4 +207,25 @@ class EquitiesResearcher(BasePodAgent):
             self.store("universe_last_review", now.isoformat())
             current_universe = updated
 
+        try:
+            from src.data.adapters.web_search import WebSearchAdapter
+            if not hasattr(self, "_web_searcher"):
+                self._web_searcher = WebSearchAdapter()
+            self._web_searcher.reset_cycle()
+            macro_outlook = self._ns.get("features", {}).get("macro_outlook", "") if self._ns.get("features") else ""
+            if macro_outlook:
+                results = await self._web_searcher.search(f"financial markets {macro_outlook} equities outlook {now.strftime('%B %Y')}")
+                self._ns.set("web_search_results", results)
+        except Exception as e:
+            logger.debug("[equities.researcher] Web search skipped: %s", e)
+
+        try:
+            from src.data.adapters.events_calendar import EventsCalendarAdapter
+            if not hasattr(self, "_events_calendar"):
+                self._events_calendar = EventsCalendarAdapter()
+            events = await self._events_calendar.fetch_upcoming_events(current_universe)
+            self._ns.set("upcoming_events", events)
+        except Exception as e:
+            logger.debug("[equities.researcher] Events calendar skipped: %s", e)
+
         return {"universe": current_universe, "poly_signals": poly_signals}
