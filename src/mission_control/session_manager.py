@@ -176,6 +176,7 @@ class SessionManager:
         self._web_app = None
         self._web_server_task = None
         self._enable_web_server = enable_web_server
+        self._external_web_app = False
 
         self._session_active = False
         self._capital_per_pod = 0.0
@@ -192,6 +193,11 @@ class SessionManager:
         self._position_monitor = PositionMonitor()
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
+
+    def set_web_app(self, app) -> None:
+        """Inject an externally-created FastAPI app so _update_web_state can update it."""
+        self._web_app = app
+        self._external_web_app = True
 
     async def start_live_session(
         self,
@@ -467,6 +473,9 @@ class SessionManager:
                         rt._signal_scorer = SignalScorer.load_from_state(score_state)
                         logger.info("[session_manager] Restored signal scorer for %s", pod_id)
 
+                # Backfill entry metadata for hydrated positions from memory trades
+                self._backfill_entry_metadata_from_memory(self._restored_memory)
+
                 if self._web_app:
                     lsnr = getattr(self._web_app.state, "listener", None)
                     if lsnr:
@@ -614,6 +623,9 @@ class SessionManager:
             interval_seconds,
             governance_freq,
         )
+
+        # Start background price ticker (updates prices between iterations)
+        ticker_task = asyncio.create_task(self._run_price_ticker())
 
         try:
             while self._session_active:
@@ -790,7 +802,7 @@ class SessionManager:
                             logger.debug("[session_manager] %s enrichment broadcast failed: %s", pod_id, e)
 
                     # 5.5. Update web server state with latest summaries
-                    if self._enable_web_server:
+                    if self._enable_web_server or self._web_app:
                         await self._update_web_state(pod_summaries)
 
                     # 6. Every N iterations: run governance cycle
@@ -855,6 +867,24 @@ class SessionManager:
                                     self._iteration, breached_pods
                                 )
 
+                            # Publish governance mandate to dashboard
+                            try:
+                                if mandate:
+                                    mandate_payload = mandate.model_dump(mode="json")
+                                    mandate_payload["event_type"] = "MANDATE_UPDATE"
+                                    mandate_msg = AgentMessage(
+                                        timestamp=datetime.now(timezone.utc),
+                                        sender="governance.ceo",
+                                        recipient="dashboard",
+                                        topic="governance.ceo",
+                                        payload=mandate_payload,
+                                    )
+                                    await self._event_bus.publish(
+                                        "governance.ceo", mandate_msg, publisher_id="governance.ceo"
+                                    )
+                            except Exception:
+                                pass
+
                             # Publish governance summary activity
                             try:
                                 gov_summary = (
@@ -916,7 +946,56 @@ class SessionManager:
                     await asyncio.sleep(interval_seconds)
 
         finally:
+            ticker_task.cancel()
+            try:
+                await ticker_task
+            except asyncio.CancelledError:
+                pass
             await self.stop_session()
+
+    async def _run_price_ticker(self) -> None:
+        """Background task: refresh live prices every 60 seconds via Alpaca positions API.
+
+        Runs independently of the main iteration loop so the dashboard always
+        shows reasonably fresh prices and unrealized P&L.
+        """
+        await asyncio.sleep(5)
+        while self._session_active:
+            try:
+                live = await self._alpaca.get_open_positions()
+                if not live:
+                    await asyncio.sleep(60)
+                    continue
+
+                updated_count = 0
+                for pod_id, rt in self._pod_runtimes.items():
+                    acct = rt._ns.get("accountant")
+                    if not acct:
+                        continue
+                    tick_prices: dict[str, float] = {}
+                    for sym, pos_data in acct._positions.items():
+                        if pos_data.get("quantity", 0) != 0 and sym in live:
+                            tick_prices[sym] = live[sym]["current_price"]
+                    if tick_prices:
+                        acct.mark_to_market(tick_prices)
+                        updated_count += len(tick_prices)
+
+                for pod_id, gateway in self._pod_gateways.items():
+                    rt = self._pod_runtimes[pod_id]
+                    try:
+                        summary = await rt.get_summary()
+                        await gateway.emit_summary(summary)
+                    except Exception:
+                        pass
+
+                logger.info("[session_manager] Price ticker: refreshed %d prices across %d symbols",
+                           updated_count, len(live))
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning("[session_manager] Price ticker failed (non-fatal): %s", e)
+
+            await asyncio.sleep(60)
 
     async def _maybe_run_position_review(self) -> None:
         """Run position review if the date has changed since last review."""
@@ -1445,6 +1524,13 @@ class SessionManager:
                 universe = ns.get("universe") or POD_UNIVERSES.get(pod_id, [])
                 pod_universes[pod_id] = set(universe)
 
+            # Fetch earliest buy dates from Alpaca order history
+            earliest_dates: dict[str, str] = {}
+            try:
+                earliest_dates = await self._alpaca.get_earliest_buy_dates()
+            except Exception:
+                logger.warning("[session_manager] Could not fetch order history for entry dates")
+
             for symbol, pos_data in positions.items():
                 target_pod = None
                 for pod_id, universe in pod_universes.items():
@@ -1465,6 +1551,14 @@ class SessionManager:
                             "avg_entry": pos_data["entry_price"],
                             "current_price": pos_data["current_price"],
                         }])
+
+                        # Set entry date from Alpaca order history (backfill from memory may override)
+                        if symbol in earliest_dates and not acct._entry_dates.get(symbol):
+                            raw_ts = earliest_dates[symbol]
+                            date_str = raw_ts[:10] if len(raw_ts) >= 10 else raw_ts
+                            acct._entry_dates[symbol] = date_str
+                            logger.debug("[session_manager] Set entry date for %s from order history: %s", symbol, date_str)
+
                         # Ensure held symbols are in the pod universe so bars are fetched
                         ns = self._pod_runtimes[target_pod]._ns
                         current_universe = ns.get("universe") or list(POD_UNIVERSES.get(target_pod, []))
@@ -1475,8 +1569,86 @@ class SessionManager:
                         logger.info("[session_manager] Hydrated %s: %s %.2f @ $%.2f -> pod %s",
                                     symbol, "LONG" if pos_data["qty"] > 0 else "SHORT",
                                     abs(pos_data["qty"]), pos_data["entry_price"], target_pod)
+
+            # Reconcile starting_capital so NAV = invested + cash (fixes invested >> NAV mismatch)
+            for pod_id, rt in self._pod_runtimes.items():
+                acct = rt._ns.get("accountant")
+                if acct and acct._positions:
+                    acct.reconcile_capital_from_positions()
         except Exception as e:
             logger.warning("[session_manager] Alpaca hydration failed (non-fatal): %s", e)
+
+    def _backfill_entry_metadata_from_memory(self, memory: dict) -> None:
+        """Populate entry dates/theses for hydrated positions using memory.json trades.
+
+        When positions are loaded from Alpaca, the accountant knows qty and cost
+        but has no entry_date, entry_thesis, or exit conditions.  This method
+        scans the saved trade log to find the earliest BUY for each currently
+        held symbol and backfills the accountant's internal metadata so the
+        dashboard can display accurate entry dates and days-held.
+        """
+        trades = memory.get("trades", [])
+        if not trades:
+            return
+
+        backfilled = 0
+        for pod_id, rt in self._pod_runtimes.items():
+            acct = rt._ns.get("accountant")
+            if not acct:
+                continue
+
+            held_symbols = set(acct._positions.keys())
+            if not held_symbols:
+                continue
+
+            for sym in held_symbols:
+                if acct._entry_dates.get(sym):
+                    continue
+
+                pod_buys = [
+                    t for t in trades
+                    if t.get("pod_id") == pod_id
+                    and t.get("symbol") == sym
+                    and (t.get("side") or "").lower() == "buy"
+                    and t.get("timestamp")
+                ]
+                if not pod_buys:
+                    continue
+
+                pod_buys.sort(key=lambda t: t["timestamp"])
+                earliest = pod_buys[0]
+                ts = earliest["timestamp"]
+                reasoning = earliest.get("reasoning", "")
+
+                acct._entry_dates[sym] = ts[:10]
+                acct._entry_theses[sym] = reasoning[:300] if reasoning else ""
+                if sym not in acct._entry_metadata:
+                    acct._entry_metadata[sym] = {
+                        "entry_price": acct._cost_basis.get(sym, 0),
+                        "entry_time": ts,
+                        "reasoning": reasoning[:300] if reasoning else "",
+                        "conviction": earliest.get("conviction", 0.5),
+                        "strategy_tag": earliest.get("strategy_tag", ""),
+                        "signal_snapshot": {},
+                        "stop_loss_pct": 0.05,
+                        "take_profit_pct": 0.15,
+                        "exit_when": "",
+                        "max_hold_days": 0,
+                    }
+                acct._fill_log.append({
+                    "order_id": earliest.get("order_id", ""),
+                    "symbol": sym,
+                    "qty": abs(earliest.get("qty", 0)),
+                    "fill_price": earliest.get("filled_price") or earliest.get("fill_price", acct._cost_basis.get(sym, 0)),
+                    "filled_at": ts,
+                    "side": "BUY",
+                    "reasoning": reasoning[:200] if reasoning else "",
+                })
+                backfilled += 1
+                logger.info("[session_manager] Backfilled entry metadata for %s/%s: date=%s", pod_id, sym, ts[:10])
+
+        if backfilled:
+            logger.info("[session_manager] Backfilled entry metadata for %d positions from memory", backfilled)
 
     async def stop_session(self) -> dict:
         """Stop event loop and gracefully shut down all pods.
@@ -1669,6 +1841,164 @@ class SessionManager:
     def get_session_dir(self) -> str:
         """Get the session log directory."""
         return self._session_logger.session_dir
+
+    def get_all_closed_trades(self) -> list[dict]:
+        """Collect closed trades from all pod accountants, sorted by exit time descending."""
+        all_trades = []
+        for pod_id, rt in self._pod_runtimes.items():
+            acct = rt._ns.get("accountant")
+            if not acct:
+                continue
+            for ct in acct.closed_trades:
+                entry_time = ct.get("entry_time", "")
+                exit_time = ct.get("exit_time", "")
+                holding_days = 0
+                if entry_time and exit_time:
+                    try:
+                        e_d = datetime.fromisoformat(entry_time.split("T")[0]).date()
+                        x_d = datetime.fromisoformat(exit_time.split("T")[0]).date()
+                        holding_days = (x_d - e_d).days
+                    except Exception:
+                        pass
+                all_trades.append({
+                    "pod_id": pod_id,
+                    "symbol": ct.get("symbol", ""),
+                    "side": ct.get("side", "long"),
+                    "entry_price": round(ct.get("entry_price", 0), 2),
+                    "exit_price": round(ct.get("exit_price", 0), 2),
+                    "qty": round(ct.get("qty", 0), 4),
+                    "realized_pnl": round(ct.get("realized_pnl", 0), 4),
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "holding_days": holding_days,
+                    "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
+                    "conviction": ct.get("conviction", 0),
+                    "strategy_tag": ct.get("strategy_tag", ""),
+                })
+
+        # Also include closed trades from restored memory
+        prev = self._restored_memory or {}
+        for t in prev.get("trades", []):
+            side = (t.get("side") or "").upper()
+            if side != "SELL":
+                continue
+            pod_id = t.get("pod_id", "")
+            all_trades.append({
+                "pod_id": pod_id,
+                "symbol": t.get("symbol", ""),
+                "side": "long",
+                "entry_price": 0,
+                "exit_price": round(t.get("filled_price") or t.get("fill_price", 0), 2),
+                "qty": round(abs(t.get("qty", 0)), 4),
+                "realized_pnl": 0,
+                "entry_time": "",
+                "exit_time": t.get("timestamp", ""),
+                "holding_days": 0,
+                "entry_reasoning": "",
+                "conviction": 0,
+                "strategy_tag": "",
+            })
+
+        all_trades.sort(key=lambda x: x.get("exit_time", ""), reverse=True)
+        return all_trades
+
+    def get_position_detail(self, pod_id: str, symbol: str) -> dict | None:
+        """Get full position detail including fill history for a symbol in a pod."""
+        runtime = self._pod_runtimes.get(pod_id)
+        if not runtime:
+            return None
+        accountant = runtime._ns.get("accountant")
+        if not accountant:
+            return None
+
+        snap = accountant.current_positions.get(symbol)
+        if not snap:
+            return None
+
+        meta = accountant._entry_metadata.get(symbol, {})
+
+        # Compute days held
+        days_held = 0
+        entry_date_str = snap.entry_date or meta.get("entry_time", "")
+        if entry_date_str:
+            try:
+                from datetime import date as _date
+                entry_d = datetime.fromisoformat(entry_date_str.split("T")[0]).date()
+                days_held = (_date.today() - entry_d).days
+            except Exception:
+                pass
+
+        # Gather all fills for this symbol from the accountant fill log
+        fills = []
+        for f in getattr(accountant, "_fill_log", []):
+            if f.get("symbol") != symbol:
+                continue
+            ts = f.get("timestamp")
+            ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts) if ts else ""
+            qty_val = f.get("qty", 0)
+            fills.append({
+                "timestamp": ts_str,
+                "qty": abs(qty_val),
+                "fill_price": f.get("fill_price", 0),
+                "side": "BUY" if qty_val > 0 else "SELL",
+                "reasoning": (f.get("reasoning") or "")[:200],
+            })
+
+        # Also include fills from restored memory
+        prev = self._restored_memory or {}
+        for t in prev.get("trades", []):
+            if t.get("symbol") != symbol or t.get("pod_id") != pod_id:
+                continue
+            existing_ids = {f2.get("order_id") for f2 in getattr(accountant, "_fill_log", []) if f2.get("order_id")}
+            if t.get("order_id") and t["order_id"] in existing_ids:
+                continue
+            fills.append({
+                "timestamp": t.get("timestamp", ""),
+                "qty": abs(t.get("qty", 0)),
+                "fill_price": t.get("filled_price") or t.get("fill_price", 0),
+                "side": (t.get("side") or "buy").upper(),
+                "reasoning": (t.get("reasoning") or "")[:200],
+            })
+
+        fills.sort(key=lambda x: x.get("timestamp", ""))
+
+        # Gather partial exits from closed trades
+        partial_exits = []
+        total_bought = sum(f["qty"] for f in fills if f["side"] == "BUY") or 1
+        for ct in getattr(accountant, "_closed_trades", []):
+            if ct.get("symbol") != symbol:
+                continue
+            qty_sold = ct.get("qty", 0)
+            exit_ts = ct.get("exit_time", "")
+            partial_exits.append({
+                "date": exit_ts[:10] if exit_ts else "",
+                "qty_sold": qty_sold,
+                "pct_of_original": round(qty_sold / total_bought * 100, 1) if total_bought else 0,
+                "exit_price": ct.get("exit_price", 0),
+                "realized_pnl": round(ct.get("realized_pnl", 0), 4),
+            })
+
+        reasoning_history = accountant.get_reasoning_log(symbol)
+
+        return {
+            "symbol": symbol,
+            "pod_id": pod_id,
+            "qty": snap.qty,
+            "cost_basis": snap.cost_basis,
+            "current_price": snap.current_price,
+            "unrealized_pnl": round(snap.unrealized_pnl, 4),
+            "pnl_pct": round(snap.pnl_pct, 2),
+            "entry_date": snap.entry_date,
+            "entry_thesis": snap.entry_thesis,
+            "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
+            "take_profit_pct": meta.get("take_profit_pct", 0.15),
+            "max_hold_days": meta.get("max_hold_days", 0),
+            "conviction": meta.get("conviction", 0),
+            "days_held": days_held,
+            "fills": fills,
+            "partial_exits": partial_exits,
+            "reasoning_history": reasoning_history,
+        }
 
     # Context manager support
     async def __aenter__(self):

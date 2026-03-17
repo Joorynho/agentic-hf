@@ -1117,6 +1117,7 @@ button { font-family: inherit; cursor: pointer; }
 .alloc-tile { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:4px; padding:10px 6px; text-align:center; }
 .alloc-pod  { font-size:9px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); }
 .alloc-val  { font-family:var(--font-mono); font-size:15px; font-weight:500; color:var(--text-primary); margin-top:4px; font-variant-numeric:tabular-nums; }
+.alloc-pct  { font-family:var(--font-mono); font-size:11px; color:var(--accent); margin-top:2px; }
 
 /* ============================================================
    TOOLTIP REASONING
@@ -1620,3 +1621,161 @@ button { font-family: inherit; cursor: pointer; }
 .sec-btn {
   cursor: pointer;
 }
+
+/* ============================================================
+   HOLDINGS ROW CLICKABLE
+============================================================ */
+.holdings-row { cursor:pointer; transition:background 0.15s; }
+.holdings-row:hover { background:rgba(0,207,232,0.07); }
+
+/* ============================================================
+   POSITION DETAIL MODAL
+============================================================ */
+.pos-modal-overlay {
+  position:fixed; inset:0; z-index:9000;
+  background:rgba(8,14,28,0.85);
+  display:none; align-items:center; justify-content:center;
+  backdrop-filter:blur(4px);
+}
+.pos-modal-overlay.open { display:flex; }
+
+.pos-modal {
+  position:relative;
+  background:var(--bg-card, #14202e);
+  border:1px solid var(--border-dim, #2a3a50);
+  border-radius:8px;
+  width:520px; max-width:94vw; max-height:85vh;
+  overflow-y:auto; padding:24px 28px 20px;
+  box-shadow:0 16px 48px rgba(0,0,0,0.5);
+}
+.pos-modal-close {
+  position:absolute; top:10px; right:14px;
+  background:none; border:none; color:var(--text-muted,#6a82a0);
+  font-size:22px; cursor:pointer; line-height:1;
+}
+.pos-modal-close:hover { color:#fff; }
+.pos-modal-loading, .pos-modal-err {
+  padding:32px; text-align:center; color:var(--text-muted,#6a82a0);
+  font-family:var(--font-mono,'IBM Plex Mono',monospace); font-size:13px;
+}
+
+/* Header */
+.pos-hdr { display:flex; justify-content:space-between; align-items:center; margin-bottom:18px; }
+.pos-hdr-left { display:flex; align-items:center; gap:10px; }
+.pos-symbol { font-size:22px; font-weight:700; color:#fff; letter-spacing:.02em; }
+.pos-hdr-right { font-family:var(--font-mono); font-size:16px; font-weight:600; }
+.pos-hdr-right.pos { color:var(--green,#00d68f); }
+.pos-hdr-right.neg { color:var(--red,#e84040); }
+.pos-hdr-pct { font-size:12px; font-weight:400; opacity:0.8; }
+
+/* Summary grid */
+.pos-grid {
+  display:grid; grid-template-columns:repeat(3,1fr); gap:8px;
+  margin-bottom:18px;
+}
+.pos-cell {
+  background:var(--bg-surface,#0e1a28); border-radius:4px; padding:8px 10px;
+  border:1px solid var(--border-dim,#2a3a50);
+}
+.pos-cell-lbl { font-size:9px; text-transform:uppercase; letter-spacing:.08em; color:var(--text-muted,#6a82a0); margin-bottom:2px; }
+.pos-cell-val { font-family:var(--font-mono); font-size:14px; color:#fff; font-variant-numeric:tabular-nums; }
+
+/* Sections */
+.pos-section { margin-bottom:16px; }
+.pos-section-title {
+  font-size:10px; text-transform:uppercase; letter-spacing:.1em;
+  color:var(--accent,#00cfe8); font-weight:600; margin-bottom:8px;
+  border-bottom:1px solid var(--border-dim,#2a3a50); padding-bottom:4px;
+}
+
+/* Exit conditions bar */
+.pos-exit-bar { margin-bottom:6px; }
+.pos-bar-track {
+  position:relative; height:10px; border-radius:5px;
+  background:var(--bg-surface,#0e1a28); overflow:visible;
+  border:1px solid var(--border-dim,#2a3a50);
+}
+.pos-bar-sl {
+  position:absolute; left:0; top:0; bottom:0;
+  background:rgba(232,64,64,0.25); border-radius:5px 0 0 5px;
+}
+.pos-bar-tp {
+  position:absolute; top:0; bottom:0;
+  background:rgba(0,214,143,0.25); border-radius:0 5px 5px 0;
+}
+.pos-bar-marker {
+  position:absolute; top:-3px; width:4px; height:16px;
+  background:#fff; border-radius:2px; transform:translateX(-2px);
+}
+.pos-bar-labels {
+  display:flex; justify-content:space-between; margin-top:4px;
+  font-size:10px; font-family:var(--font-mono);
+}
+.pos-bar-sl-lbl { color:var(--red,#e84040); }
+.pos-bar-now { color:#fff; font-weight:600; }
+.pos-bar-tp-lbl { color:var(--green,#00d68f); }
+.pos-exit-meta { font-size:10px; color:var(--text-muted,#6a82a0); margin-top:4px; }
+
+/* Fill timeline */
+.pos-fills { display:flex; flex-direction:column; gap:6px; max-height:200px; overflow-y:auto; }
+.fill-entry {
+  display:flex; flex-wrap:wrap; align-items:flex-start; gap:6px;
+  padding:6px 8px; border-radius:4px; font-size:12px;
+  background:var(--bg-surface,#0e1a28);
+  border-left:3px solid transparent;
+}
+.fill-entry.fill-buy  { border-left-color:var(--green,#00d68f); }
+.fill-entry.fill-sell { border-left-color:var(--red,#e84040); }
+.fill-icon {
+  font-family:var(--font-mono); font-weight:700; font-size:14px; width:16px; text-align:center;
+}
+.fill-buy .fill-icon  { color:var(--green,#00d68f); }
+.fill-sell .fill-icon  { color:var(--red,#e84040); }
+.fill-info { flex:1; font-family:var(--font-mono); color:var(--text-primary,#f0f4fa); }
+.fill-side { font-weight:600; }
+.fill-buy .fill-side  { color:var(--green,#00d68f); }
+.fill-sell .fill-side  { color:var(--red,#e84040); }
+.fill-qty { color:#fff; }
+.fill-px  { color:var(--text-muted,#6a82a0); }
+.fill-date { float:right; color:var(--text-muted,#6a82a0); font-size:10px; }
+.fill-reason { width:100%; font-size:10px; color:var(--text-muted,#6a82a0); margin-top:2px; line-height:1.4; }
+
+/* Partial exits */
+.exit-entry {
+  display:flex; flex-wrap:wrap; gap:8px; align-items:center;
+  padding:5px 8px; border-radius:4px; font-size:11px; font-family:var(--font-mono);
+  background:var(--bg-surface,#0e1a28); margin-bottom:4px;
+}
+.exit-date { color:var(--text-muted,#6a82a0); min-width:70px; }
+.exit-qty  { color:#fff; flex:1; }
+.exit-px   { color:var(--text-muted,#6a82a0); }
+.exit-pnl  { font-weight:600; }
+.exit-pnl.pos { color:var(--green,#00d68f); }
+.exit-pnl.neg { color:var(--red,#e84040); }
+
+/* Entry thesis */
+.pos-thesis {
+  font-size:12px; line-height:1.5; color:var(--text-primary,#f0f4fa);
+  background:var(--bg-surface,#0e1a28); padding:10px 12px; border-radius:4px;
+  border:1px solid var(--border-dim,#2a3a50);
+}
+.pos-empty { font-size:12px; color:var(--text-muted,#6a82a0); padding:8px; text-align:center; }
+
+/* PM Reasoning History */
+.rh-list { display:flex; flex-direction:column; gap:6px; max-height:300px; overflow-y:auto; }
+.rh-entry { padding:8px 10px; border-radius:4px; border-left:3px solid var(--border-dim,#2a3a50); background:var(--bg-surface,#0e1a28); }
+.rh-entry.rh-hold { border-left-color:var(--text-muted,#6a82a0); }
+.rh-entry.rh-buy  { border-left-color:var(--green,#00d68f); }
+.rh-entry.rh-sell  { border-left-color:var(--red,#e84040); }
+.rh-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+.rh-badge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:3px; text-transform:uppercase; }
+.rh-hold .rh-badge { background:rgba(106,130,160,0.2); color:var(--text-muted,#6a82a0); }
+.rh-buy .rh-badge  { background:rgba(0,214,143,0.15); color:var(--green,#00d68f); }
+.rh-sell .rh-badge  { background:rgba(232,64,64,0.15); color:var(--red,#e84040); }
+.rh-ts { font-size:10px; color:var(--text-muted,#6a82a0); }
+.rh-text { font-size:11px; line-height:1.4; color:var(--text-secondary,#c8d6e5); }
+
+/* Closed Trades */
+.ct-pnl { font-weight:600; }
+.ct-pnl.pos { color:var(--green,#00d68f); }
+.ct-pnl.neg { color:var(--red,#e84040); }

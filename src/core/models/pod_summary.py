@@ -15,6 +15,8 @@ class PodRiskMetrics(BaseModel):
     nav: float
     daily_pnl: float
     starting_capital: float = 0.0
+    invested: float = 0.0
+    cash: float = 0.0
     drawdown_from_hwm: float
     current_vol_ann: float
     gross_leverage: float

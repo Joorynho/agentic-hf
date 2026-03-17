@@ -60,6 +60,16 @@ class AlpacaAdapter:
         )
         logger.info("[alpaca] Connected to %s", "paper" if paper else "live")
 
+    def _sync_fetch_account(self) -> dict:
+        """Synchronous account fetch — called via to_thread."""
+        account = self._client.get_account()
+        return {
+            "equity": float(account.equity),
+            "cash": float(account.cash),
+            "buying_power": float(account.buying_power),
+            "position_count": len(self._client.list_positions()),
+        }
+
     async def fetch_account(self) -> dict:
         """Fetch account info (NAV, buying power, positions).
 
@@ -67,13 +77,7 @@ class AlpacaAdapter:
             dict with keys: equity, cash, buying_power, etc.
         """
         try:
-            account = self._client.get_account()
-            return {
-                "equity": float(account.equity),
-                "cash": float(account.cash),
-                "buying_power": float(account.buying_power),
-                "position_count": len(self._client.list_positions()),
-            }
+            return await asyncio.to_thread(self._sync_fetch_account)
         except Exception as exc:
             logger.error("[alpaca] fetch_account failed: %s", exc)
             raise
@@ -168,21 +172,16 @@ class AlpacaAdapter:
             crypto_symbols = [s for s in symbols if self._is_crypto_symbol(s)]
 
             if stock_symbols:
-                barset = self._client.get_bars(
-                    stock_symbols,
-                    timeframe=tf,
-                    limit=limit,
+                barset = await asyncio.to_thread(
+                    self._client.get_bars, stock_symbols, timeframe=tf, limit=limit
                 )
                 stock_bars = self._barset_to_bar_list(barset, stock_symbols, source="alpaca")
                 for k, v in stock_bars.items():
                     results[k] = v
 
             if crypto_symbols:
-                crypto_barset = self._client.get_crypto_bars(
-                    crypto_symbols,
-                    timeframe=tf,
-                    limit=limit,
-                    loc="us",
+                crypto_barset = await asyncio.to_thread(
+                    self._client.get_crypto_bars, crypto_symbols, timeframe=tf, limit=limit, loc="us"
                 )
                 crypto_bars = self._barset_to_bar_list(
                     crypto_barset, crypto_symbols, source="alpaca"
@@ -364,6 +363,10 @@ class AlpacaAdapter:
                 "filled_at": None,
             }
 
+    def _sync_list_positions(self) -> list:
+        """Synchronous call to Alpaca list_positions — called via to_thread."""
+        return self._client.list_positions()
+
     async def get_open_positions(self) -> dict[str, dict]:
         """Get all open positions.
 
@@ -371,7 +374,7 @@ class AlpacaAdapter:
             dict[symbol] -> {qty, entry_price, current_price, unrealized_pl}
         """
         try:
-            positions = self._client.list_positions()
+            positions = await asyncio.to_thread(self._sync_list_positions)
             result = {}
             for pos in positions:
                 result[pos.symbol] = {
@@ -421,6 +424,28 @@ class AlpacaAdapter:
         except Exception as exc:
             logger.error("[alpaca] close_position failed for %s: %s", symbol, exc)
             raise
+
+    async def get_earliest_buy_dates(self) -> dict[str, str]:
+        """Fetch order history and return earliest fill date per symbol.
+
+        Returns:
+            dict[symbol] -> ISO date string of earliest filled BUY order.
+        """
+        try:
+            orders = self._client.list_orders(status="closed", limit=500, direction="asc")
+            earliest: dict[str, str] = {}
+            for o in orders:
+                if o.side != "buy" or not o.filled_at:
+                    continue
+                sym = o.symbol
+                fill_ts = str(o.filled_at)
+                if sym not in earliest or fill_ts < earliest[sym]:
+                    earliest[sym] = fill_ts
+            logger.info("[alpaca] Found earliest buy dates for %d symbols", len(earliest))
+            return earliest
+        except Exception as exc:
+            logger.warning("[alpaca] get_earliest_buy_dates failed (non-fatal): %s", exc)
+            return {}
 
     async def close_all_positions(self) -> list[dict]:
         """Liquidate all positions.

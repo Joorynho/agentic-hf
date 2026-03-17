@@ -97,7 +97,7 @@ class TradeProposal(BaseModel):
     stop_loss_pct: float = 0.05
     take_profit_pct: float = 0.15
     exit_when: str = ""
-    max_hold_days: int = 30
+    max_hold_days: int = 0
 
 
 class PositionSnapshot(BaseModel):
@@ -109,6 +109,10 @@ class PositionSnapshot(BaseModel):
     unrealized_pnl: float  # qty * (current_price - cost_basis)
     entry_thesis: str = ""
     entry_date: str = ""
+    stop_loss_pct: float = 0.05
+    take_profit_pct: float = 0.15
+    max_hold_days: int = 0
+    conviction: float = 0.0
 
     @property
     def notional(self) -> float:
@@ -130,3 +134,10 @@ class PodPosition(BaseModel):
     current_price: float
     unrealized_pnl: float = 0.0
     notional: float = 0.0  # qty * current_price
+    cost_basis: float = 0.0
+    entry_date: str = ""
+    entry_thesis: str = ""
+    stop_loss_pct: float = 0.05
+    take_profit_pct: float = 0.15
+    max_hold_days: int = 0
+    conviction: float = 0.0

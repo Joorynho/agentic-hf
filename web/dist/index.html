@@ -39,6 +39,10 @@
       <span class="sb-label">ITER</span>
       <span id="iter-ctr" style="color:var(--text-primary);font-family:var(--font-mono)">—</span>
     </div>
+    <div class="sb-pill" title="Last price refresh from Alpaca">
+      <span class="sb-label">PRICES</span>
+      <span id="price-ts" style="color:var(--text-primary);font-family:var(--font-mono);font-size:10px">—</span>
+    </div>
     <div class="sb-reports-wrap">
       <button class="sb-btn sb-btn-reports" id="reports-btn" onclick="toggleReportsDropdown()">REPORTS</button>
       <div class="sb-reports-dropdown" id="reports-dropdown">
@@ -146,9 +150,9 @@
           <table class="dtbl">
             <thead><tr>
               <th>Pod</th><th>Symbol</th><th class="r">Qty</th>
-              <th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th>
+              <th class="r">Entry</th><th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th>
             </tr></thead>
-            <tbody id="holdings-table"><tr><td colspan="6" class="empty"><div class="empty-txt">No positions yet</div></td></tr></tbody>
+            <tbody id="holdings-table"><tr><td colspan="7" class="empty"><div class="empty-txt">No positions yet</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -264,6 +268,21 @@
               <th class="r">Qty</th><th class="r">Price</th><th class="r">Status</th>
             </tr></thead>
             <tbody id="exec-table"><tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Closed Trades</span>
+          <span class="sec-badge" id="ct-badge">0 trades</span>
+        </div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Pod</th><th>Symbol</th><th>Entry</th><th>Exit</th>
+              <th class="r">Qty</th><th class="r">P&amp;L</th><th class="r">Days</th><th>Thesis</th>
+            </tr></thead>
+            <tbody id="ct-table"><tr><td colspan="8" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr></tbody>
           </table>
         </div>
       </div>

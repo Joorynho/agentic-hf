@@ -26,6 +26,7 @@ class PortfolioAccountant:
         self._entry_dates: dict[str, str] = {}
         self._entry_metadata: dict[str, dict] = {}
         self._closed_trades: list[dict] = []
+        self._position_reasoning_log: dict[str, list[dict]] = {}
         self._daily_nav_snapshots: list[tuple[date, float]] = [(date.today(), initial_nav)]
 
     def record_fill(self, fill: Fill) -> None:
@@ -68,7 +69,7 @@ class PortfolioAccountant:
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
         exit_when: str = "",
-        max_hold_days: int = 30,
+        max_hold_days: int = 0,
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -154,6 +155,7 @@ class PortfolioAccountant:
             self._entry_theses.pop(symbol, None)
             self._entry_dates.pop(symbol, None)
             self._entry_metadata.pop(symbol, None)
+            self._position_reasoning_log.pop(symbol, None)
         elif prev_qty == 0:
             # Opening new position
             self._cost_basis[symbol] = fill_price
@@ -188,6 +190,31 @@ class PortfolioAccountant:
             f"[{self._pod_id}] Fill recorded: {symbol} {qty:+.1f} @ ${fill_price:.2f}"
         )
 
+    def append_reasoning(
+        self,
+        symbol: str,
+        timestamp: str,
+        action: str,
+        reasoning: str,
+        conviction: float = 0.0,
+    ) -> None:
+        """Append a PM reasoning entry for a held position (capped at 20 per symbol)."""
+        if symbol not in self._position_reasoning_log:
+            self._position_reasoning_log[symbol] = []
+        log = self._position_reasoning_log[symbol]
+        log.append({
+            "timestamp": timestamp,
+            "action": action,
+            "reasoning": reasoning,
+            "conviction": round(conviction, 2),
+        })
+        if len(log) > 20:
+            self._position_reasoning_log[symbol] = log[-20:]
+
+    def get_reasoning_log(self, symbol: str) -> list[dict]:
+        """Return the reasoning history for a symbol (most recent first)."""
+        return list(reversed(self._position_reasoning_log.get(symbol, [])))
+
     def get_last_price(self, symbol: str, default: float = 0.0) -> float:
         """Get the most recent market price for a symbol from bar data."""
         return self._last_price.get(symbol, default)
@@ -213,6 +240,7 @@ class PortfolioAccountant:
                     symbol, self._cost_basis.get(symbol, 0.0)
                 )
                 unrealized_pnl = qty * (current_price - self._cost_basis.get(symbol, 0.0))
+                meta = self._entry_metadata.get(symbol, {})
                 positions[symbol] = PositionSnapshot(
                     symbol=symbol,
                     qty=qty,
@@ -221,6 +249,10 @@ class PortfolioAccountant:
                     unrealized_pnl=unrealized_pnl,
                     entry_thesis=self._entry_theses.get(symbol, ""),
                     entry_date=self._entry_dates.get(symbol, ""),
+                    stop_loss_pct=meta.get("stop_loss_pct", 0.05),
+                    take_profit_pct=meta.get("take_profit_pct", 0.15),
+                    max_hold_days=meta.get("max_hold_days", 0),
+                    conviction=meta.get("conviction", 0.0),
                 )
         return positions
 
@@ -385,3 +417,24 @@ class PortfolioAccountant:
             self._last_price[sym] = current_price
         if positions:
             logger.info("[%s] Loaded %d positions from memory/Alpaca", self._pod_id, len(positions))
+
+    def reconcile_capital_from_positions(self) -> None:
+        """Align starting_capital with loaded positions so NAV = invested + cash.
+
+        When positions are hydrated from Alpaca, their total cost basis can exceed
+        the config starting_capital ($100). This causes invested >> NAV and negative
+        cash. Set _starting_capital = total cost basis of current positions so the
+        books balance: NAV = starting + realized + unrealized = total market value.
+        """
+        total_cost = sum(
+            abs(p["quantity"]) * self._cost_basis.get(sym, p["avg_cost"])
+            for sym, p in self._positions.items()
+            if p.get("quantity", 0) != 0
+        )
+        if total_cost > 0:
+            prev = self._starting_capital
+            self._starting_capital = total_cost
+            logger.info(
+                "[%s] Reconciled starting_capital: $%.2f -> $%.2f (from %d positions)",
+                self._pod_id, prev, total_cost, len(self._positions),
+            )

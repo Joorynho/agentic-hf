@@ -27,6 +27,7 @@ async def main():
         event_bus=event_bus, audit_log=audit_log, enable_news_adapters=True
     )
     app = create_app(event_bus=event_bus, session_manager=manager)
+    manager.set_web_app(app)
 
     config = uvicorn.Config(app, host="127.0.0.1", port=8000, log_level="info")
     server = uvicorn.Server(config)

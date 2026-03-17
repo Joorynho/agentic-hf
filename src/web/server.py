@@ -137,32 +137,44 @@ class EventBusListener:
             payload = message.payload
             pod_id = payload.get("pod_id") or message.topic.split(".")[1]
 
-            # Flatten risk_metrics to top level so dashboard can read directly
-            rm = payload.get("risk_metrics", {})
-            payload["nav"] = payload.get("nav") or rm.get("nav", 0)
-            payload["daily_pnl"] = payload.get("daily_pnl") or rm.get("daily_pnl", 0)
-            payload["starting_capital"] = rm.get("starting_capital", 0)
-            payload["drawdown"] = rm.get("drawdown_from_hwm", 0)
-            payload["vol_ann"] = rm.get("current_vol_ann", 0)
-            payload["gross_leverage"] = rm.get("gross_leverage", 0)
-            payload["net_leverage"] = rm.get("net_leverage", 0)
-            payload["var_95"] = rm.get("var_95_1d", 0)
-            payload["es_95"] = rm.get("es_95_1d", 0)
-            # Map positions array for frontend compatibility
-            payload["current_positions"] = payload.get("positions", payload.get("current_positions", []))
-            payload["exposure_buckets"] = payload.get("exposure_buckets", [])
+            is_full_summary = "risk_metrics" in payload or "positions" in payload
+
+            if is_full_summary:
+                rm = payload.get("risk_metrics", {})
+                payload["nav"] = payload.get("nav") or rm.get("nav", 0)
+                payload["daily_pnl"] = payload.get("daily_pnl") or rm.get("daily_pnl", 0)
+                payload["starting_capital"] = rm.get("starting_capital", 0)
+                payload["invested"] = rm.get("invested", 0)
+                payload["cash"] = rm.get("cash", 0)
+                payload["drawdown"] = rm.get("drawdown_from_hwm", 0)
+                payload["vol_ann"] = rm.get("current_vol_ann", 0)
+                payload["gross_leverage"] = rm.get("gross_leverage", 0)
+                payload["net_leverage"] = rm.get("net_leverage", 0)
+                payload["var_95"] = rm.get("var_95_1d", 0)
+                payload["es_95"] = rm.get("es_95_1d", 0)
+                payload["current_positions"] = payload.get("positions", payload.get("current_positions", []))
+                payload["exposure_buckets"] = payload.get("exposure_buckets", [])
 
             broadcast_data = {
-                "type": "pod_summary",
+                "type": "pod_summary" if is_full_summary else "pod_enrichment",
                 "pod_id": pod_id,
                 "timestamp": message.timestamp.isoformat(),
                 "data": payload,
             }
             await self.manager.broadcast(broadcast_data)
 
-            # Store for snapshot on reconnect
             if hasattr(self, '_app_state'):
-                self._app_state['last_pod_summaries'][pod_id] = broadcast_data
+                if is_full_summary:
+                    self._app_state['last_pod_summaries'][pod_id] = broadcast_data
+                else:
+                    existing = self._app_state['last_pod_summaries'].get(pod_id, {})
+                    if existing:
+                        existing_data = existing.get("data", {})
+                        existing_data.update(payload)
+                        existing["data"] = existing_data
+                        existing["timestamp"] = message.timestamp.isoformat()
+                    else:
+                        self._app_state['last_pod_summaries'][pod_id] = broadcast_data
         except Exception as e:
             logger.error("[web] Error broadcasting pod update: %s", e)
 
@@ -462,6 +474,25 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"Pod {pod_id} not found")
 
         return {"pod_id": pod_id, "data": summary}
+
+    @app.get("/api/position/{pod_id}/{symbol}")
+    async def get_position_detail(pod_id: str, symbol: str):
+        """Get full position detail including fill history."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        detail = sm.get_position_detail(pod_id, symbol.upper())
+        if not detail:
+            raise HTTPException(status_code=404, detail=f"Position {symbol} not found in {pod_id}")
+        return detail
+
+    @app.get("/api/trades/closed")
+    async def get_closed_trades():
+        """Get all closed trades across all pods."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        return sm.get_all_closed_trades()
 
     @app.get("/api/risk", response_model=RiskStatusResponse)
     async def get_risk_status():

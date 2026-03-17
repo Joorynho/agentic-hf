@@ -71,12 +71,12 @@ If you need information not provided (e.g. a protocol upgrade date, regulatory n
 include "search_queries": ["query1", "query2"] (max 2). Results will be provided before your final decision.
 
 Output JSON:
-{"trades": [{"action": "BUY"|"SELL", "symbol": "XXX/USD", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ...", "stop_loss_pct": 0.05, "take_profit_pct": 0.15, "exit_when": "", "max_hold_days": 30}], "read_articles": ["url1"], "search_queries": ["query1"]}
+{"trades": [{"action": "BUY"|"SELL", "symbol": "XXX/USD", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ...", "stop_loss_pct": 0.05, "take_profit_pct": 0.15, "exit_when": "", "max_hold_days": 0}], "read_articles": ["url1"], "search_queries": ["query1"]}
 conviction: 0.0 = no confidence, 0.5 = moderate, 0.8+ = high conviction, 1.0 = maximum.
 stop_loss_pct: auto-exit if loss exceeds this % (default 5%). Use tighter stops (3%) in volatile setups.
 take_profit_pct: auto-exit if gain exceeds this % (default 15%).
 exit_when: free-text condition for exit (e.g. "exit if BTC breaks 50k support").
-max_hold_days: maximum days to hold (default 30).
+max_hold_days: optional. Set to a specific number of days if the thesis is time-bound (e.g. ETF approval in 21 days -> max_hold_days: 25). Set to 0 (default) for thesis-driven holds with no fixed time limit. Only set a limit when the trade thesis has a clear expiration.
 Only trades with conviction >= 0.7 should be above 10% of NAV.
 Omit read_articles if not needed.
 

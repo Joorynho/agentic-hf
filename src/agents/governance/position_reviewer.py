@@ -45,7 +45,7 @@ Be honest. If a position has deteriorated, admit it and recommend EXIT or TRIM.
 Do NOT defend losers out of ego. A good PM cuts losses and lets winners run.
 
 Respond with JSON:
-{"positions": [{"symbol": "X", "action": "HOLD|ADD|TRIM|EXIT", "qty": N_or_null, "reasoning": "..."}]}
+{{"positions": [{{"symbol": "X", "action": "HOLD|ADD|TRIM|EXIT", "qty": N_or_null, "reasoning": "..."}}]}}
 qty is required for ADD and TRIM (number of shares/units to add or remove). null for HOLD and EXIT."""
 
 _CIO_DECISION_SYSTEM = """You are the CIO reviewing the PM's position recommendations for the {pod_id} pod.
@@ -57,7 +57,7 @@ For each position, decide whether to ACCEPT or OVERRIDE the PM's recommendation.
 - You may change ADD to HOLD if conviction isn't strong enough.
 
 Respond with JSON:
-{"decisions": [{"symbol": "X", "action": "HOLD|ADD|TRIM|EXIT", "qty": N_or_null, "reasoning": "...", "pm_overridden": true|false}]}"""
+{{"decisions": [{{"symbol": "X", "action": "HOLD|ADD|TRIM|EXIT", "qty": N_or_null, "reasoning": "...", "pm_overridden": true|false}}]}}"""
 
 
 class PositionReviewer:

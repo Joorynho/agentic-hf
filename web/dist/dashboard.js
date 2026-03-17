@@ -134,6 +134,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'execution') fetchClosedTrades();
   });
 });
 
@@ -708,11 +709,22 @@ function handleMessage(msg) {
     updateSessionStatus(!!sd.active);
     return;
   }
-  if (msg.type === 'pod_summary') {
+  if (msg.type === 'pod_summary' || msg.type === 'pod_enrichment') {
     const data = msg.data;
     const pod_id = msg.pod_id || data.pod_id;
     if (pod_id) {
-      pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+      if (msg.type === 'pod_summary') {
+        pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+        var ptsEl = document.getElementById('price-ts');
+        if (ptsEl) ptsEl.textContent = new Date().toLocaleTimeString();
+      } else {
+        // Enrichment: only merge research keys, never clobber core metrics
+        if (!pods[pod_id]) pods[pod_id] = {};
+        var enrichKeys = ['polymarket_signals','polymarket_confidence','macro_score','fred_snapshot','fred_score','poly_sentiment','social_score','x_feed','x_tweet_count','news_last_refresh','features','pod_id'];
+        for (var ek = 0; ek < enrichKeys.length; ek++) {
+          if (data[enrichKeys[ek]] !== undefined) pods[pod_id][enrichKeys[ek]] = data[enrichKeys[ek]];
+        }
+      }
 
       if (data.polymarket_signals !== undefined || data.fred_snapshot !== undefined || data.x_feed !== undefined) {
         if (data.fred_snapshot !== undefined) {
@@ -748,7 +760,7 @@ function handleMessage(msg) {
         } else {
           updateResearchTab([], data.polymarket_confidence, data.macro_score);
         }
-        if (!data.status) return;
+        if (msg.type === 'pod_enrichment' || !data.status) return;
       }
 
       iterCount++;
@@ -765,6 +777,8 @@ function handleMessage(msg) {
       calculateRisk();
       updateRiskTable();
       updateTopHoldings();
+      refreshOpenModal();
+      if (document.getElementById('tab-execution') && document.getElementById('tab-execution').classList.contains('active')) fetchClosedTrades();
       if (data.status) {
         if (typeof updatePodSilhouetteColor === 'function') updatePodSilhouetteColor(pod_id, data.status);
       }
@@ -845,14 +859,17 @@ function updatePodsTable() {
   tbody.innerHTML = ids.map(id => {
     const d   = pods[id];
     const nav = d.nav || 0;
+    const invested = d.invested || 0;
+    const cash = d.cash || 0;
     const pnl = d.daily_pnl || 0;
     const st  = (d.status || 'UNKNOWN').toUpperCase();
     const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
     const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
     const spark = makeSparkline(podNavSpark[id]);
-    return `<tr onclick="openDrilldown('${id}')" style="cursor:pointer" title="Click for details">
+    const navTitle = `Invested: $${invested.toFixed(2)} | Cash: $${cash.toFixed(2)}`;
+    return `<tr onclick="openDrilldown('${id}')" style="cursor:pointer" title="${navTitle}">
       <td class="pod-name">${id.toUpperCase()}</td>
-      <td class="r">$${nav.toFixed(2)}</td>
+      <td class="r"><span title="${navTitle}">$${nav.toFixed(2)}</span></td>
       <td class="r">${spark}</td>
       <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
       <td class="r"><span class="badge ${sc}">${st}</span></td>
@@ -876,7 +893,11 @@ function updateFirmMetrics() {
     }, 0);
   }
 
+  const firmInvested = ids.reduce((s,id) => s + (pods[id].invested || 0), 0);
+  const firmCash = ids.reduce((s,id) => s + (pods[id].cash || 0), 0);
+
   document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
+  if (nav > 0) document.getElementById('kpi-nav').title = `Invested: $${firmInvested.toFixed(0)} | Cash: $${firmCash.toFixed(0)}`;
   document.getElementById('kpi-active').textContent = act > 0 ? act : '—';
   document.getElementById('kpi-pos').textContent    = pos > 0 ? pos : '—';
 
@@ -1030,7 +1051,7 @@ function calculateRisk() {
   var hasRealData = ids.some(function(id) { return pods[id].var_95 != null && pods[id].var_95 !== 0; });
 
   if (hasRealData) {
-    document.getElementById('kpi-var').textContent = '$' + totalVar.toFixed(0);
+    document.getElementById('kpi-var').textContent = '$' + Math.abs(totalVar).toFixed(0);
     document.getElementById('kpi-lev').textContent = (totalLev / (count || 1)).toFixed(2) + 'x';
   } else {
     var approxVar = nav * 0.025;
@@ -1038,14 +1059,35 @@ function calculateRisk() {
     document.getElementById('kpi-lev').textContent = '—';
   }
 
+  // Drawdown: use backend value if nonzero, otherwise compute from navHistory
+  var ddVal = totalDD;
+  if (ddVal === 0 && navHistory.length >= 2) {
+    var navs = navHistory.map(function(h) { return h.firmNav; });
+    var hwm = Math.max.apply(null, navs);
+    if (hwm > 0) ddVal = (navs[navs.length - 1] - hwm) / hwm;
+  }
   var ddEl = document.getElementById('kpi-dd');
   if (ddEl) {
-    ddEl.textContent = totalDD !== 0 ? (totalDD * 100).toFixed(1) + '%' : '—';
-    ddEl.className = 'kpi-val' + (totalDD < -0.05 ? ' neg' : '');
+    ddEl.textContent = ddVal !== 0 ? (ddVal * 100).toFixed(1) + '%' : '0.0%';
+    ddEl.className = 'kpi-val' + (ddVal < -0.05 ? ' neg' : '');
   }
 
+  // Volatility: use backend value if nonzero, otherwise compute from navHistory
+  var volVal = totalVol > 0 ? (totalVol / (count || 1)) : 0;
+  if (volVal === 0 && navHistory.length >= 3) {
+    var navs2 = navHistory.map(function(h) { return h.firmNav; });
+    var rets = [];
+    for (var ri = 1; ri < navs2.length; ri++) {
+      if (navs2[ri - 1] > 0) rets.push((navs2[ri] - navs2[ri - 1]) / navs2[ri - 1]);
+    }
+    if (rets.length >= 2) {
+      var rmean = rets.reduce(function(s, r) { return s + r; }, 0) / rets.length;
+      var rvar = rets.reduce(function(s, r) { return s + (r - rmean) * (r - rmean); }, 0) / rets.length;
+      volVal = Math.sqrt(rvar) * Math.sqrt(252);
+    }
+  }
   var volEl = document.getElementById('kpi-vol');
-  if (volEl) volEl.textContent = totalVol > 0 ? ((totalVol / (count || 1)) * 100).toFixed(1) + '%' : '—';
+  if (volEl) volEl.textContent = volVal > 0 ? (volVal * 100).toFixed(1) + '%' : '—';
 
   document.getElementById('kpi-alerts').textContent = riskAlerts.length;
   updateRiskTable();
@@ -1071,7 +1113,7 @@ function updateRiskTable() {
     const pos   = Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0;
     const st    = (d.status || 'UNKNOWN').toUpperCase();
     const sc    = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
-    const var95 = d.var_95 != null && d.var_95 !== 0 ? '$' + d.var_95.toFixed(0) : '$' + (nav * 0.025).toFixed(0);
+    const var95 = d.var_95 != null && d.var_95 !== 0 ? '$' + Math.abs(d.var_95).toFixed(0) : '$' + (nav * 0.025).toFixed(0);
     const lev   = d.gross_leverage != null && d.gross_leverage !== 0 ? d.gross_leverage.toFixed(2) + 'x' : '—';
     const dd    = d.drawdown != null && d.drawdown !== 0 ? (d.drawdown * 100).toFixed(1) + '%' : '0.0%';
     const ddCls = d.drawdown != null && d.drawdown < -0.05 ? 'neg' : '';
@@ -1161,17 +1203,26 @@ function recordGov(agent, decision, reasoning, weights) {
     ts: new Date().toISOString(),
   });
   if (governanceDecisions.length > 50) governanceDecisions.pop();
+  if (weights && typeof weights === 'object' && Object.keys(weights).length > 0) {
+    latestAllocWeights = weights;
+  }
   updateGovHub();
 }
+
+var latestAllocWeights = {};
 
 function updateGovHub() {
   const ids = Object.keys(pods).sort();
   const names = ids.length > 0 ? ids : ['equities','fx','crypto','commodities'];
+  const firmNav = ids.reduce(function(s, id) { return s + (pods[id] ? pods[id].nav || 0 : 0); }, 0);
   document.getElementById('alloc-grid').innerHTML = names.map(id => {
     const nav = pods[id] ? pods[id].nav || 0 : 0;
+    const pct = latestAllocWeights[id] != null ? (latestAllocWeights[id] * 100).toFixed(0) + '%'
+              : firmNav > 0 ? (nav / firmNav * 100).toFixed(0) + '%' : '—';
     return `<div class="alloc-tile">
       <div class="alloc-pod">${id.toUpperCase()}</div>
-      <div class="alloc-val">${nav > 0 ? '$'+nav.toFixed(0) : '—'}</div>
+      <div class="alloc-val">$${nav > 0 ? nav.toFixed(0) : '—'}</div>
+      <div class="alloc-pct">${pct}</div>
     </div>`;
   }).join('');
 
@@ -1209,23 +1260,244 @@ function updateTopHoldings() {
   });
   if (badge) badge.textContent = allPos.length + ' position' + (allPos.length !== 1 ? 's' : '');
   if (allPos.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
     return;
   }
   allPos.sort(function(a, b) { return Math.abs(b.notional || 0) - Math.abs(a.notional || 0); });
   tbody.innerHTML = allPos.slice(0, 15).map(function(p) {
     var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
-    var notional = p.notional || (p.qty || 0) * (p.current_price || p.avg_entry || 0);
-    return '<tr>' +
-      '<td class="pod-name">' + escapeHtml((p._pod || '').toUpperCase()) + '</td>' +
-      '<td style="font-weight:600">' + escapeHtml(p.symbol || '') + '</td>' +
+    var entry = p.cost_basis || p.avg_entry || 0;
+    var notional = p.notional || (p.qty || 0) * (p.current_price || entry);
+    var podEsc = escapeHtml(p._pod || '');
+    var symEsc = escapeHtml(p.symbol || '');
+    return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for details">' +
+      '<td class="pod-name">' + podEsc.toUpperCase() + '</td>' +
+      '<td style="font-weight:600">' + symEsc + '</td>' +
       '<td class="r">' + (p.qty || 0) + '</td>' +
-      '<td class="r">$' + (p.current_price || p.avg_entry || 0).toFixed(2) + '</td>' +
+      '<td class="r">$' + entry.toFixed(2) + '</td>' +
+      '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
       '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
       '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
       '</tr>';
   }).join('');
+}
+
+// ─── 12b. Position Detail Modal ─────────────────────────────────────────────
+var _openModalPodId = null;
+var _openModalSymbol = null;
+
+function showPositionDetail(podId, symbol) {
+  var overlay = document.getElementById('pos-modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'pos-modal-overlay';
+    overlay.className = 'pos-modal-overlay';
+    overlay.onclick = function(e) { if (e.target === overlay) closePositionModal(); };
+    document.body.appendChild(overlay);
+  }
+  overlay.classList.add('open');
+  _openModalPodId = podId;
+  _openModalSymbol = symbol;
+
+  // Build modal immediately from data already on the frontend
+  var localData = buildPositionFromLocal(podId, symbol);
+  if (localData) {
+    renderPositionModal(localData, overlay);
+  } else {
+    overlay.innerHTML = '<div class="pos-modal"><div class="pos-modal-loading">Loading ' + escapeHtml(symbol) + '...</div></div>';
+  }
+
+  // Try API for enriched data (fills, partial exits) with a timeout
+  var controller = new AbortController();
+  var timeout = setTimeout(function() { controller.abort(); }, 4000);
+  fetch('/api/position/' + encodeURIComponent(podId) + '/' + encodeURIComponent(symbol), { signal: controller.signal })
+    .then(function(r) { clearTimeout(timeout); if (!r.ok) throw new Error(r.statusText); return r.json(); })
+    .then(function(d) { renderPositionModal(d, overlay); })
+    .catch(function() {
+      clearTimeout(timeout);
+      if (!localData) {
+        overlay.innerHTML = '<div class="pos-modal"><div class="pos-modal-err">Position data unavailable. Try again between iterations.</div><button class="pos-modal-close" onclick="closePositionModal()">Close</button></div>';
+      }
+    });
+}
+
+function refreshOpenModal() {
+  if (!_openModalPodId || !_openModalSymbol) return;
+  var overlay = document.getElementById('pos-modal-overlay');
+  if (!overlay || !overlay.classList.contains('open')) return;
+  var localData = buildPositionFromLocal(_openModalPodId, _openModalSymbol);
+  if (localData) renderPositionModal(localData, overlay);
+}
+
+function buildPositionFromLocal(podId, symbol) {
+  var pod = pods[podId];
+  if (!pod) return null;
+  var positions = pod.current_positions || pod.positions || [];
+  if (!Array.isArray(positions)) return null;
+  var pos = null;
+  for (var i = 0; i < positions.length; i++) {
+    if (positions[i].symbol === symbol) { pos = positions[i]; break; }
+  }
+  if (!pos) return null;
+  var pnl = pos.unrealized_pnl || pos.unrealised_pnl || 0;
+  var costBasis = pos.cost_basis || pos.avg_entry || 0;
+  var pnlPct = costBasis > 0 ? (pos.current_price - costBasis) / costBasis * 100 : 0;
+  var daysHeld = 0;
+  if (pos.entry_date) {
+    try {
+      var entryMs = new Date(pos.entry_date).getTime();
+      daysHeld = Math.max(0, Math.floor((Date.now() - entryMs) / 86400000));
+    } catch(e) {}
+  }
+  return {
+    symbol: pos.symbol,
+    pod_id: podId,
+    qty: pos.qty || 0,
+    cost_basis: costBasis,
+    current_price: pos.current_price || 0,
+    unrealized_pnl: pnl,
+    pnl_pct: pnlPct,
+    entry_date: pos.entry_date || '',
+    entry_thesis: pos.entry_thesis || '',
+    stop_loss_pct: pos.stop_loss_pct || 0.05,
+    take_profit_pct: pos.take_profit_pct || 0.15,
+    max_hold_days: pos.max_hold_days || 0,
+    conviction: pos.conviction || 0,
+    days_held: daysHeld,
+    fills: pos.fills || [],
+    partial_exits: pos.partial_exits || []
+  };
+}
+
+function closePositionModal() {
+  var o = document.getElementById('pos-modal-overlay');
+  if (o) o.classList.remove('open');
+  _openModalPodId = null;
+  _openModalSymbol = null;
+}
+
+function renderPositionModal(d, overlay) {
+  var pnl = d.unrealized_pnl || 0;
+  var pnlCls = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+  var pnlPct = d.pnl_pct || 0;
+  var totalRetCls = pnlPct >= 0 ? 'pos' : 'neg';
+
+  // SL / TP progress bar
+  var slPct = ((d.stop_loss_pct || 0.05) * 100).toFixed(1);
+  var tpPct = ((d.take_profit_pct || 0.15) * 100).toFixed(1);
+  var currentPnlPct = pnlPct;
+  var barMin = -(d.stop_loss_pct || 0.05) * 100;
+  var barMax = (d.take_profit_pct || 0.15) * 100;
+  var barRange = barMax - barMin;
+  var markerPos = barRange > 0 ? Math.max(0, Math.min(100, (currentPnlPct - barMin) / barRange * 100)) : 50;
+
+  // Fill timeline
+  var fillsHtml = '';
+  if (d.fills && d.fills.length > 0) {
+    fillsHtml = d.fills.map(function(f) {
+      var isBuy = f.side === 'BUY';
+      var cls = isBuy ? 'fill-buy' : 'fill-sell';
+      var icon = isBuy ? '+' : '-';
+      var ts = f.timestamp ? new Date(f.timestamp).toLocaleDateString() : '—';
+      return '<div class="fill-entry ' + cls + '">' +
+        '<span class="fill-icon">' + icon + '</span>' +
+        '<div class="fill-info">' +
+          '<span class="fill-side">' + f.side + '</span> ' +
+          '<span class="fill-qty">' + f.qty + '</span> @ ' +
+          '<span class="fill-px">$' + (f.fill_price || 0).toFixed(2) + '</span>' +
+          '<span class="fill-date">' + ts + '</span>' +
+        '</div>' +
+        (f.reasoning ? '<div class="fill-reason">' + escapeHtml(f.reasoning) + '</div>' : '') +
+      '</div>';
+    }).join('');
+  } else {
+    fillsHtml = '<div class="pos-empty">No fill history available</div>';
+  }
+
+  // Partial exits
+  var exitsHtml = '';
+  if (d.partial_exits && d.partial_exits.length > 0) {
+    exitsHtml = '<div class="pos-section"><div class="pos-section-title">Partial Exits</div>' +
+      d.partial_exits.map(function(e) {
+        var rpnl = e.realized_pnl || 0;
+        var rpCls = rpnl >= 0 ? 'pos' : 'neg';
+        return '<div class="exit-entry">' +
+          '<span class="exit-date">' + (e.date || '—') + '</span>' +
+          '<span class="exit-qty">Sold ' + e.qty_sold + ' (' + e.pct_of_original + '% of original)</span>' +
+          '<span class="exit-px">@ $' + (e.exit_price || 0).toFixed(2) + '</span>' +
+          '<span class="exit-pnl ' + rpCls + '">P&L: ' + (rpnl >= 0 ? '+' : '') + '$' + rpnl.toFixed(4) + '</span>' +
+        '</div>';
+      }).join('') + '</div>';
+  }
+
+  var convPct = ((d.conviction || 0) * 100).toFixed(0);
+
+  overlay.innerHTML = '<div class="pos-modal">' +
+    '<button class="pos-modal-close" onclick="closePositionModal()">&times;</button>' +
+    // Header
+    '<div class="pos-hdr">' +
+      '<div class="pos-hdr-left">' +
+        '<span class="pos-symbol">' + escapeHtml(d.symbol) + '</span>' +
+        '<span class="badge b-' + escapeHtml(d.pod_id) + '">' + escapeHtml(d.pod_id).toUpperCase() + '</span>' +
+      '</div>' +
+      '<div class="pos-hdr-right ' + pnlCls + '">' +
+        (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) +
+        ' <span class="pos-hdr-pct">(' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)</span>' +
+      '</div>' +
+    '</div>' +
+    // Summary grid
+    '<div class="pos-grid">' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Entry Date</div><div class="pos-cell-val">' + (d.entry_date || '—') + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Days Held</div><div class="pos-cell-val">' + (d.days_held > 0 ? d.days_held : (d.entry_date ? '< 1' : '—')) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Entry Price</div><div class="pos-cell-val">$' + (d.cost_basis || 0).toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Current Price</div><div class="pos-cell-val">$' + (d.current_price || 0).toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Quantity</div><div class="pos-cell-val">' + (d.qty || 0) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + totalRetCls + '">' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%</div></div>' +
+    '</div>' +
+    // Exit conditions bar
+    '<div class="pos-section">' +
+      '<div class="pos-section-title">Exit Conditions</div>' +
+      '<div class="pos-exit-bar">' +
+        '<div class="pos-bar-track">' +
+          '<div class="pos-bar-sl" style="width:' + (((d.stop_loss_pct || 0.05) * 100) / barRange * 100) + '%"></div>' +
+          '<div class="pos-bar-tp" style="width:' + (((d.take_profit_pct || 0.15) * 100) / barRange * 100) + '%;right:0"></div>' +
+          '<div class="pos-bar-marker" style="left:' + markerPos + '%"></div>' +
+        '</div>' +
+        '<div class="pos-bar-labels">' +
+          '<span class="pos-bar-sl-lbl">SL -' + slPct + '%</span>' +
+          '<span class="pos-bar-now">Now ' + (currentPnlPct >= 0 ? '+' : '') + currentPnlPct.toFixed(1) + '%</span>' +
+          '<span class="pos-bar-tp-lbl">TP +' + tpPct + '%</span>' +
+        '</div>' +
+      '</div>' +
+      '<div class="pos-exit-meta">Max hold: ' + (d.max_hold_days > 0 ? d.max_hold_days + ' days' : 'No limit (thesis-driven)') + '</div>' +
+    '</div>' +
+    // Fill timeline
+    '<div class="pos-section">' +
+      '<div class="pos-section-title">Fill Timeline (' + (d.fills ? d.fills.length : 0) + ' fills)</div>' +
+      '<div class="pos-fills">' + fillsHtml + '</div>' +
+    '</div>' +
+    // Partial exits
+    exitsHtml +
+    // Entry thesis
+    (d.entry_thesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(d.entry_thesis) + '</div></div>' : '') +
+    // PM Reasoning History
+    (function() {
+      var rh = d.reasoning_history;
+      if (!rh || !rh.length) return '';
+      var items = rh.slice(0, 10).map(function(r) {
+        var actionCls = r.action === 'HOLD' ? 'rh-hold' : r.action === 'BUY' ? 'rh-buy' : 'rh-sell';
+        var ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : '';
+        var conv = r.conviction > 0 ? ' (' + (r.conviction * 100).toFixed(0) + '% conviction)' : '';
+        return '<div class="rh-entry ' + actionCls + '">' +
+          '<div class="rh-header"><span class="rh-badge">' + escapeHtml(r.action) + '</span><span class="rh-ts">' + ts + conv + '</span></div>' +
+          '<div class="rh-text">' + escapeHtml(r.reasoning || '') + '</div>' +
+        '</div>';
+      }).join('');
+      return '<div class="pos-section"><div class="pos-section-title">PM Reasoning History (' + rh.length + ' entries)</div>' +
+        '<div class="rh-list">' + items + '</div></div>';
+    })() +
+  '</div>';
 }
 
 // ─── 13. Drawdown Chart ───────────────────────────────────────────────────
@@ -1436,6 +1708,54 @@ function exportNavHistory() {
   downloadCsv('nav_history_' + new Date().toISOString().slice(0,10) + '.csv', headers, rows);
 }
 
+// ─── 16b. Closed Trades ─────────────────────────────────────────────────────
+var _ctLastFetch = 0;
+var _ctData = [];
+
+function fetchClosedTrades() {
+  var now = Date.now();
+  if (now - _ctLastFetch < 15000) return;
+  _ctLastFetch = now;
+  var controller = new AbortController();
+  var timeout = setTimeout(function() { controller.abort(); }, 4000);
+  fetch('/api/trades/closed', { signal: controller.signal })
+    .then(function(r) { clearTimeout(timeout); if (!r.ok) throw new Error(r.statusText); return r.json(); })
+    .then(function(data) {
+      _ctData = data;
+      renderClosedTrades();
+    })
+    .catch(function() { clearTimeout(timeout); });
+}
+
+function renderClosedTrades() {
+  var tbody = document.getElementById('ct-table');
+  var badge = document.getElementById('ct-badge');
+  if (!tbody) return;
+  if (badge) badge.textContent = _ctData.length + ' trade' + (_ctData.length !== 1 ? 's' : '');
+  if (_ctData.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr>';
+    return;
+  }
+  var totalPnl = 0;
+  tbody.innerHTML = _ctData.slice(0, 30).map(function(t) {
+    var pnl = t.realized_pnl || 0;
+    totalPnl += pnl;
+    var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+    var thesis = (t.entry_reasoning || '').substring(0, 60);
+    if (t.entry_reasoning && t.entry_reasoning.length > 60) thesis += '...';
+    return '<tr>' +
+      '<td class="pod-name">' + escapeHtml(t.pod_id || '').toUpperCase() + '</td>' +
+      '<td style="font-weight:600">' + escapeHtml(t.symbol || '') + '</td>' +
+      '<td class="r">$' + (t.entry_price || 0).toFixed(2) + '</td>' +
+      '<td class="r">$' + (t.exit_price || 0).toFixed(2) + '</td>' +
+      '<td class="r">' + (t.qty || 0) + '</td>' +
+      '<td class="r ct-pnl ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</td>' +
+      '<td class="r">' + (t.holding_days || '—') + '</td>' +
+      '<td class="ct-thesis" title="' + escapeHtml(t.entry_reasoning || '') + '">' + escapeHtml(thesis) + '</td>' +
+      '</tr>';
+  }).join('');
+}
+
 // ─── 17. Chart Timeframe Toggle ────────────────────────────────────────────
 function setChartTimeframe(minutes) {
   chartTimeframeMinutes = minutes;
@@ -1461,15 +1781,17 @@ function openDrilldown(podId) {
   var sc = d.starting_capital || 0;
   var cpnl = sc > 0 ? nav - sc : pnl;
   var cret = sc > 0 ? ((nav - sc) / sc * 100).toFixed(2) + '%' : '—';
+  var inv = d.invested || 0;
+  var csh = d.cash || 0;
   kpis.innerHTML = [
     { lbl: 'NAV', val: '$' + nav.toFixed(2) },
+    { lbl: 'Invested', val: '$' + inv.toFixed(2) },
+    { lbl: 'Cash', val: '$' + csh.toFixed(2) },
     { lbl: 'Daily P&L', val: (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) },
     { lbl: 'Cum. P&L', val: (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2) },
     { lbl: 'Return', val: cret },
-    { lbl: 'VaR 95%', val: d.var_95 != null ? '$' + d.var_95.toFixed(0) : '—' },
     { lbl: 'Leverage', val: d.gross_leverage != null ? d.gross_leverage.toFixed(2) + 'x' : '—' },
     { lbl: 'Drawdown', val: d.drawdown != null ? (d.drawdown * 100).toFixed(1) + '%' : '—' },
-    { lbl: 'Vol (ann)', val: d.vol_ann != null ? (d.vol_ann * 100).toFixed(1) + '%' : '—' },
   ].map(function(k) {
     return '<div class="kpi"><div class="kpi-lbl">' + k.lbl + '</div><div class="kpi-val">' + k.val + '</div></div>';
   }).join('');

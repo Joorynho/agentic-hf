@@ -172,6 +172,9 @@ class PodRuntime:
             "action": last_pm.get("action_summary", "holding")[:100],
         })
 
+        # Log PM reasoning for all held positions (diary per position)
+        self._log_pm_reasoning(last_pm)
+
         order: Order | None = ctx.get("order")
         if order is None:
             # No trade proposed — still run Ops
@@ -193,7 +196,7 @@ class PodRuntime:
             "stop_loss_pct": matching_trade.get("stop_loss_pct"),
             "take_profit_pct": matching_trade.get("take_profit_pct"),
             "exit_when": matching_trade.get("exit_when", ""),
-            "max_hold_days": matching_trade.get("max_hold_days", 30),
+            "max_hold_days": matching_trade.get("max_hold_days", 0),
         })
 
         # 4. Risk sign-off loop (PM↔Risk, max 10 iter)
@@ -229,6 +232,39 @@ class PodRuntime:
 
         # 6. Ops
         await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
+
+    def _log_pm_reasoning(self, pm_decision: dict) -> None:
+        """Log PM reasoning for all held positions after each PM decision cycle."""
+        accountant = self._ns.get("accountant")
+        if not accountant:
+            return
+
+        held_symbols = {
+            sym for sym, pos in accountant._positions.items()
+            if pos.get("quantity", 0) != 0
+        }
+        if not held_symbols:
+            return
+
+        now_str = datetime.now().isoformat()
+        pm_trades = pm_decision.get("trades", [])
+        traded_symbols: dict[str, dict] = {}
+        for t in pm_trades:
+            if isinstance(t, dict) and t.get("symbol"):
+                traded_symbols[t["symbol"]] = t
+
+        for sym in held_symbols:
+            if sym in traded_symbols:
+                t = traded_symbols[sym]
+                action = (t.get("action") or "TRADE").upper()
+                reasoning = t.get("reasoning", "")[:300]
+                conviction = t.get("conviction", 0.0)
+            else:
+                action = "HOLD"
+                summary = pm_decision.get("action_summary", "")
+                reasoning = f"No action taken. PM summary: {summary[:200]}" if summary else "Position maintained — no action from PM this iteration"
+                conviction = 0.0
+            accountant.append_reasoning(sym, now_str, action, reasoning, conviction)
 
     async def _run_risk_loop_with_exits(self, order: Order) -> tuple[Order | None, list[Order]]:
         """Run the risk loop and collect any exit orders. Returns (approved_order, exit_orders)."""
@@ -391,6 +427,13 @@ class PodRuntime:
                     current_price=snapshot.current_price,
                     unrealized_pnl=snapshot.unrealized_pnl,
                     notional=snapshot.notional,
+                    cost_basis=snapshot.cost_basis,
+                    entry_date=snapshot.entry_date,
+                    entry_thesis=snapshot.entry_thesis,
+                    stop_loss_pct=snapshot.stop_loss_pct,
+                    take_profit_pct=snapshot.take_profit_pct,
+                    max_hold_days=snapshot.max_hold_days,
+                    conviction=snapshot.conviction,
                 )
             )
 
@@ -423,6 +466,10 @@ class PodRuntime:
                 )
             )
 
+        # Cash and invested breakdown
+        invested = total_notional
+        cash_value = accountant.nav - invested
+
         # Build risk metrics
         risk_metrics = PodRiskMetrics(
             pod_id=self._pod_id,
@@ -430,7 +477,9 @@ class PodRuntime:
             nav=accountant.nav,
             daily_pnl=accountant.daily_pnl,
             starting_capital=accountant.starting_capital,
-            drawdown_from_hwm=max(0.0, drawdown),  # Clamp to non-negative
+            invested=round(invested, 2),
+            cash=round(cash_value, 2),
+            drawdown_from_hwm=drawdown,
             current_vol_ann=vol_ann,
             gross_leverage=gross_leverage,
             net_leverage=net_leverage,

@@ -231,7 +231,7 @@ class EquitiesExecutionTrader(BasePodAgent):
                         stop_loss_pct=pm_meta.get("stop_loss_pct"),
                         take_profit_pct=pm_meta.get("take_profit_pct"),
                         exit_when=pm_meta.get("exit_when", ""),
-                        max_hold_days=pm_meta.get("max_hold_days", 30),
+                        max_hold_days=pm_meta.get("max_hold_days", 0),
                     )
 
                 try:

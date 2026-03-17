@@ -38,7 +38,7 @@ class PositionMonitor:
             meta = accountant._entry_metadata.get(sym, {})
             sl = meta.get("stop_loss_pct", 0.05)
             tp = meta.get("take_profit_pct", 0.15)
-            max_days = meta.get("max_hold_days", 30)
+            max_days = meta.get("max_hold_days", 0)
             entry_time_str = meta.get("entry_time", "")
 
             reason = ""
