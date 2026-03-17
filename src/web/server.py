@@ -165,6 +165,19 @@ class EventBusListener:
 
             if hasattr(self, '_app_state'):
                 if is_full_summary:
+                    # Preserve research keys from existing summary; full summaries (e.g. price ticker)
+                    # don't include fred_snapshot, polymarket_signals, etc., so merge them in
+                    existing = self._app_state['last_pod_summaries'].get(pod_id, {})
+                    existing_data = existing.get("data", {})
+                    research_keys = (
+                        "polymarket_signals", "polymarket_confidence", "macro_score",
+                        "fred_snapshot", "fred_score", "poly_sentiment", "social_score",
+                        "x_feed", "x_tweet_count", "news_last_refresh", "features",
+                    )
+                    for key in research_keys:
+                        if key not in payload and key in existing_data:
+                            payload[key] = existing_data[key]
+                    broadcast_data["data"] = payload
                     self._app_state['last_pod_summaries'][pod_id] = broadcast_data
                 else:
                     existing = self._app_state['last_pod_summaries'].get(pod_id, {})

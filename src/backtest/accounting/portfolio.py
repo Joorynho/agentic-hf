@@ -422,19 +422,19 @@ class PortfolioAccountant:
         """Align starting_capital with loaded positions so NAV = invested + cash.
 
         When positions are hydrated from Alpaca, their total cost basis can exceed
-        the config starting_capital ($100). This causes invested >> NAV and negative
-        cash. Set _starting_capital = total cost basis of current positions so the
-        books balance: NAV = starting + realized + unrealized = total market value.
+        the config starting_capital ($100). Set _starting_capital = total cost basis
+        of current positions so the books balance. Pods with no positions get
+        starting_capital=0 to avoid phantom capital (firm total would otherwise
+        exceed actual Alpaca account value).
         """
         total_cost = sum(
             abs(p["quantity"]) * self._cost_basis.get(sym, p["avg_cost"])
             for sym, p in self._positions.items()
             if p.get("quantity", 0) != 0
         )
-        if total_cost > 0:
-            prev = self._starting_capital
-            self._starting_capital = total_cost
-            logger.info(
-                "[%s] Reconciled starting_capital: $%.2f -> $%.2f (from %d positions)",
-                self._pod_id, prev, total_cost, len(self._positions),
-            )
+        prev = self._starting_capital
+        self._starting_capital = total_cost
+        logger.info(
+            "[%s] Reconciled starting_capital: $%.2f -> $%.2f (%d positions)",
+            self._pod_id, prev, total_cost, len([p for p in self._positions.values() if p.get("quantity", 0) != 0]),
+        )
