@@ -1018,6 +1018,10 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 4px;
   overflow: hidden;
 }
+.tbl-wrap-scroll {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
 .dtbl { width: 100%; border-collapse: collapse; }
 .dtbl thead th {
   padding: 6px 10px;

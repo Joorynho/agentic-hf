@@ -1573,7 +1573,7 @@ class SessionManager:
             # Reconcile starting_capital so NAV = invested + cash (fixes invested >> NAV mismatch)
             for pod_id, rt in self._pod_runtimes.items():
                 acct = rt._ns.get("accountant")
-                if acct and acct._positions:
+                if acct:
                     acct.reconcile_capital_from_positions()
         except Exception as e:
             logger.warning("[session_manager] Alpaca hydration failed (non-fatal): %s", e)

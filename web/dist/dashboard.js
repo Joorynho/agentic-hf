@@ -1274,7 +1274,7 @@ function updateTopHoldings() {
     return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for details">' +
       '<td class="pod-name">' + podEsc.toUpperCase() + '</td>' +
       '<td style="font-weight:600">' + symEsc + '</td>' +
-      '<td class="r">' + (p.qty || 0) + '</td>' +
+      '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
       '<td class="r">$' + entry.toFixed(2) + '</td>' +
       '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
       '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
