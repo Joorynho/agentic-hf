@@ -176,6 +176,24 @@ class PodRuntime:
         self._log_pm_reasoning(last_pm)
 
         order: Order | None = ctx.get("order")
+
+        # Universe boundary enforcement: reject trades for symbols that belong
+        # exclusively to another pod's seed universe (prevents cross-pod contamination).
+        if order is not None:
+            from src.core.config.universes import POD_UNIVERSES
+            for other_pod, other_symbols in POD_UNIVERSES.items():
+                if other_pod != self._pod_id and order.symbol in other_symbols:
+                    # Only block if the symbol is NOT in this pod's own universe
+                    my_symbols = POD_UNIVERSES.get(self._pod_id, [])
+                    if order.symbol not in my_symbols:
+                        logger.warning(
+                            "[%s] Rejected trade for %s — symbol belongs to %s universe, not %s",
+                            self._pod_id, order.symbol, other_pod, self._pod_id,
+                        )
+                        order = None
+                        ctx["order"] = None
+                    break
+
         if order is None:
             # No trade proposed — still run Ops
             await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
