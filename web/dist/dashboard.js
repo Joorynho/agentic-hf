@@ -120,6 +120,28 @@ function tickerDisplay(symbol) {
   return name ? symbol + ' <span class="ticker-name">(' + escapeHtml(name) + ')</span>' : escapeHtml(symbol);
 }
 
+/**
+ * Strip raw TradeProposal JSON blob from thesis/reasoning strings.
+ * If the text is a JSON blob like {"trades":[{"symbol":"X","reasoning":"..."}]},
+ * extract the human-readable reasoning for the given symbol (or the first trade).
+ */
+function cleanThesis(text, symbol) {
+  if (!text) return '';
+  text = String(text).trim();
+  if (text.charAt(0) !== '{') return text; // fast path — not JSON
+  try {
+    var proposal = JSON.parse(text);
+    var trades = proposal.trades || [];
+    // prefer matching symbol, fall back to first trade
+    var match = null;
+    for (var i = 0; i < trades.length; i++) {
+      if (!symbol || trades[i].symbol === symbol) { match = trades[i]; break; }
+    }
+    if (!match && trades.length) match = trades[0];
+    return match ? (match.reasoning || match.thesis || text) : text;
+  } catch(e) { return text; }
+}
+
 // ─── 1. Clock ─────────────────────────────────────────────────────────────
 function tick() {
   document.getElementById('clock').textContent =
@@ -1586,7 +1608,7 @@ function renderPositionModal(d, overlay) {
       qty: d.qty,
       fill_price: d.cost_basis,
       side: 'BUY',
-      reasoning: d.entry_thesis ? 'Entry: ' + d.entry_thesis.slice(0, 120) : 'Position opened (fill data predates this session)',
+      reasoning: d.entry_thesis ? 'Entry: ' + cleanThesis(d.entry_thesis, d.symbol).slice(0, 150) : 'Position opened (fill data predates this session)',
       _synthetic: true
     }];
   }
@@ -1605,7 +1627,7 @@ function renderPositionModal(d, overlay) {
           '<span class="fill-px">$' + (f.fill_price || 0).toFixed(2) + '</span>' +
           '<span class="fill-date">' + ts + '</span>' +
         '</div>' +
-        (f.reasoning ? '<div class="fill-reason">' + escapeHtml(f.reasoning) + '</div>' : '') +
+        (f.reasoning ? '<div class="fill-reason">' + escapeHtml(cleanThesis(f.reasoning, d.symbol)) + '</div>' : '') +
       '</div>';
     }).join('');
   } else {
@@ -1633,6 +1655,9 @@ function renderPositionModal(d, overlay) {
 
   var convPct = ((d.conviction || 0) * 100).toFixed(0);
 
+  var avgEntry = d.cost_basis || 0;
+  var thesis = cleanThesis(d.entry_thesis || '', d.symbol);
+
   overlay.innerHTML = '<div class="pos-modal">' +
     '<button class="pos-modal-close" onclick="closePositionModal()">&times;</button>' +
     // Header
@@ -1641,9 +1666,9 @@ function renderPositionModal(d, overlay) {
         '<span class="pos-symbol">' + tickerDisplay(d.symbol) + '</span>' +
         '<span class="badge b-' + escapeHtml(d.pod_id) + '">' + escapeHtml(d.pod_id).toUpperCase() + '</span>' +
       '</div>' +
-      '<div class="pos-hdr-right ' + pnlCls + '">' +
-        (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) +
-        ' <span class="pos-hdr-pct">(' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)</span>' +
+      '<div class="pos-hdr-right">' +
+        '<div class="pos-hdr-avg">AVG $' + avgEntry.toFixed(2) + '</div>' +
+        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + ' <span class="pos-hdr-pct">(' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)</span></div>' +
       '</div>' +
     '</div>' +
     // Summary grid
@@ -1680,7 +1705,7 @@ function renderPositionModal(d, overlay) {
     // Partial exits
     exitsHtml +
     // Entry thesis
-    (d.entry_thesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(d.entry_thesis) + '</div></div>' : '') +
+    (thesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(thesis) + '</div></div>' : '') +
     // PM Reasoning History
     (function() {
       var rh = d.reasoning_history;
