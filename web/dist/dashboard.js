@@ -1578,12 +1578,23 @@ function renderPositionModal(d, overlay) {
   var barRange = barMax - barMin;
   var markerPos = barRange > 0 ? Math.max(0, Math.min(100, (currentPnlPct - barMin) / barRange * 100)) : 50;
 
-  // Fill timeline
+  // Fill timeline — synthesise an entry fill from metadata when no live fills recorded
+  var fills = (d.fills && d.fills.length > 0) ? d.fills : [];
+  if (fills.length === 0 && d.cost_basis > 0 && d.qty > 0) {
+    fills = [{
+      timestamp: d.entry_date || '',
+      qty: d.qty,
+      fill_price: d.cost_basis,
+      side: 'BUY',
+      reasoning: d.entry_thesis ? 'Entry: ' + d.entry_thesis.slice(0, 120) : 'Position opened (fill data predates this session)',
+      _synthetic: true
+    }];
+  }
   var fillsHtml = '';
-  if (d.fills && d.fills.length > 0) {
-    fillsHtml = d.fills.map(function(f) {
+  if (fills.length > 0) {
+    fillsHtml = fills.map(function(f) {
       var isBuy = f.side === 'BUY';
-      var cls = isBuy ? 'fill-buy' : 'fill-sell';
+      var cls = (isBuy ? 'fill-buy' : 'fill-sell') + (f._synthetic ? ' fill-synthetic' : '');
       var icon = isBuy ? '+' : '-';
       var ts = f.timestamp ? new Date(f.timestamp).toLocaleDateString() : '—';
       return '<div class="fill-entry ' + cls + '">' +
@@ -1600,6 +1611,9 @@ function renderPositionModal(d, overlay) {
   } else {
     fillsHtml = '<div class="pos-empty">No fill history available</div>';
   }
+
+  // Update fills count in section title to use resolved fills array
+  var fillsCount = fills.length;
 
   // Partial exits
   var exitsHtml = '';
@@ -1624,7 +1638,7 @@ function renderPositionModal(d, overlay) {
     // Header
     '<div class="pos-hdr">' +
       '<div class="pos-hdr-left">' +
-        '<span class="pos-symbol">' + escapeHtml(d.symbol) + '</span>' +
+        '<span class="pos-symbol">' + tickerDisplay(d.symbol) + '</span>' +
         '<span class="badge b-' + escapeHtml(d.pod_id) + '">' + escapeHtml(d.pod_id).toUpperCase() + '</span>' +
       '</div>' +
       '<div class="pos-hdr-right ' + pnlCls + '">' +
@@ -1660,7 +1674,7 @@ function renderPositionModal(d, overlay) {
     '</div>' +
     // Fill timeline
     '<div class="pos-section">' +
-      '<div class="pos-section-title">Fill Timeline (' + (d.fills ? d.fills.length : 0) + ' fills)</div>' +
+      '<div class="pos-section-title">Fill Timeline (' + fillsCount + (fills.length > 0 && fills[0]._synthetic ? ' — entry reconstructed' : ' fills') + ')</div>' +
       '<div class="pos-fills">' + fillsHtml + '</div>' +
     '</div>' +
     // Partial exits

@@ -1795,6 +1795,7 @@ button { font-family: inherit; cursor: pointer; }
 .fill-px  { color:var(--text-muted,#6a82a0); }
 .fill-date { float:right; color:var(--text-muted,#6a82a0); font-size:10px; }
 .fill-reason { width:100%; font-size:10px; color:var(--text-muted,#6a82a0); margin-top:2px; line-height:1.4; }
+.fill-entry.fill-synthetic { opacity:0.75; border-left-style:dashed; }
 
 /* Partial exits */
 .exit-entry {
