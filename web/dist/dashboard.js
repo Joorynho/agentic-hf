@@ -1,5 +1,125 @@
 'use strict';
 
+// ─── 0. Ticker Name Lookup ────────────────────────────────────────────────
+var TICKER_NAMES = {
+  // Broad Market ETFs
+  SPY:'S&P 500 ETF', QQQ:'Nasdaq 100 ETF', IWM:'Russell 2000 ETF', DIA:'Dow Jones ETF',
+  VTI:'Total Stock Market ETF', VOO:'Vanguard S&P 500 ETF', RSP:'Equal Weight S&P 500',
+  MDY:'S&P MidCap 400 ETF',
+  // Sector ETFs
+  XLF:'Financials Select ETF', XLE:'Energy Select ETF', XLK:'Technology Select ETF',
+  XLV:'Health Care Select ETF', XLI:'Industrials Select ETF', XLP:'Consumer Staples ETF',
+  XLU:'Utilities Select ETF', XLY:'Consumer Discretionary ETF', XLC:'Communication Services ETF',
+  XLB:'Materials Select ETF', XLRE:'Real Estate Select ETF',
+  // Thematic / Factor ETFs
+  ARKK:'ARK Innovation ETF', SOXX:'iShares Semiconductor ETF', SMH:'VanEck Semiconductor ETF',
+  TAN:'Invesco Solar ETF', LIT:'Global X Lithium & Battery Tech ETF', HACK:'ETFMG Cybersecurity ETF',
+  IBB:'iShares Biotech ETF', XBI:'SPDR Biotech ETF', KWEB:'KraneShares China Internet ETF',
+  CQQQ:'Invesco China Technology ETF', ICLN:'iShares Global Clean Energy ETF',
+  QCLN:'First Trust Clean Energy ETF', BOTZ:'Global X Robotics & AI ETF',
+  ROBO:'ROBO Global Robotics & AI ETF',
+  // International ETFs
+  EFA:'iShares MSCI EAFE ETF', EEM:'iShares MSCI Emerging Markets ETF',
+  VGK:'Vanguard European ETF', EWJ:'iShares MSCI Japan ETF', FXI:'iShares China Large-Cap ETF',
+  EWZ:'iShares MSCI Brazil ETF', INDA:'iShares MSCI India ETF', EWT:'iShares MSCI Taiwan ETF',
+  EWY:'iShares MSCI South Korea ETF', VWO:'Vanguard Emerging Markets ETF',
+  IEMG:'iShares Core MSCI Emerging Markets ETF', MCHI:'iShares MSCI China ETF',
+  EWG:'iShares MSCI Germany ETF', EWU:'iShares MSCI United Kingdom ETF',
+  EWQ:'iShares MSCI France ETF', EWP:'iShares MSCI Spain ETF', EWI:'iShares MSCI Italy ETF',
+  EWN:'iShares MSCI Netherlands ETF', EWL:'iShares MSCI Switzerland ETF',
+  EWA:'iShares MSCI Australia ETF', EWC:'iShares MSCI Canada ETF',
+  EWS:'iShares MSCI Singapore ETF', EWM:'iShares MSCI Malaysia ETF',
+  EWW:'iShares MSCI Mexico ETF', EWH:'iShares MSCI Hong Kong ETF',
+  THD:'iShares MSCI Thailand ETF', VNM:'VanEck Vietnam ETF',
+  EIDO:'iShares MSCI Indonesia ETF', EPHE:'iShares MSCI Philippines ETF', FM:'iShares Frontier & Select EM ETF',
+  // Bond / Fixed Income ETFs
+  TLT:'iShares 20+ Year Treasury Bond ETF', IEF:'iShares 7-10 Year Treasury ETF',
+  SHY:'iShares 1-3 Year Treasury ETF', HYG:'iShares High Yield Corporate Bond ETF',
+  LQD:'iShares Investment Grade Corporate Bond ETF', AGG:'iShares Core US Aggregate Bond ETF',
+  BND:'Vanguard Total Bond Market ETF', TIP:'iShares TIPS Bond ETF',
+  EMB:'iShares JP Morgan USD Emerging Markets Bond ETF', JNK:'SPDR Bloomberg High Yield Bond ETF',
+  BWX:'SPDR Bloomberg International Treasury Bond ETF', IGOV:'iShares Intl Treasury Bond ETF',
+  LEMB:'iShares EM Local Currency Bond ETF', EMLC:'VanEck EM Local Currency Bond ETF',
+  // Currency ETFs
+  FXE:'Invesco CurrencyShares Euro ETF', FXY:'Invesco CurrencyShares Japanese Yen ETF',
+  FXB:'Invesco CurrencyShares British Pound ETF', FXA:'Invesco CurrencyShares Australian Dollar ETF',
+  FXC:'Invesco CurrencyShares Canadian Dollar ETF', FXF:'Invesco CurrencyShares Swiss Franc ETF',
+  UUP:'Invesco DB US Dollar Bullish ETF', UDN:'Invesco DB US Dollar Bearish ETF',
+  CEW:'WisdomTree Emerging Currency Strategy ETF', USDU:'WisdomTree Bloomberg US Dollar Bullish ETF',
+  // Commodities ETFs
+  GLD:'SPDR Gold Shares ETF', IAU:'iShares Gold Trust', GDX:'VanEck Gold Miners ETF',
+  GDXJ:'VanEck Junior Gold Miners ETF', SGOL:'Aberdeen Physical Gold ETF',
+  SLV:'iShares Silver Trust', PSLV:'Sprott Physical Silver Trust', SIL:'Global X Silver Miners ETF',
+  USO:'United States Oil Fund', XOP:'SPDR S&P Oil & Gas E&P ETF', OIH:'VanEck Oil Services ETF',
+  UNG:'United States Natural Gas Fund', AMLP:'Alerian MLP ETF',
+  DBA:'Invesco Agriculture ETF', CORN:'Teucrium Corn ETF', WEAT:'Teucrium Wheat ETF',
+  SOYB:'Teucrium Soybean ETF', MOO:'VanEck Agribusiness ETF', COW:'iPath Bloomberg Livestock ETN',
+  GSG:'iShares S&P GSCI Commodity ETF', PDBC:'Invesco Optimum Yield Diversified Commodity ETF',
+  COM:'Direxion Auspice Broad Commodity ETF', DJP:'iPath Bloomberg Commodity Index ETN',
+  COMT:'iShares MSCI Global Commodity Producers ETF',
+  CPER:'United States Copper Index ETF', COPX:'Global X Copper Miners ETF',
+  DBB:'Invesco DB Base Metals ETF', PICK:'iShares MSCI Global Metals & Mining ETF',
+  URA:'Global X Uranium ETF', URNM:'Sprott Uranium Miners ETF',
+  BATT:'Amplify Lithium & Battery Technology ETF',
+  XME:'SPDR S&P Metals & Mining ETF', REMX:'VanEck Rare Earth/Strategic Metals ETF',
+  // Individual Commodities / Miners
+  FCX:'Freeport-McMoRan Inc', NEM:'Newmont Corporation', GOLD:'Barrick Gold Corporation',
+  BHP:'BHP Group', RIO:'Rio Tinto', AA:'Alcoa Corporation', CLF:'Cleveland-Cliffs Inc',
+  VALE:'Vale S.A.', MOS:'The Mosaic Company', NTR:'Nutrien Ltd',
+  // Mega-cap Tech & Growth
+  AAPL:'Apple Inc', MSFT:'Microsoft Corporation', NVDA:'NVIDIA Corporation',
+  AMZN:'Amazon.com Inc', GOOGL:'Alphabet Inc', META:'Meta Platforms Inc',
+  TSLA:'Tesla Inc', 'BRK.B':'Berkshire Hathaway B',
+  // Financials
+  JPM:'JPMorgan Chase & Co', V:'Visa Inc', MA:'Mastercard Inc',
+  GS:'Goldman Sachs Group', MS:'Morgan Stanley', C:'Citigroup Inc',
+  BAC:'Bank of America', WFC:'Wells Fargo & Co', SCHW:'Charles Schwab Corp',
+  // Healthcare & Pharma
+  JNJ:'Johnson & Johnson', UNH:'UnitedHealth Group', LLY:'Eli Lilly and Company',
+  ABBV:'AbbVie Inc', MRK:'Merck & Co', TMO:'Thermo Fisher Scientific',
+  // Consumer
+  WMT:'Walmart Inc', PG:'Procter & Gamble', PEP:'PepsiCo Inc', KO:'The Coca-Cola Company',
+  COST:'Costco Wholesale', MCD:"McDonald's Corporation", NKE:'Nike Inc',
+  // Industrial & Energy
+  XOM:'Exxon Mobil Corporation', CVX:'Chevron Corporation', HD:'Home Depot Inc',
+  BA:'Boeing Company', CAT:'Caterpillar Inc', DE:'Deere & Company',
+  GE:'GE Aerospace', UPS:'United Parcel Service', RTX:'RTX Corporation', LMT:'Lockheed Martin',
+  // Tech
+  AVGO:'Broadcom Inc', ADBE:'Adobe Inc', CRM:'Salesforce Inc', ACN:'Accenture PLC',
+  CSCO:'Cisco Systems', AMD:'Advanced Micro Devices', INTC:'Intel Corporation',
+  QCOM:'Qualcomm Inc', TXN:'Texas Instruments', NFLX:'Netflix Inc',
+  ORCL:'Oracle Corporation', PLTR:'Palantir Technologies', SNOW:'Snowflake Inc',
+  // Growth / New Tech
+  UBER:'Uber Technologies', ABNB:'Airbnb Inc', SQ:'Block Inc',
+  SHOP:'Shopify Inc', COIN:'Coinbase Global', MSTR:'Strategy Inc',
+  RIVN:'Rivian Automotive', LCID:'Lucid Group',
+  // Financials & Insurance
+  MET:'MetLife Inc', AIG:'American International Group', PRU:'Prudential Financial',
+  // Transport
+  DAL:'Delta Air Lines', UAL:'United Airlines Holdings', AAL:'American Airlines Group',
+  // Energy / Utilities
+  DVN:'Devon Energy', OXY:'Occidental Petroleum', MPC:'Marathon Petroleum',
+  VST:'Vistra Corp', NEE:'NextEra Energy', DUK:'Duke Energy',
+  // Crypto (Alpaca format)
+  'BTC/USD':'Bitcoin', 'ETH/USD':'Ethereum', 'SOL/USD':'Solana', 'ADA/USD':'Cardano',
+  'XRP/USD':'XRP', 'DOT/USD':'Polkadot', 'LTC/USD':'Litecoin', 'AVAX/USD':'Avalanche',
+  'AAVE/USD':'Aave', 'UNI/USD':'Uniswap', 'SUSHI/USD':'SushiSwap', 'CRV/USD':'Curve DAO',
+  'LDO/USD':'Lido DAO', 'LINK/USD':'Chainlink', 'GRT/USD':'The Graph',
+  'DOGE/USD':'Dogecoin', 'SHIB/USD':'Shiba Inu', 'PEPE/USD':'Pepe',
+  'BONK/USD':'Bonk', 'WIF/USD':'dogwifhat', 'TRUMP/USD':'Official Trump',
+  'FIL/USD':'Filecoin', 'RENDER/USD':'Render', 'ARB/USD':'Arbitrum',
+  'ONDO/USD':'Ondo Finance', 'POL/USD':'Polygon', 'BAT/USD':'Basic Attention Token',
+  'BCH/USD':'Bitcoin Cash', 'HYPE/USD':'Hyperliquid', 'PAXG/USD':'PAX Gold',
+  'SKY/USD':'Sky', 'XTZ/USD':'Tezos', 'YFI/USD':'Yearn Finance',
+};
+
+/** Return "TICKER (Full Name)" or just "TICKER" if unknown */
+function tickerDisplay(symbol) {
+  if (!symbol) return '';
+  var name = TICKER_NAMES[symbol];
+  return name ? symbol + ' <span class="ticker-name">(' + escapeHtml(name) + ')</span>' : escapeHtml(symbol);
+}
+
 // ─── 1. Clock ─────────────────────────────────────────────────────────────
 function tick() {
   document.getElementById('clock').textContent =
@@ -1203,7 +1323,7 @@ function updateExecTable() {
     var ss = t.status === 'FILLED' ? 'b-filled' : t.status === 'PENDING' ? 'b-pending' : t.status === 'PARTIAL' ? 'b-partial' : t.status === 'REJECTED' ? 'b-rejected' : 'b-pending';
     return '<tr>' +
       '<td>' + (t.podId || 'unknown').toUpperCase() + '</td>' +
-      '<td style="font-weight:600">' + (t.symbol || '') + '</td>' +
+      '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
       '<td><span class="badge ' + sc + '">' + (t.side || '') + '</span></td>' +
       '<td class="r">' + (t.qty || 0) + '</td>' +
       '<td class="r">$' + (t.price || 0).toFixed(2) + '</td>' +
@@ -1294,7 +1414,7 @@ function updateTopHoldings() {
     var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
     return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for details">' +
       '<td class="pod-name">' + podEsc.toUpperCase() + '</td>' +
-      '<td style="font-weight:600" title="' + symTitle + '">' + symEsc + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
+      '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
       '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
       '<td class="r">$' + entry.toFixed(2) + '</td>' +
       '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
@@ -1811,7 +1931,7 @@ function renderClosedTrades() {
     if (t.entry_reasoning && t.entry_reasoning.length > 60) thesis += '...';
     return '<tr>' +
       '<td class="pod-name">' + escapeHtml(t.pod_id || '').toUpperCase() + '</td>' +
-      '<td style="font-weight:600">' + escapeHtml(t.symbol || '') + '</td>' +
+      '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
       '<td class="r">$' + (t.entry_price || 0).toFixed(2) + '</td>' +
       '<td class="r">$' + (t.exit_price || 0).toFixed(2) + '</td>' +
       '<td class="r">' + (t.qty || 0) + '</td>' +
@@ -1877,7 +1997,7 @@ function openDrilldown(podId) {
       var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
       var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
       return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for full detail" style="cursor:pointer">' +
-        '<td style="font-weight:600" title="' + symTitle + '">' + symEsc + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
+        '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
         '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
         '<td class="r">$' + entry.toFixed(2) + '</td>' +
         '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
@@ -1897,7 +2017,7 @@ function openDrilldown(podId) {
       var sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
       var ss = t.status === 'FILLED' ? 'b-filled' : 'b-pending';
       return '<tr>' +
-        '<td style="font-weight:600">' + escapeHtml(t.symbol) + '</td>' +
+        '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
         '<td><span class="badge ' + sc + '">' + t.side + '</span></td>' +
         '<td class="r">' + t.qty + '</td>' +
         '<td class="r">$' + (t.price || 0).toFixed(2) + '</td>' +
@@ -2155,7 +2275,7 @@ function renderReviews() {
             var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
             var entry = p.cost_basis || p.avg_entry || 0;
             var thesis = p.entry_thesis ? p.entry_thesis.slice(0, 80) + (p.entry_thesis.length > 80 ? '…' : '') : '—';
-            return '<tr><td><strong>' + escapeHtml(p.symbol || '') + '</strong></td>' +
+            return '<tr><td><strong>' + tickerDisplay(p.symbol || '') + '</strong></td>' +
               '<td class="r">' + (p.qty || 0).toFixed(3) + '</td>' +
               '<td class="r">$' + entry.toFixed(2) + '</td>' +
               '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +

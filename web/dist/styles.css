@@ -1539,6 +1539,14 @@ button { font-family: inherit; cursor: pointer; }
 .attr-pct { font-size: 10px; color: var(--text-dim); text-align: right; }
 .attr-stat { font-size: 9px; color: var(--text-dim); }
 
+/* Ticker full name suffix */
+.ticker-name {
+  color: var(--text-dim);
+  font-weight: 400;
+  font-size: 0.88em;
+  letter-spacing: 0;
+}
+
 /* ============================================================
    REPORTS TAB — POSITION REVIEWS & SAVED REPORTS
 ============================================================ */
