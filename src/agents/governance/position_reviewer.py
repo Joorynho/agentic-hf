@@ -197,6 +197,9 @@ class PositionReviewer:
 
     async def _cio_review(self, pod_id: str, positions_text: str, nav: float) -> str:
         """CIO evaluates positions and produces a challenge for the PM."""
+        n_positions = positions_text.count("\n  ") or positions_text.count("qty=") or 1
+        # Allow ~150 tokens per position for a thorough prose review, capped at 4000
+        tokens = max(1500, min(4000, n_positions * 150))
         prompt = (
             f"Pod: {pod_id.upper()}\nPod NAV: ${nav:,.2f}\n\n"
             f"Current positions:\n{positions_text}\n\n"
@@ -210,7 +213,7 @@ class PositionReviewer:
             return llm_chat(
                 [{"role": "system", "content": _CIO_REVIEW_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
-                max_tokens=1200,
+                max_tokens=tokens,
             )
         except Exception as e:
             logger.warning("[position_review] CIO review LLM failed: %s", e)
@@ -245,11 +248,13 @@ class PositionReviewer:
             f"You MUST respond ONLY with valid JSON, no prose. Example:\n"
             f'{{"positions": [{{"symbol": "AAPL", "action": "HOLD", "qty": null, "reasoning": "..."}}]}}'
         )
+        n_positions = positions_text.count("qty=") or 1
+        pm_tokens = max(1500, min(3500, n_positions * 120))
         try:
             raw = llm_chat(
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
-                max_tokens=1200,
+                max_tokens=pm_tokens,
             )
         except Exception as e:
             logger.warning("[position_review] PM defend LLM call failed: %s", e)
@@ -279,11 +284,13 @@ class PositionReviewer:
             f"You MUST respond ONLY with valid JSON, no prose. Example:\n"
             f'{{"decisions": [{{"symbol": "AAPL", "action": "HOLD", "qty": null, "reasoning": "...", "pm_overridden": false}}]}}'
         )
+        n_positions = positions_text.count("qty=") or 1
+        cio_dec_tokens = max(1500, min(3500, n_positions * 120))
         try:
             raw = llm_chat(
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
-                max_tokens=1200,
+                max_tokens=cio_dec_tokens,
             )
         except Exception as e:
             logger.warning("[position_review] CIO decision LLM call failed: %s", e)
@@ -332,7 +339,7 @@ class PositionReviewer:
             raw = llm_chat(
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
-                max_tokens=800,
+                max_tokens=1500,
             )
         except Exception as e:
             logger.warning("[position_review] PM counter-argument LLM call failed: %s", e)
@@ -371,7 +378,7 @@ class PositionReviewer:
             raw = llm_chat(
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
-                max_tokens=800,
+                max_tokens=1500,
             )
         except Exception as e:
             logger.warning("[position_review] CIO final ruling LLM call failed: %s", e)
