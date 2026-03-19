@@ -1668,7 +1668,6 @@ function renderPositionModal(d, overlay) {
         '<span class="badge b-' + escapeHtml(d.pod_id) + '">' + escapeHtml(d.pod_id).toUpperCase() + '</span>' +
       '</div>' +
       '<div class="pos-hdr-right">' +
-        '<div class="pos-hdr-avg">AVG $' + avgEntry.toFixed(2) + '</div>' +
         '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + ' <span class="pos-hdr-pct">(' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)</span></div>' +
       '</div>' +
     '</div>' +
@@ -1676,7 +1675,7 @@ function renderPositionModal(d, overlay) {
     '<div class="pos-grid">' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Entry Date</div><div class="pos-cell-val">' + (d.entry_date || '—') + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Days Held</div><div class="pos-cell-val">' + (d.days_held > 0 ? d.days_held : (d.entry_date ? '< 1' : '—')) + '</div></div>' +
-      '<div class="pos-cell"><div class="pos-cell-lbl">Entry Price</div><div class="pos-cell-val">$' + (d.cost_basis || 0).toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Avg Entry</div><div class="pos-cell-val">$' + (d.cost_basis || 0).toFixed(2) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Current Price</div><div class="pos-cell-val">$' + (d.current_price || 0).toFixed(2) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Quantity</div><div class="pos-cell-val">' + (d.qty || 0) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + totalRetCls + '">' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%</div></div>' +
