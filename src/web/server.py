@@ -143,6 +143,7 @@ class EventBusListener:
                 rm = payload.get("risk_metrics", {})
                 payload["nav"] = payload.get("nav") or rm.get("nav", 0)
                 payload["daily_pnl"] = payload.get("daily_pnl") or rm.get("daily_pnl", 0)
+                payload["realized_pnl"] = rm.get("realized_pnl", 0)
                 payload["starting_capital"] = rm.get("starting_capital", 0)
                 payload["invested"] = rm.get("invested", 0)
                 payload["cash"] = rm.get("cash", 0)
@@ -656,6 +657,29 @@ def create_app(
         app.state.pod_summaries = pod_summaries
         app.state.risk_halt = risk_halt
         app.state.risk_halt_reason = risk_halt_reason
+
+        # Sync into listener's last_pod_summaries so WebSocket snapshot includes research data
+        # (Research tab reads fred_snapshot, polymarket_signals, x_feed from pod_summaries)
+        if hasattr(app.state, "listener") and app.state.listener is not None:
+            listener = app.state.listener
+            if hasattr(listener, "_app_state"):
+                ts = datetime.now(timezone.utc).isoformat()
+                for pod_id, raw in pod_summaries.items():
+                    rm = raw.get("risk_metrics") or {}
+                    data = dict(raw)
+                    data["nav"] = data.get("nav") or rm.get("nav", 0)
+                    data["daily_pnl"] = data.get("daily_pnl") or rm.get("daily_pnl", 0)
+                    data["realized_pnl"] = rm.get("realized_pnl", 0)
+                    data["starting_capital"] = rm.get("starting_capital", 0)
+                    data["invested"] = rm.get("invested", 0)
+                    data["cash"] = rm.get("cash", 0)
+                    data["current_positions"] = data.get("current_positions") or data.get("positions", [])
+                    listener._app_state["last_pod_summaries"][pod_id] = {
+                        "type": "pod_summary",
+                        "pod_id": pod_id,
+                        "data": data,
+                        "timestamp": ts,
+                    }
 
     app.state.update_session_state = update_session_state
 

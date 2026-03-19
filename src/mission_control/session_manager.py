@@ -481,6 +481,24 @@ class SessionManager:
                     if lsnr:
                         lsnr.inject_restored_memory(self._restored_memory)
 
+            # Emit initial pod summaries via gateways so dashboard receives live broadcasts
+            # and the snapshot store is populated before any client connects
+            if self._web_app:
+                try:
+                    initial_summaries = {}
+                    for pod_id, rt in self._pod_runtimes.items():
+                        summary = await rt.get_summary()
+                        initial_summaries[pod_id] = summary
+                    await self._update_web_state(initial_summaries)
+                    # Also broadcast via gateways so already-connected clients get the update
+                    for pod_id, summary in initial_summaries.items():
+                        gateway = self._pod_gateways.get(pod_id)
+                        if gateway:
+                            await gateway.emit_summary(summary)
+                    logger.info("[session_manager] Broadcast initial pod summaries (%d pods)", len(initial_summaries))
+                except Exception as e:
+                    logger.warning("[session_manager] Failed to send initial web state: %s", e)
+
         except Exception as exc:
             logger.error("[session_manager] Failed to start session: %s", exc)
             raise
@@ -1512,6 +1530,12 @@ class SessionManager:
             positions = await self._alpaca.get_open_positions()
             if not positions:
                 logger.info("[session_manager] Alpaca: no open positions to hydrate")
+                # Still run reconcile so pods keep allocated capital (crypto=100, etc.)
+                cap = self._capital_per_pod or 100.0
+                for pod_id, rt in self._pod_runtimes.items():
+                    acct = rt._ns.get("accountant")
+                    if acct:
+                        acct.reconcile_capital_from_positions(allocated_capital=cap)
                 return
 
             account = await self._alpaca.fetch_account()
@@ -1571,10 +1595,11 @@ class SessionManager:
                                     abs(pos_data["qty"]), pos_data["entry_price"], target_pod)
 
             # Reconcile starting_capital so NAV = invested + cash (fixes invested >> NAV mismatch)
+            cap = self._capital_per_pod or 100.0
             for pod_id, rt in self._pod_runtimes.items():
                 acct = rt._ns.get("accountant")
                 if acct:
-                    acct.reconcile_capital_from_positions()
+                    acct.reconcile_capital_from_positions(allocated_capital=cap)
         except Exception as e:
             logger.warning("[session_manager] Alpaca hydration failed (non-fatal): %s", e)
 
@@ -1619,6 +1644,16 @@ class SessionManager:
                 earliest = pod_buys[0]
                 ts = earliest["timestamp"]
                 reasoning = earliest.get("reasoning", "")
+                # Unwrap JSON-blob reasoning (older sessions stored the raw TradeProposal)
+                if reasoning and (reasoning.startswith('{"trades":') or reasoning.startswith("{'trades':")):
+                    try:
+                        proposal = json.loads(reasoning)
+                        for trade in proposal.get("trades", []):
+                            if trade.get("symbol") == sym:
+                                reasoning = trade.get("reasoning", reasoning)
+                                break
+                    except Exception:
+                        pass
 
                 acct._entry_dates[sym] = ts[:10]
                 acct._entry_theses[sym] = reasoning[:300] if reasoning else ""

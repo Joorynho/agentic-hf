@@ -652,6 +652,14 @@ function handleMessage(msg) {
         }
       }
     }
+    // Seed sparklines from snapshot so trend column isn't empty on connect
+    for (var spid in pods) {
+      var spNav = getPodNav(pods[spid]);
+      if (spNav > 0) {
+        if (!podNavSpark[spid]) podNavSpark[spid] = [];
+        if (podNavSpark[spid].length === 0) podNavSpark[spid].push(spNav, spNav);
+      }
+    }
     (snap.recent_trades || []).forEach(function(t) {
       if (t.data && t.data.symbol && t.data.side && t.data.qty) {
         var oid = t.data.order_id || t.data.id || null;
@@ -858,12 +866,16 @@ function updatePodsTable() {
   }
   tbody.innerHTML = ids.map(id => {
     const d   = pods[id];
-    const nav = d.nav || 0;
-    const invested = d.invested || 0;
-    const cash = d.cash || 0;
-    const pnl = d.daily_pnl || 0;
+    const rm  = d.risk_metrics || {};
+    let nav = d.nav ?? rm.nav ?? 0;
+    const invested = d.invested ?? rm.invested ?? 0;
+    const startCap = d.starting_capital ?? rm.starting_capital;
+    // Fallback: nav=0 but pod has allocated capital (idle pod) — show starting_capital
+    if (nav === 0 && startCap > 0 && invested === 0) nav = startCap;
+    const cash = d.cash ?? rm.cash ?? 0;
+    const pnl = d.daily_pnl ?? rm.daily_pnl ?? 0;
     const st  = (d.status || 'UNKNOWN').toUpperCase();
-    const sc  = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
+    const stCls = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
     const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
     const spark = makeSparkline(podNavSpark[id]);
     const navTitle = `Invested: $${invested.toFixed(2)} | Cash: $${cash.toFixed(2)}`;
@@ -872,29 +884,36 @@ function updatePodsTable() {
       <td class="r"><span title="${navTitle}">$${nav.toFixed(2)}</span></td>
       <td class="r">${spark}</td>
       <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
-      <td class="r"><span class="badge ${sc}">${st}</span></td>
+      <td class="r"><span class="badge ${stCls}">${st}</span></td>
     </tr>`;
   }).join('');
 }
 
+function getPodNav(d) { return d.nav ?? (d.risk_metrics && d.risk_metrics.nav) ?? 0; }
+function getPodPnl(d) { return d.daily_pnl ?? (d.risk_metrics && d.risk_metrics.daily_pnl) ?? 0; }
+function getPodPositions(d) { return d.current_positions || d.positions || []; }
+function getPodInvested(d) { return d.invested ?? (d.risk_metrics && d.risk_metrics.invested) ?? 0; }
+function getPodCash(d) { return d.cash ?? (d.risk_metrics && d.risk_metrics.cash) ?? 0; }
+function getPodStartCap(d) { return d.starting_capital ?? (d.risk_metrics && d.risk_metrics.starting_capital) ?? 0; }
+
 function updateFirmMetrics() {
   const ids = Object.keys(pods);
-  const nav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
-  const pnl = ids.reduce((s,id) => s + (pods[id].daily_pnl || 0), 0);
+  const nav = ids.reduce((s,id) => s + getPodNav(pods[id]), 0);
+  const pnl = ids.reduce((s,id) => s + getPodPnl(pods[id]), 0);
   const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
   const pos = ids.reduce((s,id) => {
-    const p = pods[id].current_positions;
-    return s + (Array.isArray(p) ? p.length : p ? Object.keys(p).length : 0);
+    const p = getPodPositions(pods[id]);
+    return s + (Array.isArray(p) ? p.length : (p && typeof p === 'object' ? Object.keys(p).length : 0));
   }, 0);
 
   if (initialCapital === 0 && ids.length > 0) {
     initialCapital = ids.reduce(function(s, id) {
-      return s + (pods[id].starting_capital || pods[id].nav || 0);
+      return s + (getPodStartCap(pods[id]) || getPodNav(pods[id]));
     }, 0);
   }
 
-  const firmInvested = ids.reduce((s,id) => s + (pods[id].invested || 0), 0);
-  const firmCash = ids.reduce((s,id) => s + (pods[id].cash || 0), 0);
+  const firmInvested = ids.reduce((s,id) => s + getPodInvested(pods[id]), 0);
+  const firmCash = ids.reduce((s,id) => s + getPodCash(pods[id]), 0);
 
   document.getElementById('kpi-nav').textContent    = nav > 0 ? `$${nav.toFixed(0)}` : '—';
   if (nav > 0) document.getElementById('kpi-nav').title = `Invested: $${firmInvested.toFixed(0)} | Cash: $${firmCash.toFixed(0)}`;
@@ -1251,36 +1270,83 @@ function updateTopHoldings() {
   var allPos = [];
   var ids = Object.keys(pods);
   ids.forEach(function(id) {
-    var positions = pods[id].current_positions;
-    if (Array.isArray(positions)) {
-      positions.forEach(function(p) {
-        allPos.push(Object.assign({ _pod: id }, p));
-      });
-    }
+    var positions = getPodPositions(pods[id]);
+    var arr = Array.isArray(positions) ? positions : (positions && typeof positions === 'object' ? Object.values(positions) : []);
+    arr.forEach(function(p) {
+      if (p && (p.symbol || p.qty != null)) allPos.push(Object.assign({ _pod: id }, p));
+    });
   });
   if (badge) badge.textContent = allPos.length + ' position' + (allPos.length !== 1 ? 's' : '');
   if (allPos.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
     return;
   }
-  allPos.sort(function(a, b) { return Math.abs(b.notional || 0) - Math.abs(a.notional || 0); });
-  tbody.innerHTML = allPos.slice(0, 15).map(function(p) {
+  applySortHoldings(allPos);
+  tbody.innerHTML = allPos.map(function(p) {
     var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
     var entry = p.cost_basis || p.avg_entry || 0;
     var notional = p.notional || (p.qty || 0) * (p.current_price || entry);
     var podEsc = escapeHtml(p._pod || '');
     var symEsc = escapeHtml(p.symbol || '');
+    var entryDate = escapeHtml(p.entry_date || '—');
+    var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
+    var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
     return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for details">' +
       '<td class="pod-name">' + podEsc.toUpperCase() + '</td>' +
-      '<td style="font-weight:600">' + symEsc + '</td>' +
+      '<td style="font-weight:600" title="' + symTitle + '">' + symEsc + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
       '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
       '<td class="r">$' + entry.toFixed(2) + '</td>' +
       '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
       '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
       '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
+      '<td class="r">' + entryDate + '</td>' +
       '</tr>';
   }).join('');
+}
+
+// ─── Holdings sort state ─────────────────────────────────────────────────────
+var _holdingsSortCol = 'notional';
+var _holdingsSortAsc = false;
+
+function sortHoldings(col) {
+  if (_holdingsSortCol === col) {
+    _holdingsSortAsc = !_holdingsSortAsc;
+  } else {
+    _holdingsSortCol = col;
+    _holdingsSortAsc = col === 'pod' || col === 'symbol' || col === 'entry_date';
+  }
+  updateSortIcons();
+  updateTopHoldings();
+}
+
+function applySortHoldings(arr) {
+  var col = _holdingsSortCol;
+  var asc = _holdingsSortAsc;
+  arr.sort(function(a, b) {
+    var av, bv;
+    if (col === 'pod')        { av = (a._pod || '').toLowerCase(); bv = (b._pod || '').toLowerCase(); }
+    else if (col === 'symbol')     { av = (a.symbol || '').toLowerCase(); bv = (b.symbol || '').toLowerCase(); }
+    else if (col === 'qty')        { av = Math.abs(a.qty || 0); bv = Math.abs(b.qty || 0); }
+    else if (col === 'entry')      { av = a.cost_basis || a.avg_entry || 0; bv = b.cost_basis || b.avg_entry || 0; }
+    else if (col === 'price')      { av = a.current_price || 0; bv = b.current_price || 0; }
+    else if (col === 'pnl')        { av = a.unrealized_pnl || a.unrealised_pnl || 0; bv = b.unrealized_pnl || b.unrealised_pnl || 0; }
+    else if (col === 'entry_date') { av = a.entry_date || ''; bv = b.entry_date || ''; }
+    else /* notional */            { av = Math.abs(a.notional || (a.qty || 0) * (a.current_price || 0)); bv = Math.abs(b.notional || (b.qty || 0) * (b.current_price || 0)); }
+    if (av < bv) return asc ? -1 : 1;
+    if (av > bv) return asc ? 1 : -1;
+    return 0;
+  });
+}
+
+function updateSortIcons() {
+  var cols = ['pod','symbol','qty','entry','price','pnl','notional','entry_date'];
+  cols.forEach(function(c) {
+    var el = document.getElementById('sh-' + c);
+    if (!el) return;
+    if (c === _holdingsSortCol) el.textContent = _holdingsSortAsc ? '▲' : '▼';
+    else el.textContent = '';
+  });
 }
 
 // ─── 12b. Position Detail Modal ─────────────────────────────────────────────
@@ -1797,22 +1863,31 @@ function openDrilldown(podId) {
   }).join('');
 
   var posTbody = document.getElementById('dd-positions');
-  var positions = d.current_positions;
-  if (Array.isArray(positions) && positions.length > 0) {
-    posTbody.innerHTML = positions.map(function(p) {
+  var positions = getPodPositions(d);
+  var posArr = Array.isArray(positions) ? positions : (positions && typeof positions === 'object' ? Object.values(positions) : []);
+  if (posArr.length > 0) {
+    posTbody.innerHTML = posArr.map(function(p) {
       var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
       var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
-      var notional = p.notional || (p.qty || 0) * (p.current_price || p.avg_entry || 0);
-      return '<tr>' +
-        '<td style="font-weight:600">' + escapeHtml(p.symbol || '') + '</td>' +
-        '<td class="r">' + (p.qty || 0) + '</td>' +
-        '<td class="r">$' + (p.current_price || p.avg_entry || 0).toFixed(2) + '</td>' +
+      var entry = p.cost_basis || p.avg_entry || 0;
+      var notional = p.notional || (p.qty || 0) * (p.current_price || entry);
+      var entryDate = escapeHtml(p.entry_date || '—');
+      var podEsc = escapeHtml(podId);
+      var symEsc = escapeHtml(p.symbol || '');
+      var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
+      var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
+      return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for full detail" style="cursor:pointer">' +
+        '<td style="font-weight:600" title="' + symTitle + '">' + symEsc + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
+        '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
+        '<td class="r">$' + entry.toFixed(2) + '</td>' +
+        '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
         '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
         '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
+        '<td class="r">' + entryDate + '</td>' +
         '</tr>';
     }).join('');
   } else {
-    posTbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">No open positions</div></td></tr>';
+    posTbody.innerHTML = '<tr><td colspan="7" class="empty"><div class="empty-txt">No open positions</div></td></tr>';
   }
 
   var tradeTbody = document.getElementById('dd-trades');
@@ -1982,13 +2057,17 @@ function renderReviews() {
   var badge = document.getElementById('review-badge');
   if (!container) return;
 
+  // Group events by pod, preserving most recent timestamp per pod
   var pods = {};
   reviewEvents.forEach(function(ev) {
     var d = ev.data || {};
     var podId = d.pod_id || 'firm';
     var action = d.action || '';
-    if (!pods[podId]) pods[podId] = { challenge: '', pm_defense: '', cio_decision: '', counter: '', final: '', summary: '' };
-    if (action === 'position_review') pods[podId].challenge = d.detail || d.summary || '';
+    if (!pods[podId]) pods[podId] = { challenge: '', pm_defense: '', cio_decision: '', counter: '', final: '', summary: '', override: '', ts: '' };
+    // Track most recent timestamp for this pod's review
+    var evTs = ev.timestamp || (d && d.ts) || '';
+    if (evTs && evTs > pods[podId].ts) pods[podId].ts = evTs;
+    if (action === 'position_review' && d.agent_role !== 'PM') pods[podId].challenge = d.detail || d.summary || '';
     if (action === 'position_review' && d.agent_role === 'PM') pods[podId].pm_defense = d.detail || d.summary || '';
     if (action === 'position_review_decision') pods[podId].cio_decision = d.detail || d.summary || '';
     if (action === 'position_review_counter') pods[podId].counter = d.detail || d.summary || '';
@@ -2009,11 +2088,17 @@ function renderReviews() {
     var r = pods[pid];
     var sections = '';
 
+    // Format review date
+    var dateStr = '—';
+    if (r.ts) {
+      try { dateStr = new Date(r.ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); } catch(e) { dateStr = r.ts.slice(0, 16).replace('T', ' '); }
+    }
+
     if (r.challenge) {
-      sections += '<div class="review-section"><div class="review-label">CIO CHALLENGE</div><div class="review-text">' + escapeHtml(r.challenge) + '</div></div>';
+      sections += '<div class="review-section"><div class="review-label">CIO REVIEW — ALL HOLDINGS</div><div class="review-text">' + escapeHtml(r.challenge) + '</div></div>';
     }
     if (r.pm_defense) {
-      sections += '<div class="review-section"><div class="review-label">PM DEFENSE</div><div class="review-text">' + escapeHtml(r.pm_defense) + '</div></div>';
+      sections += '<div class="review-section"><div class="review-label">PM RECOMMENDATIONS</div><div class="review-text">' + escapeHtml(r.pm_defense) + '</div></div>';
     }
     if (r.cio_decision) {
       sections += '<div class="review-section"><div class="review-label">CIO DECISION</div><div class="review-text">' + escapeHtml(r.cio_decision) + '</div></div>';
@@ -2028,7 +2113,39 @@ function renderReviews() {
       sections += '<div class="review-section"><div class="review-label">CIO FINAL RULING</div><div class="review-text">' + escapeHtml(r.final) + '</div></div>';
     }
 
-    return '<div class="review-card"><div class="review-pod-header">' + pid.toUpperCase() + ' — Position Review</div>' + sections + '</div>';
+    // Snapshot of current holdings for this pod (from live pods state)
+    var podData = (typeof pods_state !== 'undefined' ? pods_state : (typeof pods !== 'undefined' ? pods : {}))[pid];
+    var posSnap = '';
+    if (podData) {
+      var posArr2 = getPodPositions(podData);
+      posArr2 = Array.isArray(posArr2) ? posArr2 : (posArr2 && typeof posArr2 === 'object' ? Object.values(posArr2) : []);
+      if (posArr2.length > 0) {
+        posSnap = '<div class="review-section"><div class="review-label">HOLDINGS REVIEWED (' + posArr2.length + ')</div>' +
+          '<table class="dtbl" style="font-size:10px"><thead><tr><th>Symbol</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Price</th><th class="r">Unrl P&L</th><th>Thesis</th></tr></thead><tbody>' +
+          posArr2.map(function(p) {
+            var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
+            var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+            var entry = p.cost_basis || p.avg_entry || 0;
+            var thesis = p.entry_thesis ? p.entry_thesis.slice(0, 80) + (p.entry_thesis.length > 80 ? '…' : '') : '—';
+            return '<tr><td><strong>' + escapeHtml(p.symbol || '') + '</strong></td>' +
+              '<td class="r">' + (p.qty || 0).toFixed(3) + '</td>' +
+              '<td class="r">$' + entry.toFixed(2) + '</td>' +
+              '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
+              '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+              '<td style="color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(p.entry_thesis || '') + '">' + escapeHtml(thesis) + '</td></tr>';
+          }).join('') +
+          '</tbody></table></div>';
+      }
+    }
+
+    return '<div class="review-card">' +
+      '<div class="review-pod-header" style="display:flex;justify-content:space-between;align-items:center">' +
+        '<span>' + pid.toUpperCase() + ' — Position Review</span>' +
+        '<span style="font-size:10px;color:var(--text-dim);font-family:var(--font-mono)">' + dateStr + '</span>' +
+      '</div>' +
+      posSnap +
+      sections +
+    '</div>';
   }).join('');
 }
 

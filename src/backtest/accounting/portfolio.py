@@ -418,20 +418,23 @@ class PortfolioAccountant:
         if positions:
             logger.info("[%s] Loaded %d positions from memory/Alpaca", self._pod_id, len(positions))
 
-    def reconcile_capital_from_positions(self) -> None:
-        """Align starting_capital with loaded positions so NAV = invested + cash.
+    def reconcile_capital_from_positions(self, allocated_capital: float | None = None) -> None:
+        """Align starting_capital with loaded positions only when they exceed allocation.
 
-        When positions are hydrated from Alpaca, their total cost basis can exceed
-        the config starting_capital ($100). Set _starting_capital = total cost basis
-        of current positions so the books balance. Pods with no positions get
-        starting_capital=0 to avoid phantom capital (firm total would otherwise
-        exceed actual Alpaca account value).
+        Preserves allocated capital (e.g. $100 per pod): crypto with no positions
+        stays at 100; FX with 65 invested keeps NAV=100 and cash=35. Only reconcile
+        when hydrated positions exceed allocated_capital (e.g. Alpaca has 50k when
+        config allocated 100). Uses allocated_capital if provided, else _starting_capital.
         """
         total_cost = sum(
             abs(p["quantity"]) * self._cost_basis.get(sym, p["avg_cost"])
             for sym, p in self._positions.items()
             if p.get("quantity", 0) != 0
         )
+        threshold = allocated_capital if allocated_capital is not None and allocated_capital > 0 else self._starting_capital
+        # Keep allocated capital: only reconcile when positions exceed allocation
+        if total_cost == 0 or total_cost <= threshold:
+            return
         prev = self._starting_capital
         self._starting_capital = total_cost
         logger.info(

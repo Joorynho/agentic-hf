@@ -188,8 +188,24 @@ class PodRuntime:
             (t for t in trades if isinstance(t, dict) and t.get("symbol") == order.symbol),
             {},
         )
+        # Prefer per-trade reasoning (human-readable thesis) over the top-level
+        # field which is the raw serialised TradeProposal JSON blob
+        trade_reasoning = matching_trade.get("reasoning", "")
+        if not trade_reasoning:
+            trade_reasoning = last_pm.get("reasoning", "")
+        # Strip outer JSON wrapper if it leaked through (starts with {"trades":)
+        if trade_reasoning.startswith('{"trades":') or trade_reasoning.startswith("{'trades':"):
+            try:
+                import json as _json
+                proposal = _json.loads(trade_reasoning)
+                for t in proposal.get("trades", []):
+                    if t.get("symbol") == order.symbol:
+                        trade_reasoning = t.get("reasoning", trade_reasoning)
+                        break
+            except Exception:
+                pass
         self._ns.set("pm_trade_metadata", {
-            "reasoning": last_pm.get("reasoning", "")[:500],
+            "reasoning": trade_reasoning[:500],
             "conviction": order.conviction,
             "strategy_tag": order.strategy_tag,
             "signal_snapshot": last_pm.get("signal_snapshot", {}),
@@ -476,6 +492,7 @@ class PodRuntime:
             timestamp=datetime.now(),
             nav=accountant.nav,
             daily_pnl=accountant.daily_pnl,
+            realized_pnl=accountant.realized_pnl,
             starting_capital=accountant.starting_capital,
             invested=round(invested, 2),
             cash=round(cash_value, 2),

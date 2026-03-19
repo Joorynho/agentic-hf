@@ -147,12 +147,18 @@
           <span class="sec-badge" id="holdings-badge">0 positions</span>
         </div>
         <div class="tbl-wrap tbl-wrap-scroll">
-          <table class="dtbl">
-            <thead><tr>
-              <th>Pod</th><th>Symbol</th><th class="r">Qty</th>
-              <th class="r">Entry</th><th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th>
+          <table class="dtbl" id="holdings-tbl">
+            <thead><tr id="holdings-thead">
+              <th class="sortable-th" data-col="pod" onclick="sortHoldings('pod')">Pod <span class="sort-icon" id="sh-pod"></span></th>
+              <th class="sortable-th" data-col="symbol" onclick="sortHoldings('symbol')">Symbol <span class="sort-icon" id="sh-symbol"></span></th>
+              <th class="r sortable-th" data-col="qty" onclick="sortHoldings('qty')">Qty <span class="sort-icon" id="sh-qty"></span></th>
+              <th class="r sortable-th" data-col="entry" onclick="sortHoldings('entry')">Entry <span class="sort-icon" id="sh-entry"></span></th>
+              <th class="r sortable-th" data-col="price" onclick="sortHoldings('price')">Price <span class="sort-icon" id="sh-price"></span></th>
+              <th class="r sortable-th" data-col="pnl" onclick="sortHoldings('pnl')">Unrl P&amp;L <span class="sort-icon" id="sh-pnl"></span></th>
+              <th class="r sortable-th" data-col="notional" onclick="sortHoldings('notional')">Notional <span class="sort-icon" id="sh-notional"></span></th>
+              <th class="r sortable-th" data-col="entry_date" onclick="sortHoldings('entry_date')">Entry Date <span class="sort-icon" id="sh-entry_date"></span></th>
             </tr></thead>
-            <tbody id="holdings-table"><tr><td colspan="7" class="empty"><div class="empty-txt">No positions yet</div></td></tr></tbody>
+            <tbody id="holdings-table"><tr><td colspan="8" class="empty"><div class="empty-txt">No positions yet</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -165,7 +171,7 @@
         <div class="dd-section">
           <div class="sec-hdr"><span class="sec-title">Positions</span></div>
           <div class="tbl-wrap"><table class="dtbl">
-            <thead><tr><th>Symbol</th><th class="r">Qty</th><th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th></tr></thead>
+            <thead><tr><th>Symbol</th><th class="r">Qty</th><th class="r">Entry</th><th class="r">Price</th><th class="r">Unrl P&amp;L</th><th class="r">Notional</th><th class="r">Entry Date</th></tr></thead>
             <tbody id="dd-positions"></tbody>
           </table></div>
         </div>

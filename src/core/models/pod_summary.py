@@ -14,6 +14,7 @@ class PodRiskMetrics(BaseModel):
     timestamp: datetime
     nav: float
     daily_pnl: float
+    realized_pnl: float = 0.0
     starting_capital: float = 0.0
     invested: float = 0.0
     cash: float = 0.0
