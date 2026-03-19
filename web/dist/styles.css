@@ -1819,6 +1819,10 @@ button { font-family: inherit; cursor: pointer; }
   background:var(--bg-surface,#0e1a28); padding:10px 12px; border-radius:4px;
   border:1px solid var(--border-dim,#2a3a50);
 }
+.closed-exit-when {
+  border-left: 3px solid var(--cyan);
+  background: rgba(0, 212, 255, 0.04);
+}
 .pos-empty { font-size:12px; color:var(--text-muted,#6a82a0); padding:8px; text-align:center; }
 
 /* PM Reasoning History */

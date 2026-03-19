@@ -93,6 +93,7 @@
       <button class="tab-btn" data-tab="governance">Governance</button>
       <button class="tab-btn" data-tab="research">Research</button>
       <button class="tab-btn" data-tab="reports">Reports</button>
+      <button class="tab-btn" data-tab="closed">Closed</button>
     </nav>
 
     <!-- OPERATIONS -->
@@ -636,6 +637,34 @@
             <div class="empty-txt">Loading saved reports…</div>
           </div>
         </div>
+      </div>
+    </div>
+
+    <!-- CLOSED POSITIONS -->
+    <div class="tab-pane" id="tab-closed">
+      <div class="sec-hdr">
+        <span class="sec-title">Closed Positions</span>
+        <span class="sec-badge" id="closed-badge">0 positions</span>
+        <button class="sec-btn" onclick="loadClosedPositions()" style="cursor:pointer;background:var(--card);border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;font-size:10px;letter-spacing:1px;margin-left:8px">REFRESH</button>
+      </div>
+      <div class="tbl-wrap">
+        <table class="dtbl" id="closed-pos-table">
+          <thead><tr>
+            <th>Pod</th>
+            <th>Symbol</th>
+            <th class="r">Entry</th>
+            <th class="r">Exit</th>
+            <th class="r">Qty</th>
+            <th class="r">P&amp;L</th>
+            <th class="r">Return</th>
+            <th class="r">Hold</th>
+            <th>Entry Date</th>
+            <th>Exit Date</th>
+          </tr></thead>
+          <tbody id="closed-pos-tbody">
+            <tr><td colspan="10" class="empty"><div class="empty-txt">No closed positions yet</div><div class="empty-hint">Positions appear here after they are fully exited</div></td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
 

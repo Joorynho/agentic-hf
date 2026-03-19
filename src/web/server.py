@@ -508,6 +508,29 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session not initialized")
         return sm.get_all_closed_trades()
 
+    @app.get("/api/closed-positions")
+    async def get_closed_positions():
+        """Get all closed positions across all pods, sorted by exit time descending."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        results = []
+        pod_runtimes = getattr(sm, "_pod_runtimes", {})
+        for pod_key, rt in pod_runtimes.items():
+            accountant = getattr(rt, "_accountant", None)
+            if accountant is None:
+                continue
+            for trade in accountant.closed_trades:
+                enriched = dict(trade)
+                enriched["pod_id"] = pod_key
+                # Try to enrich with entry_thesis from metadata (may already be cleared)
+                symbol = enriched.get("symbol", "")
+                meta = accountant._entry_metadata.get(symbol, {})
+                enriched["entry_thesis"] = meta.get("entry_thesis", enriched.get("entry_reasoning", ""))
+                results.append(enriched)
+        results.sort(key=lambda t: t.get("exit_time", ""), reverse=True)
+        return {"closed_positions": results}
+
     @app.get("/api/risk", response_model=RiskStatusResponse)
     async def get_risk_status():
         """Get current risk status."""

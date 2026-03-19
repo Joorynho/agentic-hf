@@ -277,6 +277,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'execution') fetchClosedTrades();
+    if (btn.dataset.tab === 'closed') loadClosedPositions();
   });
 });
 
@@ -2420,7 +2421,133 @@ function loadSavedReports() {
     });
 }
 
+// ─── Closed Positions Tab ─────────────────────────────────────────────────
+var _closedPositions = [];
+
+function loadClosedPositions() {
+  fetch('/api/closed-positions')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      _closedPositions = data.closed_positions || [];
+      renderClosedPositions();
+    })
+    .catch(function() {
+      var tbody = document.getElementById('closed-pos-tbody');
+      if (tbody) tbody.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-txt">Failed to load — try again</div></td></tr>';
+    });
+}
+
+function renderClosedPositions() {
+  var tbody = document.getElementById('closed-pos-tbody');
+  var badge = document.getElementById('closed-badge');
+  if (!tbody) return;
+  if (badge) badge.textContent = _closedPositions.length + ' position' + (_closedPositions.length !== 1 ? 's' : '');
+
+  if (_closedPositions.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-txt">No closed positions yet</div><div class="empty-hint">Positions appear here after they are fully exited</div></td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = _closedPositions.map(function(p, idx) {
+    var pnl = p.realized_pnl || 0;
+    var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+    var entryP = p.entry_price || 0;
+    var exitP = p.exit_price || 0;
+    var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
+    if (p.side === 'short') retPct = -retPct;
+    var retCls = retPct >= 0 ? 'pos' : 'neg';
+    var entryDate = (p.entry_time || '').slice(0, 10) || '—';
+    var exitDate = (p.exit_time || '').slice(0, 10) || '—';
+    var holdDays = '—';
+    if (p.entry_time && p.exit_time) {
+      try {
+        holdDays = Math.round((new Date(p.exit_time) - new Date(p.entry_time)) / 86400000) + 'd';
+      } catch(e) {}
+    }
+    return '<tr class="holdings-row" style="cursor:pointer" onclick="showClosedPositionDetail(' + idx + ')" title="Click for details">' +
+      '<td class="pod-name">' + escapeHtml(p.pod_id || '').toUpperCase() + '</td>' +
+      '<td style="font-weight:600">' + tickerDisplay(p.symbol || '') + '</td>' +
+      '<td class="r">$' + entryP.toFixed(2) + '</td>' +
+      '<td class="r">$' + exitP.toFixed(2) + '</td>' +
+      '<td class="r">' + (p.qty || 0) + '</td>' +
+      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</td>' +
+      '<td class="r ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</td>' +
+      '<td class="r">' + holdDays + '</td>' +
+      '<td>' + entryDate + '</td>' +
+      '<td>' + exitDate + '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+function showClosedPositionDetail(idx) {
+  var p = _closedPositions[idx];
+  if (!p) return;
+
+  var overlay = document.getElementById('closed-modal-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'closed-modal-overlay';
+    overlay.className = 'pos-modal-overlay';
+    overlay.onclick = function(e) { if (e.target === overlay) overlay.classList.remove('open'); };
+    document.body.appendChild(overlay);
+  }
+  overlay.classList.add('open');
+
+  var pnl = p.realized_pnl || 0;
+  var pnlCls = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+  var entryP = p.entry_price || 0;
+  var exitP = p.exit_price || 0;
+  var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
+  if (p.side === 'short') retPct = -retPct;
+  var retCls = retPct >= 0 ? 'pos' : 'neg';
+  var entryDate = (p.entry_time || '').slice(0, 10) || '—';
+  var exitDate = (p.exit_time || '').slice(0, 10) || '—';
+  var holdDays = '—';
+  if (p.entry_time && p.exit_time) {
+    try { holdDays = Math.round((new Date(p.exit_time) - new Date(p.entry_time)) / 86400000); } catch(e) {}
+  }
+
+  var entryThesis = cleanThesis(p.entry_reasoning || p.entry_thesis || '', p.symbol);
+  var exitWhen = p.exit_when || '';
+
+  overlay.innerHTML = '<div class="pos-modal">' +
+    '<button class="pos-modal-close" onclick="document.getElementById(\'closed-modal-overlay\').classList.remove(\'open\')">&times;</button>' +
+    '<div class="pos-hdr">' +
+      '<div class="pos-hdr-left">' +
+        '<span class="pos-symbol">' + tickerDisplay(p.symbol) + '</span>' +
+        '<span class="badge b-' + escapeHtml(p.pod_id || '') + '">' + escapeHtml(p.pod_id || '').toUpperCase() + '</span>' +
+        '<span class="badge" style="background:rgba(255,255,255,0.08);color:var(--text-dim);font-size:9px">CLOSED</span>' +
+      '</div>' +
+      '<div class="pos-hdr-right">' +
+        '<div class="pos-hdr-avg">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div>' +
+        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + ' realized</div>' +
+      '</div>' +
+    '</div>' +
+    '<div class="pos-grid">' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Entry Date</div><div class="pos-cell-val">' + entryDate + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Exit Date</div><div class="pos-cell-val">' + exitDate + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Days Held</div><div class="pos-cell-val">' + holdDays + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Entry Price</div><div class="pos-cell-val">$' + entryP.toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Exit Price</div><div class="pos-cell-val">$' + exitP.toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Quantity</div><div class="pos-cell-val">' + (p.qty || 0) + '</div></div>' +
+    '</div>' +
+    '<div class="pos-section">' +
+      '<div class="pos-section-title">Performance</div>' +
+      '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Realized P&L</div><div class="pos-cell-val ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</div></div>' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div></div>' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Conviction</div><div class="pos-cell-val">' + (((p.conviction || 0) * 100).toFixed(0)) + '%</div></div>' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Side</div><div class="pos-cell-val">' + (p.side || 'long').toUpperCase() + '</div></div>' +
+      '</div>' +
+    '</div>' +
+    (entryThesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(entryThesis) + '</div></div>' : '') +
+    (exitWhen ? '<div class="pos-section"><div class="pos-section-title">Exit Condition</div><div class="pos-thesis closed-exit-when">' + escapeHtml(exitWhen) + '</div></div>' : '') +
+    (p.strategy_tag ? '<div class="pos-section"><div class="pos-section-title">Strategy</div><div style="font-size:11px;color:var(--text-secondary);padding:6px 0">' + escapeHtml(p.strategy_tag) + '</div></div>' : '') +
+  '</div>';
+}
+
 // ─── 22. Init ──────────────────────────────────────────────────────────────
 initResearchHistoryChart();
 updateGovHub();
 loadSavedReports();
+loadClosedPositions();

@@ -141,6 +141,7 @@ class PortfolioAccountant:
                 "entry_reasoning": entry_meta.get("reasoning", ""),
                 "conviction": entry_meta.get("conviction", 0.5),
                 "strategy_tag": entry_meta.get("strategy_tag", ""),
+                "exit_when": entry_meta.get("exit_when", ""),
                 "signal_snapshot": entry_meta.get("signal_snapshot", {}),
             })
             logger.info(
