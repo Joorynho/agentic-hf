@@ -2047,6 +2047,29 @@ function updateAttribution() {
 // ─── 21. Position Review / Reports Tab ──────────────────────────────────────
 var reviewEvents = [];
 
+// Review history — persisted to localStorage
+var reviewHistory = (function() {
+  try { return JSON.parse(localStorage.getItem('reviewHistory') || '[]'); } catch(e) { return []; }
+})();
+var _rhLastSaved = (function() {
+  // Pre-populate from existing history so refreshing the page doesn't re-snapshot old reviews
+  var map = {};
+  reviewHistory.forEach(function(e) {
+    if (!map[e.pod_id] || e.ts > map[e.pod_id]) map[e.pod_id] = e.ts;
+  });
+  return map;
+})();
+
+function _maybeSaveReviewSnapshot(podId, reviewData) {
+  var ts = reviewData.ts || '';
+  if (!ts || _rhLastSaved[podId] === ts) return;
+  _rhLastSaved[podId] = ts;
+  reviewHistory.push({ pod_id: podId, ts: ts, data: JSON.parse(JSON.stringify(reviewData)) });
+  if (reviewHistory.length > 200) reviewHistory = reviewHistory.slice(-200);
+  try { localStorage.setItem('reviewHistory', JSON.stringify(reviewHistory)); } catch(e) {}
+  renderReviewHistory();
+}
+
 function addReviewEvent(ev) {
   reviewEvents.push(ev);
   renderReviews();
@@ -2078,6 +2101,11 @@ function renderReviews() {
 
   var podIds = Object.keys(pods).filter(function(p) { return p !== 'firm'; }).sort();
   if (badge) badge.textContent = podIds.length + ' review' + (podIds.length !== 1 ? 's' : '');
+
+  // Snapshot completed reviews into history
+  podIds.forEach(function(pid) {
+    if (pods[pid].summary) _maybeSaveReviewSnapshot(pid, pods[pid]);
+  });
 
   if (podIds.length === 0) {
     container.innerHTML = '<div class="empty"><div class="empty-txt">No position reviews yet</div><div class="empty-hint">Reviews run daily when positions are held</div></div>';
@@ -2147,6 +2175,61 @@ function renderReviews() {
       sections +
     '</div>';
   }).join('');
+}
+
+var _reviewHistoryVisible = false;
+
+function toggleReviewHistory() {
+  _reviewHistoryVisible = !_reviewHistoryVisible;
+  var list = document.getElementById('review-history-list');
+  var toggle = document.getElementById('review-history-toggle');
+  if (list) list.style.display = _reviewHistoryVisible ? 'flex' : 'none';
+  if (toggle) toggle.textContent = _reviewHistoryVisible ? '▲ HIDE' : '▼ SHOW';
+  if (_reviewHistoryVisible) renderReviewHistory();
+}
+
+function renderReviewHistory() {
+  var container = document.getElementById('review-history-list');
+  if (!container || !_reviewHistoryVisible) return;
+
+  if (reviewHistory.length === 0) {
+    container.innerHTML = '<div class="empty"><div class="empty-txt">No history yet</div><div class="empty-hint">Completed reviews are saved here automatically</div></div>';
+    return;
+  }
+
+  // Sort newest first
+  var sorted = reviewHistory.slice().sort(function(a, b) { return b.ts < a.ts ? -1 : 1; });
+
+  container.innerHTML = sorted.map(function(entry, idx) {
+    var r = entry.data;
+    var podId = entry.pod_id;
+    var dateStr = '—';
+    if (entry.ts) {
+      try { dateStr = new Date(entry.ts).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }); } catch(e) { dateStr = entry.ts.slice(0, 16).replace('T', ' '); }
+    }
+    var bodyId = 'rh-body-' + idx;
+    var sections = '';
+    if (r.challenge) sections += '<div class="review-section"><div class="review-label">CIO REVIEW</div><div class="review-text">' + escapeHtml(r.challenge) + '</div></div>';
+    if (r.pm_defense) sections += '<div class="review-section"><div class="review-label">PM RECOMMENDATIONS</div><div class="review-text">' + escapeHtml(r.pm_defense) + '</div></div>';
+    if (r.cio_decision) sections += '<div class="review-section"><div class="review-label">CIO DECISION</div><div class="review-text">' + escapeHtml(r.cio_decision) + '</div></div>';
+    if (r.override) sections += '<div class="review-section"><div class="review-label">CIO OVERRIDE</div><div class="review-text review-override">' + escapeHtml(r.override) + '</div></div>';
+    if (r.counter) sections += '<div class="review-section"><div class="review-label">PM COUNTER-ARGUMENT</div><div class="review-text">' + escapeHtml(r.counter) + '</div></div>';
+    if (r.final) sections += '<div class="review-section"><div class="review-label">CIO FINAL RULING</div><div class="review-text">' + escapeHtml(r.final) + '</div></div>';
+    if (r.summary) sections += '<div class="review-section"><div class="review-label">SUMMARY</div><div class="review-text">' + escapeHtml(r.summary) + '</div></div>';
+
+    return '<div class="rh-entry">' +
+      '<div class="rh-entry-header" onclick="toggleRhEntry(\'' + bodyId + '\')">' +
+        '<span><span class="rh-entry-pod">' + podId.toUpperCase() + '</span></span>' +
+        '<span>' + dateStr + '</span>' +
+      '</div>' +
+      '<div class="rh-entry-body" id="' + bodyId + '">' + (sections || '<em style="color:var(--text-dim);font-size:10px">No detail available</em>') + '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function toggleRhEntry(bodyId) {
+  var el = document.getElementById(bodyId);
+  if (el) el.classList.toggle('open');
 }
 
 function escapeHtml(text) {

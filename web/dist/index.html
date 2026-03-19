@@ -617,6 +617,16 @@
         </div>
       </div>
       <div style="margin-top:24px">
+        <div class="sec-hdr review-history-header" onclick="toggleReviewHistory()">
+          <span class="sec-title">Review History</span>
+          <span style="font-size:9px;color:var(--text-dim);letter-spacing:1px" id="review-history-toggle">▼ SHOW</span>
+        </div>
+        <div id="review-history-list" class="review-history-list" style="display:none">
+          <div class="empty"><div class="empty-txt">No history yet</div><div class="empty-hint">Completed reviews are saved here automatically</div></div>
+        </div>
+      </div>
+
+      <div style="margin-top:24px">
         <div class="sec-hdr">
           <span class="sec-title">Saved Reports</span>
           <button class="sec-btn" onclick="loadSavedReports()" style="cursor:pointer;background:var(--card);border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;font-size:10px;letter-spacing:1px">REFRESH</button>

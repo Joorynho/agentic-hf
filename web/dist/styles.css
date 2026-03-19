@@ -439,6 +439,7 @@ button { font-family: inherit; cursor: pointer; }
   display: none;
   flex-direction: column;
   flex: 1;
+  min-height: 0;
   overflow-y: auto;
   padding: 14px;
   gap: 12px;
@@ -1580,6 +1581,46 @@ button { font-family: inherit; cursor: pointer; }
 .review-text.review-override {
   border-left: 3px solid #e84040;
 }
+/* Review History */
+.review-history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+}
+.review-history-header:hover .sec-title { color: var(--cyan); }
+.review-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.rh-entry {
+  background: var(--card);
+  border: 1px solid var(--border-dim);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.rh-entry-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 10px;
+  color: var(--text-dim);
+  letter-spacing: 0.5px;
+  user-select: none;
+}
+.rh-entry-header:hover { background: rgba(255,255,255,0.02); color: var(--text-secondary); }
+.rh-entry-pod { font-weight: 700; color: var(--cyan); font-size: 11px; }
+.rh-entry-body {
+  display: none;
+  border-top: 1px solid var(--border-dim);
+  padding: 10px 12px;
+}
+.rh-entry-body.open { display: block; }
+
 .saved-report-item {
   display: flex;
   align-items: center;
