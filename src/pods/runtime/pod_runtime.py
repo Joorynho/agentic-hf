@@ -525,6 +525,22 @@ class PodRuntime:
         # Determine pod status
         status = PodStatus.ACTIVE
 
+        # Regime label from macro_view (set during run_cycle)
+        macro_view = self._ns.get("macro_view") or {}
+        macro_regime = macro_view.get("regime")  # e.g. "Risk-On", "Neutral", "Risk-Off", "Crisis"
+
+        # Real performance metrics from accountant's daily NAV history
+        try:
+            performance_metrics = accountant.performance_summary()
+        except Exception:
+            performance_metrics = {}
+
+        # Trade outcome stats (only populated once trades have closed)
+        try:
+            trade_outcome_stats = self._outcome_tracker.to_dict() if self._outcome_tracker.total_trades > 0 else {}
+        except Exception:
+            trade_outcome_stats = {}
+
         # Create and return summary
         summary = PodSummary(
             pod_id=self._pod_id,
@@ -537,6 +553,9 @@ class PodRuntime:
             heartbeat_ok=True,
             positions=positions,
             error_message=None,
+            macro_regime=macro_regime,
+            performance_metrics=performance_metrics,
+            trade_outcome_stats=trade_outcome_stats,
         )
 
         logger.debug(
