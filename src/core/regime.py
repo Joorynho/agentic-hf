@@ -43,7 +43,7 @@ def classify_regime(
     Args:
         vix: CBOE VIX index value (e.g. 15.5)
         yield_curve: 10Y-2Y Treasury spread in percentage points (e.g. 0.5 = 50bps)
-        credit_spread: Investment-grade credit spread in percentage points (e.g. 1.2)
+        credit_spread: HY credit spread (BAMLH0A0HYM2) in percentage points (e.g. 3.5)
 
     Returns:
         RegimeClassification with regime name, sizing scale, and description
@@ -75,14 +75,18 @@ def classify_regime(
 
     if credit_spread is not None:
         contributions += 1
-        if credit_spread < 1.0:
-            score += 1   # Tight spreads → risk-on
-        elif credit_spread < 2.0:
-            pass         # Normal → neutral
-        elif credit_spread < 3.5:
+        # Thresholds calibrated for BAMLH0A0HYM2 (ICE BofA US HY OAS).
+        # HY spreads historically range ~2.5% (tight) to 10%+ (crisis).
+        # Previous thresholds (<1.0 = tight) were for IG spreads and
+        # permanently biased toward risk-off since HY never goes below ~2.5%.
+        if credit_spread < 3.5:
+            score += 1   # Tight HY spreads → risk-on
+        elif credit_spread < 5.0:
+            pass         # Normal HY range → neutral
+        elif credit_spread < 7.0:
             score -= 1   # Widening → risk-off
         else:
-            score -= 2   # Blowout → crisis
+            score -= 2   # Blowout (>7%) → crisis
 
     if contributions == 0:
         regime_key = "neutral"

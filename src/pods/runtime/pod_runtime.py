@@ -175,94 +175,124 @@ class PodRuntime:
         # Log PM reasoning for all held positions (diary per position)
         self._log_pm_reasoning(last_pm)
 
-        order: Order | None = ctx.get("order")
+        # --- Collect ALL orders from PM (primary + additional) ---
+        all_orders: list[Order] = []
+        primary_order: Order | None = ctx.get("order")
+        if primary_order is not None:
+            all_orders.append(primary_order)
+
+        # Retrieve additional orders stored by PM (orders 2 & 3)
+        additional_raw = self._ns.get("pm_additional_orders") or []
+        for raw in additional_raw:
+            try:
+                all_orders.append(Order(**raw))
+            except Exception as e:
+                logger.warning("[%s] Skipping malformed additional order: %s", self._pod_id, e)
+        # Clear so they don't leak into next cycle
+        self._ns.set("pm_additional_orders", [])
 
         # Universe boundary enforcement: reject trades for symbols that belong
         # exclusively to another pod's seed universe (prevents cross-pod contamination).
-        if order is not None:
-            from src.core.config.universes import POD_UNIVERSES
+        from src.core.config.universes import POD_UNIVERSES
+        my_symbols = POD_UNIVERSES.get(self._pod_id, [])
+        valid_orders: list[Order] = []
+        for ord_ in all_orders:
+            blocked = False
             for other_pod, other_symbols in POD_UNIVERSES.items():
-                if other_pod != self._pod_id and order.symbol in other_symbols:
-                    # Only block if the symbol is NOT in this pod's own universe
-                    my_symbols = POD_UNIVERSES.get(self._pod_id, [])
-                    if order.symbol not in my_symbols:
+                if other_pod != self._pod_id and ord_.symbol in other_symbols:
+                    if ord_.symbol not in my_symbols:
                         logger.warning(
                             "[%s] Rejected trade for %s — symbol belongs to %s universe, not %s",
-                            self._pod_id, order.symbol, other_pod, self._pod_id,
+                            self._pod_id, ord_.symbol, other_pod, self._pod_id,
                         )
-                        order = None
-                        ctx["order"] = None
+                        blocked = True
                     break
+            if not blocked:
+                valid_orders.append(ord_)
 
-        if order is None:
+        if not valid_orders:
             # No trade proposed — still run Ops
             await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
             return
 
-        # Carry PM decision metadata so exec trader can attach it to fills
+        # --- Process each order through risk review + execution ---
         last_pm = self._ns.get("last_pm_decision") or {}
-        trades = last_pm.get("trades", [])
-        matching_trade = next(
-            (t for t in trades if isinstance(t, dict) and t.get("symbol") == order.symbol),
-            {},
-        )
-        # Prefer per-trade reasoning (human-readable thesis) over the top-level
-        # field which is the raw serialised TradeProposal JSON blob
-        trade_reasoning = matching_trade.get("reasoning", "")
-        if not trade_reasoning:
-            trade_reasoning = last_pm.get("reasoning", "")
-        # Strip outer JSON wrapper if it leaked through (starts with {"trades":)
-        if trade_reasoning.startswith('{"trades":') or trade_reasoning.startswith("{'trades':"):
-            try:
-                import json as _json
-                proposal = _json.loads(trade_reasoning)
-                for t in proposal.get("trades", []):
-                    if t.get("symbol") == order.symbol:
-                        trade_reasoning = t.get("reasoning", trade_reasoning)
-                        break
-            except Exception:
-                pass
-        self._ns.set("pm_trade_metadata", {
-            "reasoning": trade_reasoning[:500],
-            "conviction": order.conviction,
-            "strategy_tag": order.strategy_tag,
-            "signal_snapshot": last_pm.get("signal_snapshot", {}),
-            "stop_loss_pct": matching_trade.get("stop_loss_pct"),
-            "take_profit_pct": matching_trade.get("take_profit_pct"),
-            "exit_when": matching_trade.get("exit_when", ""),
-            "max_hold_days": matching_trade.get("max_hold_days", 0),
-        })
+        pm_trades = last_pm.get("trades", [])
+        executed_count = 0
+        rejected_count = 0
 
-        # 4. Risk sign-off loop (PM↔Risk, max 10 iter)
-        approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
+        for order in valid_orders:
+            # Find matching PM trade metadata for this specific order
+            matching_trade = next(
+                (t for t in pm_trades if isinstance(t, dict) and t.get("symbol") == order.symbol),
+                {},
+            )
 
-        # Execute exit orders first (stop-loss / take-profit)
-        if exit_orders:
-            for eo in exit_orders:
-                exit_ctx = {
-                    "approved_order": eo,
-                    "mandate": self._ns.get("governance_mandate"),
-                    "risk_halt": False,
-                    "auto_exit": True,
-                }
+            # Extract per-trade reasoning (human-readable thesis)
+            trade_reasoning = matching_trade.get("reasoning", "")
+            if not trade_reasoning:
+                trade_reasoning = last_pm.get("reasoning", "")
+            # Strip outer JSON wrapper if it leaked through
+            if trade_reasoning.startswith('{"trades":') or trade_reasoning.startswith("{'trades':"):
                 try:
-                    await self._exec_trader.run_cycle(exit_ctx)  # type: ignore[union-attr]
-                    logger.info("[%s] Auto-exit executed: %s %s %.4f", self._pod_id, eo.side.value, eo.symbol, eo.quantity)
-                except Exception as e:
-                    logger.warning("[%s] Auto-exit failed for %s: %s", self._pod_id, eo.symbol, e)
+                    import json as _json
+                    proposal = _json.loads(trade_reasoning)
+                    for t in proposal.get("trades", []):
+                        if t.get("symbol") == order.symbol:
+                            trade_reasoning = t.get("reasoning", trade_reasoning)
+                            break
+                except Exception:
+                    pass
 
-        if approved_order is None:
-            logger.info("[%s] Order rejected by Risk after deliberation", self._pod_id)
-            await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
-            return
+            # Set per-order metadata so exec trader can attach it to fills
+            self._ns.set("pm_trade_metadata", {
+                "reasoning": trade_reasoning[:500],
+                "conviction": order.conviction,
+                "strategy_tag": order.strategy_tag,
+                "signal_snapshot": last_pm.get("signal_snapshot", {}),
+                "stop_loss_pct": matching_trade.get("stop_loss_pct"),
+                "take_profit_pct": matching_trade.get("take_profit_pct"),
+                "exit_when": matching_trade.get("exit_when", ""),
+                "max_hold_days": matching_trade.get("max_hold_days", 0),
+            })
 
-        # 5. Execution Trader (with governance constraints)
-        ctx["approved_order"] = approved_order
-        # Inject governance state into context
-        ctx["mandate"] = self._ns.get("governance_mandate")
-        ctx["risk_halt"] = self._ns.get("governance_risk_halt", False)
-        ctx["risk_halt_reason"] = self._ns.get("governance_risk_halt_reason")
-        await self._exec_trader.run_cycle(ctx)  # type: ignore[union-attr]
+            # 4. Risk sign-off loop (PM↔Risk deliberation per order)
+            approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
+
+            # Execute exit orders first (stop-loss / take-profit)
+            if exit_orders:
+                for eo in exit_orders:
+                    exit_ctx = {
+                        "approved_order": eo,
+                        "mandate": self._ns.get("governance_mandate"),
+                        "risk_halt": False,
+                        "auto_exit": True,
+                    }
+                    try:
+                        await self._exec_trader.run_cycle(exit_ctx)  # type: ignore[union-attr]
+                        logger.info("[%s] Auto-exit executed: %s %s %.4f", self._pod_id, eo.side.value, eo.symbol, eo.quantity)
+                    except Exception as e:
+                        logger.warning("[%s] Auto-exit failed for %s: %s", self._pod_id, eo.symbol, e)
+
+            if approved_order is None:
+                rejected_count += 1
+                logger.info("[%s] Order %d/%d rejected by Risk: %s %s",
+                            self._pod_id, executed_count + rejected_count,
+                            len(valid_orders), order.side.value, order.symbol)
+                continue
+
+            # 5. Execution Trader (with governance constraints)
+            exec_ctx = dict(ctx)
+            exec_ctx["approved_order"] = approved_order
+            exec_ctx["mandate"] = self._ns.get("governance_mandate")
+            exec_ctx["risk_halt"] = self._ns.get("governance_risk_halt", False)
+            exec_ctx["risk_halt_reason"] = self._ns.get("governance_risk_halt_reason")
+            await self._exec_trader.run_cycle(exec_ctx)  # type: ignore[union-attr]
+            executed_count += 1
+
+        if executed_count + rejected_count > 1:
+            logger.info("[%s] Multi-order cycle: %d executed, %d rejected (of %d proposed)",
+                        self._pod_id, executed_count, rejected_count, len(valid_orders))
 
         # 6. Ops
         await self._ops.run_cycle(ctx)  # type: ignore[union-attr]

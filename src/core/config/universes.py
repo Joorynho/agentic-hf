@@ -33,17 +33,17 @@ EQUITIES_SEED: list[str] = [
 ]
 
 FX_SEED: list[str] = [
-    # --- Currency ETFs ---
-    "FXE", "FXY", "FXB", "FXA", "FXC", "FXF",
-    "UUP", "UDN", "CEW", "USDU",
-    # --- Country / Regional Market ETFs ---
-    "EWJ", "EWG", "EWU", "EWQ", "EWP", "EWI", "EWN", "EWL",
-    "EWA", "EWC", "EWZ", "FXI", "INDA", "EWT", "EWY",
-    "EWS", "EWM", "EWW", "EWH", "THD", "VNM", "EIDO", "EPHE",
-    # --- Rate-Sensitive / Bond ETFs ---
-    "TLT", "IEF", "SHY", "BWX", "IGOV", "LEMB", "EMLC",
-    # --- EM / Frontier ETFs ---
-    "EEM", "VWO", "IEMG", "FM",
+    # --- Direct Currency ETFs (pure FX exposure) ---
+    "FXE", "FXY", "FXB", "FXA", "FXC", "FXF",  # EUR, JPY, GBP, AUD, CAD, CHF
+    "UUP", "UDN",                                  # USD bull / bear
+    "CEW", "USDU",                                  # EM basket / USD index
+    "CYB", "CNY",                                   # China yuan
+    # --- Rate-Sensitive / Sovereign Bond ETFs ---
+    # These express rate differential views which drive FX
+    "BWX", "IGOV", "LEMB", "EMLC",                 # Intl + EM sovereign bonds
+    "TLT", "IEF", "SHY",                           # US rates (carry trades)
+    # --- EM Currency-Focused ETFs ---
+    "WIP", "PCY", "VWOB",                          # EM debt (currency exposure)
 ]
 
 CRYPTO_SEED: list[str] = [

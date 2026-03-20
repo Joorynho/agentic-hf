@@ -282,8 +282,16 @@ class CommoditiesPMAgent(BasePodAgent):
     def _apply_sizing_discipline(
         self, qty: float, symbol: str, side: Side,
         sizing: dict, cycle_notional_used: float,
+        conviction: float = 0.5,
     ) -> tuple[float, str]:
-        """Clamp trade qty to PM-level budget limits before sending to Risk."""
+        """Clamp trade qty to PM-level budget limits before sending to Risk.
+
+        Conviction-based position caps (enforced, not advisory):
+          conviction < 0.3  → max  5% NAV
+          conviction 0.3-0.5 → max 10% NAV
+          conviction 0.5-0.7 → max 15% NAV
+          conviction > 0.7  → max 20% NAV
+        """
         nav = sizing.get("pod_nav", 0)
         cash = sizing.get("available_cash", 0)
         if nav <= 0:
@@ -296,12 +304,22 @@ class CommoditiesPMAgent(BasePodAgent):
 
         notes = []
 
-        max_single_notional = nav * PM_MAX_SINGLE_TRADE_PCT
+        conviction = max(0.0, min(1.0, conviction))
+        if conviction < 0.3:
+            conv_cap = 0.05
+        elif conviction < 0.5:
+            conv_cap = 0.10
+        elif conviction < 0.7:
+            conv_cap = 0.15
+        else:
+            conv_cap = PM_MAX_SINGLE_TRADE_PCT
+
+        max_single_notional = nav * conv_cap
         if proposed_notional > max_single_notional:
             clamped_qty = math.floor(max_single_notional / est_price * 100) / 100
             if clamped_qty < 1 and est_price > max_single_notional:
                 clamped_qty = max_single_notional / est_price
-            notes.append(f"capped {qty:.2f}->{clamped_qty:.2f} (max {PM_MAX_SINGLE_TRADE_PCT*100:.0f}% NAV)")
+            notes.append(f"capped {qty:.2f}->{clamped_qty:.2f} (conv={conviction:.1f} → max {conv_cap*100:.0f}% NAV)")
             qty = clamped_qty
 
         if side == Side.BUY:
@@ -561,6 +579,7 @@ class CommoditiesPMAgent(BasePodAgent):
                 conviction = max(0.0, min(1.0, float(t.get("conviction", 0.5))))
                 qty, clamp_note = self._apply_sizing_discipline(
                     qty, symbol, side, sizing, cycle_notional_used,
+                    conviction=conviction,
                 )
                 if qty <= 0:
                     logger.info("[commodities.pm] Skipped %s %s: %s", action, symbol, clamp_note)
