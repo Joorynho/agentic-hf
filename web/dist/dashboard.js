@@ -876,6 +876,9 @@ function handleMessage(msg) {
     if (pod_id) {
       if (msg.type === 'pod_summary') {
         pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+        if (data.performance_metrics && Object.keys(data.performance_metrics).length > 0) {
+          pods[pod_id].performance_metrics = data.performance_metrics;
+        }
         var ptsEl = document.getElementById('price-ts');
         if (ptsEl) ptsEl.textContent = new Date().toLocaleTimeString();
         if (data.macro_regime) updateRegimeBadge(data.macro_regime);
@@ -1015,7 +1018,7 @@ function updatePodsTable() {
   document.getElementById('pod-badge').textContent = ids.length + ' pod' + (ids.length !== 1 ? 's' : '');
   const tbody = document.getElementById('pods-table');
   if (ids.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">Awaiting data…</div><div class="empty-hint">Start a trading session to see live metrics</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">Awaiting data…</div><div class="empty-hint">Start a trading session to see live metrics</div></td></tr>';
     return;
   }
   tbody.innerHTML = ids.map(id => {
@@ -1033,11 +1036,14 @@ function updatePodsTable() {
     const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
     const spark = makeSparkline(podNavSpark[id]);
     const navTitle = `Invested: $${invested.toFixed(2)} | Cash: $${cash.toFixed(2)}`;
+    var pm = pods[id] ? (pods[id].performance_metrics || {}) : {};
+    var sharpeStr = (pm.sharpe != null && pm.sharpe !== 0) ? Number(pm.sharpe).toFixed(2) : '—';
     return `<tr onclick="openDrilldown('${id}')" style="cursor:pointer" title="${navTitle}">
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r"><span title="${navTitle}">$${nav.toFixed(2)}</span></td>
       <td class="r">${spark}</td>
       <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r">${sharpeStr}</td>
       <td class="r"><span class="badge ${stCls}">${st}</span></td>
     </tr>`;
   }).join('');
@@ -1167,6 +1173,25 @@ function updateNavChart() {
   });
 }
 
+function getRealPerfMetrics() {
+  var sharpes = [], sortinos = [], dds = [], vols = [];
+  Object.values(pods).forEach(function(p) {
+    var pm = p.performance_metrics || {};
+    if (pm.sharpe != null && pm.sharpe !== 0) sharpes.push(pm.sharpe);
+    if (pm.sortino != null && pm.sortino !== 0) sortinos.push(pm.sortino);
+    if (pm.max_drawdown != null && pm.max_drawdown !== 0) dds.push(pm.max_drawdown);
+    if (pm.current_vol != null && pm.current_vol !== 0) vols.push(pm.current_vol);
+  });
+  if (sharpes.length === 0) return null;
+  var avg = function(arr) { return arr.reduce(function(a,b){return a+b;},0)/arr.length; };
+  return {
+    sharpe: avg(sharpes).toFixed(2),
+    sortino: sortinos.length > 0 ? avg(sortinos).toFixed(2) : null,
+    max_drawdown: dds.length > 0 ? Math.min.apply(null, dds) : null,
+    current_vol: vols.length > 0 ? avg(vols) : null,
+  };
+}
+
 function calculateMetrics() {
   if (navHistory.length < 2) return;
   const navs   = navHistory.map(h => h.firmNav);
@@ -1184,6 +1209,25 @@ function calculateMetrics() {
   ddEl.textContent = (dd * 100).toFixed(1) + '%';
   ddEl.className   = 'kpi-val ' + (dd < -0.05 ? 'neg' : '');
   document.getElementById('m-wr').textContent     = (wr * 100).toFixed(0) + '%';
+
+  // Override with real backend metrics when available (more accurate than frontend approximations)
+  var realM = getRealPerfMetrics();
+  if (realM) {
+    var sharpeEl = document.getElementById('m-sharpe');
+    if (sharpeEl) sharpeEl.textContent = realM.sharpe;
+    if (realM.sortino !== null) {
+      var sortEl = document.getElementById('m-sortino');
+      if (sortEl) sortEl.textContent = realM.sortino;
+    }
+    if (realM.max_drawdown !== null) {
+      var ddEl2 = document.getElementById('m-dd');
+      if (ddEl2) ddEl2.textContent = (realM.max_drawdown * 100).toFixed(1) + '%';
+    }
+    if (realM.current_vol !== null) {
+      var volEl = document.getElementById('m-vol');
+      if (volEl) volEl.textContent = (realM.current_vol * 100).toFixed(1) + '%';
+    }
+  }
 }
 
 function updatePerfTable() {
@@ -1195,11 +1239,14 @@ function updatePerfTable() {
     const sc  = d.starting_capital || (initialCapital / Math.max(Object.keys(pods).length, 1)) || 100;
     const ret = sc > 0 ? ((nav - sc) / sc * 100) : 0;
     const pnl = d.daily_pnl || 0;
+    var pm = d.performance_metrics || {};
+    var sharpeStr = (pm.sharpe != null && pm.sharpe !== 0) ? Number(pm.sharpe).toFixed(2) : '—';
     return `<tr>
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r">$${nav.toFixed(2)}</td>
       <td class="r ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</td>
       <td class="r ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r">${sharpeStr}</td>
     </tr>`;
   }).join('');
 }

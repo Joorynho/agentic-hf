@@ -134,9 +134,10 @@
               <th class="r">NAV</th>
               <th class="r">Trend</th>
               <th class="r">Daily P&amp;L</th>
+              <th class="r">Sharpe</th>
               <th class="r">Status</th>
             </tr></thead>
-            <tbody id="pods-table"><tr><td colspan="5" class="empty">
+            <tbody id="pods-table"><tr><td colspan="6" class="empty">
               <div class="empty-txt">Awaiting data…</div>
               <div class="empty-hint">Start a trading session to see live metrics</div>
             </td></tr></tbody>
@@ -204,6 +205,7 @@
       <div class="chart-wrap dd-chart-wrap"><canvas id="ddChart"></canvas></div>
       <div class="kpi-row">
         <div class="kpi"><div class="kpi-lbl">Sharpe</div><div class="kpi-val" id="m-sharpe">—</div></div>
+        <div class="kpi"><div class="kpi-lbl">Sortino</div><div class="kpi-val" id="m-sortino">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Volatility</div><div class="kpi-val" id="m-vol">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Max DD</div><div class="kpi-val" id="m-dd">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Win Rate</div><div class="kpi-val" id="m-wr">—</div></div>
@@ -213,9 +215,9 @@
         <div class="tbl-wrap">
           <table class="dtbl">
             <thead><tr>
-              <th>Pod</th><th class="r">NAV</th><th class="r">Return</th><th class="r">Daily P&amp;L</th>
+              <th>Pod</th><th class="r">NAV</th><th class="r">Return</th><th class="r">Daily P&amp;L</th><th class="r">Sharpe</th>
             </tr></thead>
-            <tbody id="perf-table"><tr><td colspan="4" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+            <tbody id="perf-table"><tr><td colspan="5" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
           </table>
         </div>
       </div>
