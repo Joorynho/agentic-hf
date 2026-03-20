@@ -359,12 +359,7 @@ function statusBadge(status) {
   return '<span class="status-pill ' + cls + '">' + escapeHtml(s) + '</span>';
 }
 
-function escapeHtml(s) {
-  if (!s) return '';
-  const d = document.createElement('div');
-  d.textContent = s;
-  return d.innerHTML;
-}
+// escapeHtml defined below (line 2547 declaration wins due to hoisting)
 
 function updateRegimeBadge(regimeLabel) {
   var badge = document.getElementById('regime-badge');
@@ -2545,7 +2540,13 @@ function renderOutcomeStats() {
 }
 
 function escapeHtml(text) {
-  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>');
+  if (text == null) return '';
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/\n/g, '<br>');
 }
 
 function loadSavedReports() {
