@@ -103,6 +103,7 @@ class FXPMAgent(BasePodAgent):
         super().__init__(agent_id=agent_id, pod_id=pod_id, namespace=namespace, bus=bus)
         self._session_logger = session_logger
         self._decision_history: list[dict] = []
+        self._pm_memory = None
 
     async def run_cycle(self, context: dict) -> dict:
         if context.get("risk_revision"):
@@ -311,6 +312,11 @@ class FXPMAgent(BasePodAgent):
         sections.append(f"\n## Current Positions\n  {positions}")
 
         user_content = "\n".join(sections)
+        mem = self._get_pm_memory()
+        if mem:
+            memory_block = mem.recall()
+            if memory_block:
+                user_content = memory_block + "\n\n" + user_content
         user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 FX ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
 
         try:
@@ -390,6 +396,18 @@ class FXPMAgent(BasePodAgent):
             })
             if len(self._decision_history) > 5:
                 self._decision_history = self._decision_history[-5:]
+
+            # Persist to DuckDB for cross-restart memory
+            pm_mem = self._get_pm_memory()
+            if pm_mem:
+                symbols = [t.get("symbol", "") for t in parsed_trades if t.get("symbol") and t.get("action", "HOLD") != "HOLD"]
+                if symbols:
+                    has_buy = any(t.get("action", "").upper() == "BUY" for t in parsed_trades)
+                    action_sum = f"{'BUY' if has_buy else 'SELL'} {', '.join(symbols[:5])}"
+                    try:
+                        pm_mem.record(action_sum, (response_text or "")[:300], symbols)
+                    except Exception:
+                        pass
 
             trades = parsed_trades
             if not trades:
@@ -593,6 +611,20 @@ class FXPMAgent(BasePodAgent):
             if pos and pos.current_price > 0:
                 return pos.current_price
         return 100.0
+
+    def _get_pm_memory(self):
+        """Lazily initialize PMMemory from the namespace audit_log. Returns None if unavailable."""
+        if self._pm_memory is not None:
+            return self._pm_memory
+        try:
+            from src.core.pm_memory import PMMemory
+            audit_log = self._ns.get("audit_log")
+            if audit_log is None:
+                return None
+            self._pm_memory = PMMemory(self._pod_id, audit_log)
+            return self._pm_memory
+        except Exception:
+            return None
 
     def _rule_based_decision(self, features: dict) -> dict:
         logger.debug("[fx.pm] Rule-based: HOLD (no LLM key)")

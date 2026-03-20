@@ -297,6 +297,9 @@ class SessionManager:
                 # Create PodNamespace (isolated state store)
                 namespace = PodNamespace(pod_id)
 
+                # Expose audit_log to pod namespace so PM agents can persist decisions
+                namespace.set("audit_log", self._audit_log)
+
                 # Create PortfolioAccountant for this pod
                 accountant = PortfolioAccountant(pod_id=pod_id, initial_nav=capital_per_pod)
                 namespace.set("accountant", accountant)
