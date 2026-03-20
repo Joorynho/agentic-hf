@@ -157,6 +157,7 @@ def compute_macro_score(
     news_count: int = 0,
     social_count: int = 0,
     poly_sentiment_override: float | None = None,
+    source_weights: dict | None = None,
 ) -> dict:
     """Compute the full macro regime score and sub-components.
 
@@ -166,6 +167,10 @@ def compute_macro_score(
 
     If poly_sentiment_override is provided (e.g. from LLM scoring),
     it replaces the keyword-based compute_poly_score result.
+
+    source_weights: optional dict with keys "fred", "poly", "news" summing to 1.0.
+    When provided (e.g. from SourceAttributor.weights()), replaces the default
+    50/30/20 split. Callers that omit this kwarg continue using the defaults.
     """
     fred_score = compute_fred_score(fred_snapshot)
     if poly_sentiment_override is not None:
@@ -182,13 +187,19 @@ def compute_macro_score(
             [0.0] * news_count, [0.0] * social_count
         )
 
-    # Weighted blend: hard data 50%, market expectations 30%, news sentiment 20%
+    # Weighted blend: default hard data 50%, market expectations 30%, news 20%.
+    # source_weights overrides these defaults when SourceAttributor has enough data.
+    w = source_weights or {}
+    w_fred = w.get("fred", 0.50)
+    w_poly = w.get("poly", 0.30)
+    w_news = w.get("news", 0.20)
+
     available = []
     if fred_snapshot:
-        available.append((0.50, fred_score))
+        available.append((w_fred, fred_score))
     if poly_signals:
-        available.append((0.30, poly_score))
-    available.append((0.20, news_score))
+        available.append((w_poly, poly_score))
+    available.append((w_news, news_score))
 
     if available:
         total_weight = sum(w for w, _ in available)

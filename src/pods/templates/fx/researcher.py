@@ -163,7 +163,12 @@ class FXResearcher(BasePodAgent):
         poly_sents = [p.get("sentiment", 0.0) for p in scored_preds]
         poly_override = sum(poly_sents) / len(poly_sents) if poly_sents else None
 
-        regime = compute_macro_score(fred_snapshot, poly_signals, news_sents, social_sents, poly_sentiment_override=poly_override)
+        source_weights = self.recall("source_weights")
+        regime = compute_macro_score(
+            fred_snapshot, poly_signals, news_sents, social_sents,
+            poly_sentiment_override=poly_override,
+            source_weights=source_weights,
+        )
         for key, val in regime.items():
             self.store(key, val)
         self.store("researcher_ok", True)

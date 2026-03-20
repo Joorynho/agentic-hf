@@ -193,6 +193,11 @@ class SessionManager:
         # Intraday position monitor
         self._position_monitor = PositionMonitor()
 
+        # Source attribution: tracks per-source (FRED/Poly/News) win rates to
+        # dynamically adjust macro score weights over time.
+        from src.core.source_attribution import SourceAttributor
+        self._source_attributors: dict[str, SourceAttributor] = {}
+
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
     def set_web_app(self, app) -> None:
@@ -416,6 +421,11 @@ class SessionManager:
                     "[session_manager] Pod %s initialized: capital=$%.2f, agents=6",
                     pod_id, capital_per_pod,
                 )
+
+            # Initialize one SourceAttributor per pod (reset on session restart)
+            from src.core.source_attribution import SourceAttributor
+            self._source_attributors = {pod_id: SourceAttributor() for pod_id in self._pod_runtimes}
+            logger.info("[session_manager] SourceAttributors initialized for %d pods", len(self._source_attributors))
 
             # Initialize governance orchestrator with CEO, CIO, CRO agents
             ceo = CEOAgent(bus=self._event_bus, session_logger=self._session_logger)
@@ -773,6 +783,23 @@ class SessionManager:
                         except Exception as e:
                             logger.warning("[session_manager] [iter %d] Pod %s agent cycle failed: %s",
                                           self._iteration, pod_id, e)
+
+                    # 3.5 Ingest closed trades into SourceAttributors and store
+                    # dynamic source weights in each pod namespace for researcher use.
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        attr = self._source_attributors.get(pod_id)
+                        if attr:
+                            try:
+                                closed = runtime._accountant.closed_trades
+                                if closed:
+                                    attr.ingest_batch(closed)
+                                    runtime._ns.set("source_weights", attr.weights())
+                                    logger.debug(
+                                        "[session_manager] [iter %d] %s source weights updated: %s",
+                                        self._iteration, pod_id, attr.weights(),
+                                    )
+                            except Exception as e:
+                                logger.debug("[session_manager] source attribution update failed for %s: %s", pod_id, e)
 
                     # 4. Collect pod summaries for governance and emission
                     pod_summaries = await self._collect_pod_summaries()
