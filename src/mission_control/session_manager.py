@@ -23,6 +23,7 @@ from src.agents.risk.cro_agent import CROAgent
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.position_monitor import PositionMonitor
+from src.core.position_aging import check_aging
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
 from src.data.adapters.fred_adapter import FredAdapter
@@ -825,6 +826,37 @@ class SessionManager:
                     # 5.5. Update web server state with latest summaries
                     if self._enable_web_server or self._web_app:
                         await self._update_web_state(pod_summaries)
+
+                    # 5.6. Position aging enforcement — store alerts in namespace for PM next cycle
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        try:
+                            aging_alerts = check_aging(runtime._accountant)
+                            if aging_alerts:
+                                # Store in namespace for PM to pick up on next cycle
+                                runtime._ns.set("aging_alerts", aging_alerts)
+                                # Emit to EventBus for Intelligence Feed
+                                for alert in aging_alerts:
+                                    await self._event_bus.publish(
+                                        topic=f"pod.{pod_id}.gateway",
+                                        payload={
+                                            "type": "position_aging_alert",
+                                            "action": "position_aging_alert",
+                                            "pod_id": pod_id,
+                                            "symbol": alert["symbol"],
+                                            "days_held": alert["days_held"],
+                                            "max_hold_days": alert["max_hold_days"],
+                                            "detail": (
+                                                f"{alert['symbol']} held {alert['days_held']}d "
+                                                f"(max {alert['max_hold_days']}d) — thesis reassessment required"
+                                            ),
+                                            "summary": f"Aging: {alert['symbol']} ({alert['days_held']}d)",
+                                        }
+                                    )
+                            else:
+                                # Clear stale aging alerts when no positions are overdue
+                                runtime._ns.delete("aging_alerts")
+                        except Exception as e:
+                            logger.debug("[session_manager] aging check error %s: %s", pod_id, e)
 
                     # 6. Every N iterations: run governance cycle
                     if self._iteration > 0 and self._iteration % governance_freq == 0:

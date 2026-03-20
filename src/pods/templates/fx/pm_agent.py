@@ -319,6 +319,22 @@ class FXPMAgent(BasePodAgent):
                 user_content = memory_block + "\n\n" + user_content
         user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 FX ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
 
+        aging_alerts = self._ns.get("aging_alerts") or []
+        if aging_alerts:
+            accountant = self._ns.get("accountant")
+            held = set(accountant._positions.keys()) if accountant and isinstance(getattr(accountant, "_positions", None), dict) else set()
+            relevant = [a for a in aging_alerts if a.get("symbol") in held] if held else aging_alerts
+            if relevant:
+                aging_lines = "\n".join(
+                    f"  \u26a0 {a['symbol']}: held {a['days_held']}d / max {a['max_hold_days']}d"
+                    f" \u2014 ASSESS THESIS VALIDITY. Propose exit if thesis is stale."
+                    for a in relevant
+                )
+                user_content = (
+                    f"POSITION AGING ALERTS \u2014 mandatory reassessment:\n{aging_lines}\n\n"
+                    + user_content
+                )
+
         try:
             raw = llm_chat(
                 [
