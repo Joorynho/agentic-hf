@@ -540,6 +540,23 @@ class CommoditiesPMAgent(BasePodAgent):
                     + user_content
                 )
 
+        # Inject CIO capital reallocation directives if present
+        trim_target = self._ns.get("trim_target_capital")
+        growth_target = self._ns.get("growth_target_capital")
+        invested = getattr(self._accountant, "invested", 0.0) if hasattr(self, "_accountant") else 0.0
+        if trim_target and invested > 0:
+            user_content = (
+                f"CAPITAL REALLOCATION DIRECTIVE: CIO has reduced your capital allocation. "
+                f"Target capital: ${trim_target:.0f}. Reduce position sizes accordingly — "
+                f"prioritize exiting weakest-thesis positions first.\n\n"
+            ) + user_content
+        elif growth_target:
+            user_content = (
+                f"CAPITAL REALLOCATION DIRECTIVE: CIO has increased your capital allocation. "
+                f"Target capital: ${growth_target:.0f}. Consider deploying additional capital "
+                f"into highest-conviction opportunities.\n\n"
+            ) + user_content
+
         try:
             held_symbols = list(self._ns.get("accountant")._positions.keys()) if (
                 self._ns.get("accountant") and isinstance(

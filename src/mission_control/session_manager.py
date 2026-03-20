@@ -17,6 +17,7 @@ load_dotenv(str(_env_path))
 
 from src.agents.ceo.ceo_agent import CEOAgent
 from src.agents.cio.cio_agent import CIOAgent
+from src.agents.cio.pod_scorer import score_pod
 from src.agents.governance.governance_orchestrator import GovernanceOrchestrator
 from src.agents.governance.position_reviewer import PositionReviewer
 from src.agents.risk.cro_agent import CROAgent
@@ -998,6 +999,9 @@ class SessionManager:
                             except Exception:
                                 pass
 
+                            # Run capital reallocation after governance
+                            await self._maybe_rebalance_capital(pod_summaries)
+
                         except Exception as e:
                             logger.error(
                                 "[session_manager] [iter %d] Governance cycle failed: %s",
@@ -1401,6 +1405,68 @@ class SessionManager:
                     f"action={v.get('action', 'holding')}"
                 )
             runtime._ns.set("firm_memo", "\n".join(lines))
+
+    async def _maybe_rebalance_capital(self, pod_summaries: dict) -> None:
+        """Run after governance cycle — rebalance capital based on pod performance scores."""
+        try:
+            # Score all pods
+            pod_scores = {}
+            for pod_id, summary in pod_summaries.items():
+                perf  = (getattr(summary, "performance_metrics", None) or {})
+                stats = (getattr(summary, "trade_outcome_stats",  None) or {})
+                if isinstance(perf, dict) and isinstance(stats, dict):
+                    pod_scores[pod_id] = score_pod(pod_id, perf, stats).score
+
+            if not pod_scores or not self._capital_allocator:
+                return
+
+            # Suggest new allocations
+            new_allocs = self._capital_allocator.suggest_reallocation(pod_scores)
+            firm_nav = sum(
+                (s.risk_metrics.nav if (s.risk_metrics and s.risk_metrics.nav) else 0.0)
+                for s in pod_summaries.values()
+            )
+            if firm_nav <= 0:
+                return
+
+            # Apply: transfer available cash, set trim/growth targets
+            for pod_id, new_pct in new_allocs.items():
+                runtime = self._pod_runtimes.get(pod_id)
+                if not runtime:
+                    continue
+                target_capital = new_pct * firm_nav
+                current_summary = pod_summaries.get(pod_id, None)
+                current_nav = current_summary.risk_metrics.nav if (current_summary and current_summary.risk_metrics) else 0.0
+                delta = target_capital - current_nav
+
+                if delta < -10.0:
+                    # Pod needs to shrink — transfer available cash, mark trim target
+                    available_cash = getattr(runtime._accountant, "_cash", 0.0)
+                    transfer = min(available_cash, abs(delta))
+                    if transfer > 1.0:
+                        runtime._accountant._cash -= transfer
+                        logger.info("[realloc] %s -> trim $%.2f (target $%.2f)", pod_id, transfer, target_capital)
+                    runtime._ns.set("trim_target_capital", round(target_capital, 2))
+                    # Clear any stale growth target
+                    runtime._ns.delete("growth_target_capital")
+
+                elif delta > 10.0:
+                    # Pod should grow — mark growth target
+                    runtime._ns.set("growth_target_capital", round(target_capital, 2))
+                    # Clear any stale trim target
+                    runtime._ns.delete("trim_target_capital")
+                    logger.info("[realloc] %s -> grow target $%.2f (delta +$%.2f)", pod_id, target_capital, delta)
+                else:
+                    # Within tolerance — clear any stale directives
+                    runtime._ns.delete("trim_target_capital")
+                    runtime._ns.delete("growth_target_capital")
+
+            # Update allocator percentages
+            self._capital_allocator._allocations.update(new_allocs)
+            logger.info("[realloc] Capital reallocation applied: %s", new_allocs)
+
+        except Exception as e:
+            logger.warning("[session_manager] reallocation error: %s", e)
 
     async def _reconcile_positions(self) -> None:
         """Compare Alpaca positions against per-pod accountant positions.

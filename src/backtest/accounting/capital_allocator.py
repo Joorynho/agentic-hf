@@ -94,6 +94,41 @@ class CapitalAllocator:
 
         logger.info("Allocation applied: %s", {r.pod_id: r.new_pct for r in records})
 
+    def suggest_reallocation(
+        self,
+        pod_scores: dict[str, float],   # pod_id -> 0-1 score
+        min_pct: float = 0.10,           # floor per pod (10%)
+    ) -> dict[str, float]:
+        """
+        Returns new allocation percentages based on scores.
+        Higher score -> higher allocation. All pods guaranteed >= min_pct.
+        Sums to 1.0.
+        """
+        if not pod_scores:
+            return dict(self._allocations)
+
+        pods = list(pod_scores.keys())
+
+        # Iteratively apply floor: clamp then renormalize until stable
+        weights = {p: pod_scores[p] for p in pods}
+        for _ in range(len(pods) + 1):
+            total = sum(weights.values()) or 1.0
+            normed = {p: weights[p] / total for p in pods}
+            # Check if any pod falls below the floor
+            clamped = {p: max(min_pct, normed[p]) for p in pods}
+            clamped_total = sum(clamped.values())
+            result = {p: round(v / clamped_total, 4) for p, v in clamped.items()}
+            # If the floor constraint is already satisfied, we're done
+            if all(v >= min_pct - 1e-9 for v in result.values()):
+                return result
+            # Otherwise update weights with clamped values and re-iterate
+            weights = clamped
+        return result
+
+    def compute_target_capitals(self, firm_nav: float) -> dict[str, float]:
+        """Returns {pod_id: target_capital_$} from current allocation percentages."""
+        return {pod: round(pct * firm_nav, 2) for pod, pct in self._allocations.items()}
+
     def propose_equal_weight(self, authorized_by: str = "cio_rule_based") -> list[AllocationRecord]:
         """Return equal-weight AllocationRecords for all pods."""
         n = len(self._allocations)
