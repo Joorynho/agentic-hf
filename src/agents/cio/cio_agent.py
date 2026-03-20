@@ -4,6 +4,7 @@ import json
 import logging
 from datetime import datetime, timezone
 
+from src.agents.cio.pod_scorer import score_pod, format_scorecard
 from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.core.bus.event_bus import EventBus
 from src.core.llm import has_llm_key, llm_chat, extract_json
@@ -167,6 +168,35 @@ class CIOAgent:
                     lines.append(f"  WARNING: {conflict}")
         return "\n".join(lines)
 
+    def _build_scorecard(self, pod_summaries=None) -> str:
+        """Build quantitative scorecard (25% weight in CIO decisions).
+
+        Accepts either a collection of PodSummary objects or falls back to
+        the pod intelligence briefs already loaded via set_pod_intelligence.
+        """
+        scores = []
+
+        if pod_summaries is not None:
+            items = pod_summaries.values() if isinstance(pod_summaries, dict) else pod_summaries
+            for summary in items:
+                pod_id = summary.pod_id
+                perf   = getattr(summary, "performance_metrics", None) or {}
+                stats  = getattr(summary, "trade_outcome_stats",  None) or {}
+                if isinstance(perf, dict) and isinstance(stats, dict):
+                    scores.append(score_pod(pod_id, perf, stats))
+        elif self._pod_intelligence:
+            # Governance path: derive scores from injected intelligence briefs
+            for pod_id, brief in self._pod_intelligence.items():
+                perf  = brief.get("performance_metrics") or {}
+                # trade_outcome_stats may be stored directly or inside "performance"
+                stats = brief.get("trade_outcome_stats") or brief.get("performance") or {}
+                if isinstance(perf, dict) and isinstance(stats, dict):
+                    scores.append(score_pod(pod_id, perf, stats))
+
+        if not scores:
+            return ""
+        return format_scorecard(scores)
+
     async def _llm_governance_response(self, msg: AgentMessage, history: list[AgentMessage] | None = None) -> AgentMessage | None:
         """LLM-powered governance deliberation with intelligence context."""
         transcript = ""
@@ -190,7 +220,11 @@ class CIOAgent:
             "Reference specific pod data and signals when justifying allocation shifts."
         )
 
-        user_prompt = f"## Current Allocations\n{current_allocs}\n\n"
+        scorecard = self._build_scorecard()
+        user_prompt = ""
+        if scorecard:
+            user_prompt += f"{scorecard}\n\n"
+        user_prompt += f"## Current Allocations\n{current_allocs}\n\n"
         if intel_brief:
             user_prompt += f"{intel_brief}\n\n"
         if transcript:
@@ -272,7 +306,11 @@ class CIOAgent:
                 for s in items
             )
             intel_brief = self._format_intelligence_brief()
-            prompt = (
+            scorecard = self._build_scorecard(pod_summaries)
+            prompt = ""
+            if scorecard:
+                prompt += f"{scorecard}\n\n"
+            prompt += (
                 "You are the CIO of an algorithmic hedge fund. "
                 f"CEO narrative: {ceo_narrative}\n"
                 f"Pod summaries:\n{summaries_text}\n"
