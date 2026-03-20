@@ -155,6 +155,9 @@ class EventBusListener:
                 payload["es_95"] = rm.get("es_95_1d", 0)
                 payload["current_positions"] = payload.get("positions", payload.get("current_positions", []))
                 payload["exposure_buckets"] = payload.get("exposure_buckets", [])
+                payload["macro_regime"] = payload.get("macro_regime")
+                payload["performance_metrics"] = payload.get("performance_metrics", {})
+                payload["trade_outcome_stats"] = payload.get("trade_outcome_stats", {})
 
             broadcast_data = {
                 "type": "pod_summary" if is_full_summary else "pod_enrichment",
