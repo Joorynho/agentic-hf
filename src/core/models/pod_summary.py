@@ -43,6 +43,9 @@ class PodSummary(BaseModel):
     heartbeat_ok: bool
     positions: list[PodPosition] = Field(default_factory=list)  # Real open positions from PortfolioAccountant
     error_message: str | None = None
+    macro_regime: str | None = None          # "risk_on" | "neutral" | "risk_off" | "crisis"
+    performance_metrics: dict = Field(default_factory=dict)   # sharpe, sortino, max_drawdown, current_vol, total_return_pct
+    trade_outcome_stats: dict = Field(default_factory=dict)   # total_trades, win_rate, avg_pnl, total_pnl, avg_winner, avg_loser
 
     @property
     def nav(self) -> float:
