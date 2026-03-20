@@ -889,6 +889,29 @@ function handleMessage(msg) {
       } else {
         // Enrichment: only merge research keys, never clobber core metrics
         if (!pods[pod_id]) pods[pod_id] = {};
+        // Handle headline_alert events routed through pod gateway
+        if (data.type === 'headline_alert') {
+          var alertSym = data.symbol;
+          if (alertSym) {
+            if (!_symbolAlerts[alertSym]) _symbolAlerts[alertSym] = [];
+            _symbolAlerts[alertSym].unshift({
+              headline: data.headline || '',
+              sentiment: data.sentiment || 0,
+              ts: new Date().toISOString(),
+              pod_id: data.pod_id || pod_id || ''
+            });
+            if (_symbolAlerts[alertSym].length > 3) _symbolAlerts[alertSym] = _symbolAlerts[alertSym].slice(0, 3);
+            updateTopHoldings();
+            addFeedEntry({
+              type: 'headline_alert',
+              pod_id: data.pod_id || pod_id,
+              detail: data.detail || data.headline,
+              summary: data.summary || ('Alert: ' + alertSym),
+              ts: new Date().toISOString()
+            });
+          }
+          return;
+        }
         var enrichKeys = ['polymarket_signals','polymarket_confidence','macro_score','fred_snapshot','fred_score','poly_sentiment','social_score','x_feed','x_tweet_count','news_last_refresh','features','pod_id'];
         for (var ek = 0; ek < enrichKeys.length; ek++) {
           if (data[enrichKeys[ek]] !== undefined) pods[pod_id][enrichKeys[ek]] = data[enrichKeys[ek]];
@@ -1497,9 +1520,13 @@ function updateTopHoldings() {
     var entryDate = escapeHtml(p.entry_date || '—');
     var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
     var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
+    var alertInfo = _symbolAlerts[p.symbol || ''];
+    var alertBadge = (alertInfo && alertInfo.length > 0)
+      ? '<span class="alert-badge" title="' + escapeHtml(alertInfo[0].headline) + '">!</span>'
+      : '';
     return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for details">' +
       '<td class="pod-name">' + podEsc.toUpperCase() + '</td>' +
-      '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
+      '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + alertBadge + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
       '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
       '<td class="r">$' + entry.toFixed(2) + '</td>' +
       '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
@@ -1877,6 +1904,23 @@ function toggleTlDetail(cardId) {
   detail.style.display = isHidden ? 'block' : 'none';
   var arrow = card.querySelector('.tl-expand');
   if (arrow) arrow.innerHTML = isHidden ? '&#9650;' : '&#9660;';
+}
+
+// ─── 14b. Feed Entry Helper ─────────────────────────────────────────────────
+function addFeedEntry(entry) {
+  // entry: {type, pod_id, detail, summary, ts}
+  var feedItem = {
+    agent_id: (entry.pod_id || 'system') + '_researcher',
+    agent_role: entry.type === 'headline_alert' ? 'Researcher' : 'System',
+    pod_id: entry.pod_id || '',
+    action: entry.type || 'alert',
+    summary: entry.summary || '',
+    detail: entry.detail || '',
+    ts: entry.ts || new Date().toISOString()
+  };
+  activityFeed.unshift(feedItem);
+  if (activityFeed.length > 50) activityFeed.pop();
+  updateActivityFeed();
 }
 
 // ─── 15. Activity Feed ─────────────────────────────────────────────────────

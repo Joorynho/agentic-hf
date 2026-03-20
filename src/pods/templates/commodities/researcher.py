@@ -8,7 +8,7 @@ from src.core.config.universes import COMMODITIES_SEED
 from src.core.models.messages import AgentMessage
 from src.core.scoring import compute_macro_score
 from src.data.adapters.fred_adapter import FredAdapter
-from src.data.adapters.sentiment import score_items
+from src.data.adapters.sentiment import score_items, find_position_alerts
 from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.data.adapters.market_tracker import MarketTracker
 from src.data.adapters.rss_adapter import RssAdapter
@@ -156,6 +156,34 @@ class CommoditiesResearcher(BasePodAgent):
 
         pred_dicts = [{"question": s.get("question", s.get("market", "?")), "probability": s.get("implied_prob", 0.5)} for s in poly_signals[:10]]
         scored_headlines, scored_preds = score_items(headline_dicts, pred_dicts, "commodities")
+
+        # Headline alerts: cross-check scored headlines against held positions
+        try:
+            accountant = self._ns.get("accountant")
+            held_symbols = set(accountant._positions.keys()) if accountant else set()
+        except Exception:
+            held_symbols = set()
+        if held_symbols and scored_headlines:
+            alert_items = [{**h, "text": h.get("title", "")} for h in scored_headlines]
+            alerts = find_position_alerts(alert_items, held_symbols)
+            for alert in alerts:
+                try:
+                    await self._bus.publish(
+                        topic=f"pod.{self._pod_id}.gateway",
+                        payload={
+                            "type": "headline_alert",
+                            "action": "headline_alert",
+                            "pod_id": self._pod_id,
+                            "symbol": alert["matched_symbol"],
+                            "headline": (alert.get("text") or alert.get("title") or "")[:200],
+                            "sentiment": round(alert.get("sentiment") or 0.0, 2),
+                            "relevancy": round(alert.get("relevancy") or 0.0, 2),
+                            "detail": f"[ALERT] {alert['matched_symbol']}: {(alert.get('text') or alert.get('title') or '')[:150]}",
+                            "summary": f"Headline alert: {alert['matched_symbol']}",
+                        }
+                    )
+                except Exception as e:
+                    logger.debug("[%s] headline alert publish error: %s", self._pod_id, e)
 
         news_sents = [h.get("sentiment", 0.0) for h in scored_headlines]
         social_sents = []

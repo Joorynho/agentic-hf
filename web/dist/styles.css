@@ -1882,3 +1882,22 @@ button { font-family: inherit; cursor: pointer; }
 }
 .outcome-stat-val.pos { color:var(--green,#00d68f); }
 .outcome-stat-val.neg { color:var(--red,#e84040); }
+
+/* Headline alert badge */
+.alert-badge {
+  display: inline-block;
+  background: #e84040;
+  color: #fff;
+  font-size: 8px;
+  font-weight: 700;
+  padding: 1px 4px;
+  border-radius: 3px;
+  margin-left: 5px;
+  vertical-align: middle;
+  cursor: help;
+  animation: alertPulse 1.5s ease-in-out 3;
+}
+@keyframes alertPulse {
+  0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(232,64,64,0.4); }
+  50% { opacity: 0.8; box-shadow: 0 0 0 4px rgba(232,64,64,0); }
+}

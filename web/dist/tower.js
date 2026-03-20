@@ -23,6 +23,7 @@ var newsLastRefresh = null;
 var newsLastRefresh = null;
 var agentActivity = {};
 var activityFeed = [];
+var _symbolAlerts = {};  // symbol -> [{headline, sentiment, ts, pod_id}]
 var podNavSpark = {};
 var ddChart = null;
 var initialCapital = 0;

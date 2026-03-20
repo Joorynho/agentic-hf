@@ -292,3 +292,29 @@ def score_items(
             p["sentiment_label"] = sentiment_label(s["sentiment"])
 
     return headlines, predictions
+
+
+def find_position_alerts(
+    scored_items: list[dict],
+    held_symbols: set[str],
+    relevancy_threshold: float = 0.70,
+) -> list[dict]:
+    """
+    Cross-check scored headlines/predictions against held positions.
+    Returns items where relevancy >= threshold AND text mentions a held symbol.
+    scored_items: list of dicts with at least {text, relevancy} keys.
+    """
+    alerts = []
+    for item in scored_items:
+        if (item.get("relevancy") or 0) < relevancy_threshold:
+            continue
+        text_upper = (item.get("text") or item.get("headline") or "").upper()
+        if not text_upper:
+            continue
+        for sym in held_symbols:
+            # Match ticker symbol in text (word boundary check)
+            sym_upper = sym.upper().replace("-USD", "").replace("/", "")
+            if sym_upper and sym_upper in text_upper:
+                alerts.append({**item, "matched_symbol": sym})
+                break
+    return alerts
