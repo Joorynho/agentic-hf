@@ -29,13 +29,31 @@ def test_empty_recall(audit_log):
     mem = PMMemory("equities", audit_log)
     assert mem.recall() == ""
 
+def test_outcome_not_overwritten(audit_log):
+    mem = PMMemory("equities", audit_log)
+    mem.record("BUY AAPL", "Strong momentum", ["AAPL"])
+    mem.mark_outcome("AAPL", "win")
+    mem.mark_outcome("AAPL", "loss")  # should NOT overwrite — already closed
+    result = mem.recall()
+    assert "win" in result
+    assert "loss" not in result
+
+
 def test_multiple_pods_isolated(audit_log):
-    mem_eq = PMMemory("equities", audit_log)
-    mem_cr = PMMemory("crypto", audit_log)
-    mem_eq.record("BUY AAPL", "equity play", ["AAPL"])
-    mem_cr.record("BUY BTC-USD", "crypto rally", ["BTC-USD"])
-    eq_recall = mem_eq.recall()
-    cr_recall = mem_cr.recall()
-    assert "AAPL" in eq_recall
-    assert "AAPL" not in cr_recall
-    assert "BTC-USD" in cr_recall
+    pods = ["equities", "crypto", "fx", "commodities"]
+    memories = {p: PMMemory(p, audit_log) for p in pods}
+
+    memories["equities"].record("BUY AAPL", "equity play", ["AAPL"])
+    memories["crypto"].record("BUY BTC-USD", "crypto rally", ["BTC-USD"])
+    memories["fx"].record("BUY EUR/USD", "fx move", ["EUR/USD"])
+    memories["commodities"].record("BUY OIH", "oil demand", ["OIH"])
+
+    eq_recall = memories["equities"].recall()
+    cr_recall = memories["crypto"].recall()
+    fx_recall = memories["fx"].recall()
+    co_recall = memories["commodities"].recall()
+
+    assert "AAPL" in eq_recall and "BTC-USD" not in eq_recall
+    assert "BTC-USD" in cr_recall and "AAPL" not in cr_recall
+    assert "EUR/USD" in fx_recall and "AAPL" not in fx_recall
+    assert "OIH" in co_recall and "BTC-USD" not in co_recall
