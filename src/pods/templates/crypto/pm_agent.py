@@ -368,6 +368,28 @@ class CryptoPMAgent(BasePodAgent):
         except Exception:
             return None
 
+    def _get_multiframe_fetch_fn(self):
+        """Return a sync fetch_fn(symbol, days) -> list[Bar] using YFinanceAdapter + ParquetCache.
+        Returns None if the adapter cannot be initialised."""
+        try:
+            import os
+            from datetime import date, timedelta
+            from src.data.adapters.yfinance_adapter import YFinanceAdapter
+            from src.data.cache.parquet_cache import ParquetCache
+            cache_dir = os.path.join(os.path.dirname(__file__), "../../../../.cache/multiframe")
+            cache = ParquetCache(os.path.normpath(cache_dir))
+            adapter = YFinanceAdapter(cache)
+
+            def fetch_fn(symbol: str, days: int):
+                end = date.today()
+                start = end - timedelta(days=days + 10)  # buffer for weekends/holidays
+                return adapter._fetch_sync(symbol, start, end)
+
+            return fetch_fn
+        except Exception as e:
+            logger.debug("[%s] multiframe adapter init failed: %s", self._pod_id, e)
+            return None
+
     def _rule_based_decision(self, features: dict) -> dict:
         logger.debug("[crypto.pm] Rule-based: HOLD (no LLM key)")
         self.store("last_pm_decision", {
@@ -518,6 +540,27 @@ class CryptoPMAgent(BasePodAgent):
                     f"POSITION AGING ALERTS \u2014 mandatory reassessment:\n{aging_lines}\n\n"
                     + user_content
                 )
+
+        try:
+            held_symbols = list(self._ns.get("accountant")._positions.keys()) if (
+                self._ns.get("accountant") and isinstance(
+                    getattr(self._ns.get("accountant"), "_positions", None), dict
+                )
+            ) else []
+        except Exception:
+            held_symbols = []
+
+        if held_symbols:
+            try:
+                from src.data.adapters.multiframe import compute_multiframe, format_multiframe_block
+                fetch_fn = self._get_multiframe_fetch_fn()
+                if fetch_fn is not None:
+                    mf_data = compute_multiframe(held_symbols, fetch_fn)
+                    mf_block = format_multiframe_block(mf_data)
+                    if mf_block:
+                        user_content = mf_block + "\n\n" + user_content
+            except Exception as e:
+                logger.debug("[%s] multiframe fetch error: %s", self._pod_id, e)
 
         try:
             raw = llm_chat(
