@@ -64,6 +64,17 @@ class TradeOutcomeTracker:
             s["win_rate"] = s["wins"] / s["trades"] if s["trades"] > 0 else 0.0
         return stats
 
+    def to_dict(self) -> dict:
+        """Return aggregate stats as a JSON-serialisable dict for dashboard broadcast."""
+        return {
+            "total_trades": self.total_trades,
+            "win_rate": round(self.win_rate, 3),
+            "avg_pnl": round(self.avg_pnl, 2),
+            "total_pnl": round(self.total_pnl, 2),
+            "avg_winner": round(self.avg_winner, 2),
+            "avg_loser": round(self.avg_loser, 2),
+        }
+
     def format_for_prompt(self, max_recent: int = 5) -> str:
         """Format trade track record for PM prompt injection."""
         if not self._trades:
