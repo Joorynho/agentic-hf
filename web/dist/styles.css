@@ -1859,3 +1859,26 @@ button { font-family: inherit; cursor: pointer; }
 .regime-neutral  { color: var(--text-dim, #8899aa); background: rgba(136,153,170,0.08); }
 .regime-risk-off { color: #f0a500; background: rgba(240,165,0,0.08); }
 .regime-crisis   { color: var(--red, #e84040); background: rgba(232,64,64,0.08); animation: blink 1.5s ease-in-out infinite; }
+
+/* ── Trade Outcome Stats ─────────────────────────────────────────────── */
+.outcome-grid { display:flex; flex-direction:column; gap:8px; }
+.outcome-pod-card {
+  background:var(--card); border:1px solid var(--border);
+  border-radius:5px; padding:10px 14px;
+}
+.outcome-pod-label {
+  font-size:9px; font-weight:700; letter-spacing:1.2px;
+  color:var(--cyan); text-transform:uppercase; margin-bottom:8px;
+}
+.outcome-stats-row { display:flex; gap:20px; flex-wrap:wrap; }
+.outcome-stat { display:flex; flex-direction:column; gap:2px; }
+.outcome-stat-lbl {
+  font-size:9px; color:var(--text-muted);
+  letter-spacing:0.8px; text-transform:uppercase;
+}
+.outcome-stat-val {
+  font-family:var(--font-mono); font-size:14px; color:#fff;
+  font-variant-numeric:tabular-nums;
+}
+.outcome-stat-val.pos { color:var(--green,#00d68f); }
+.outcome-stat-val.neg { color:var(--red,#e84040); }

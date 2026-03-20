@@ -879,6 +879,10 @@ function handleMessage(msg) {
         if (data.performance_metrics && Object.keys(data.performance_metrics).length > 0) {
           pods[pod_id].performance_metrics = data.performance_metrics;
         }
+        if (data.trade_outcome_stats && data.trade_outcome_stats.total_trades > 0) {
+          pods[pod_id].trade_outcome_stats = data.trade_outcome_stats;
+          renderOutcomeStats();
+        }
         var ptsEl = document.getElementById('price-ts');
         if (ptsEl) ptsEl.textContent = new Date().toLocaleTimeString();
         if (data.macro_regime) updateRegimeBadge(data.macro_regime);
@@ -2447,6 +2451,53 @@ function renderReviewHistory() {
 function toggleRhEntry(bodyId) {
   var el = document.getElementById(bodyId);
   if (el) el.classList.toggle('open');
+}
+
+function renderOutcomeStats() {
+  var container = document.getElementById('outcome-grid');
+  var badge = document.getElementById('outcomes-total-badge');
+  if (!container) return;
+
+  var podIds = Object.keys(pods).filter(function(pid) {
+    var s = pods[pid].trade_outcome_stats || {};
+    return s.total_trades > 0;
+  });
+
+  var totalTrades = podIds.reduce(function(sum, pid) {
+    return sum + ((pods[pid].trade_outcome_stats || {}).total_trades || 0);
+  }, 0);
+  if (badge) badge.textContent = totalTrades + ' trade' + (totalTrades !== 1 ? 's' : '');
+
+  if (podIds.length === 0) {
+    container.innerHTML = '<div class="outcome-pod-card"><div class="empty-txt">No closed trades yet</div></div>';
+    return;
+  }
+
+  container.innerHTML = podIds.map(function(pid) {
+    var s = pods[pid].trade_outcome_stats || {};
+    var wrCls = s.win_rate >= 0.5 ? 'pos' : 'neg';
+    var avgCls = s.avg_pnl >= 0 ? 'pos' : 'neg';
+    var totCls = s.total_pnl >= 0 ? 'pos' : 'neg';
+
+    function stat(lbl, val, cls) {
+      return '<div class="outcome-stat">' +
+        '<div class="outcome-stat-lbl">' + lbl + '</div>' +
+        '<div class="outcome-stat-val ' + cls + '">' + val + '</div>' +
+      '</div>';
+    }
+
+    return '<div class="outcome-pod-card">' +
+      '<div class="outcome-pod-label">' + pid.toUpperCase() + '</div>' +
+      '<div class="outcome-stats-row">' +
+        stat('Trades', s.total_trades || 0, '') +
+        stat('Win Rate', ((s.win_rate || 0) * 100).toFixed(0) + '%', wrCls) +
+        stat('Avg P&amp;L', (s.avg_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.avg_pnl) || 0).toFixed(2), avgCls) +
+        stat('Total P&amp;L', (s.total_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.total_pnl) || 0).toFixed(2), totCls) +
+        stat('Avg Winner', '+$' + (s.avg_winner || 0).toFixed(2), 'pos') +
+        stat('Avg Loser', '$' + (s.avg_loser || 0).toFixed(2), 'neg') +
+      '</div>' +
+    '</div>';
+  }).join('');
 }
 
 function escapeHtml(text) {
