@@ -6,6 +6,7 @@ from typing import Optional
 
 from src.core.bus.collaboration_runner import CollaborationRunner
 from src.core.bus.event_bus import EventBus
+from src.core.concentration import check_concentration
 from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import PodStatus
 from src.core.models.execution import Order, RiskApprovalToken, PodPosition
@@ -255,6 +256,22 @@ class PodRuntime:
                 "exit_when": matching_trade.get("exit_when", ""),
                 "max_hold_days": matching_trade.get("max_hold_days", 0),
             })
+
+            # Concentration guard: block firm-level sector overconcentration on BUY orders
+            if getattr(order, "side", None) is not None and order.side.value.upper() == "BUY":
+                firm_exposure = self._ns.get("firm_exposure") or {}
+                POD_SECTOR_MAP = {
+                    "equities": "equity",
+                    "fx": "fx",
+                    "crypto": "crypto",
+                    "commodities": "commodity",
+                }
+                sector = POD_SECTOR_MAP.get(self._pod_id, self._pod_id)
+                allowed, reason = check_concentration(sector, firm_exposure)
+                if not allowed:
+                    logger.warning("[%s] Concentration limit blocked %s buy: %s", self._pod_id, order.symbol, reason)
+                    rejected_count += 1
+                    continue
 
             # 4. Risk sign-off loop (PM↔Risk deliberation per order)
             approved_order, exit_orders = await self._run_risk_loop_with_exits(order)

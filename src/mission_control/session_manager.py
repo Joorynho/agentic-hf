@@ -24,6 +24,7 @@ from src.backtest.accounting.capital_allocator import CapitalAllocator
 from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.position_monitor import PositionMonitor
 from src.core.position_aging import check_aging
+from src.core.concentration import aggregate_exposure
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
 from src.data.adapters.fred_adapter import FredAdapter
@@ -804,6 +805,13 @@ class SessionManager:
                     # 4. Collect pod summaries for governance and emission
                     pod_summaries = await self._collect_pod_summaries()
                     logger.info("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
+
+                    # 4.1. Compute firm-wide sector concentration and push to each pod namespace
+                    firm_exposure = aggregate_exposure(pod_summaries)
+                    for pod_id, runtime in self._pod_runtimes.items():
+                        runtime._ns.set("firm_exposure", firm_exposure)
+                    logger.debug("[session_manager] [iter %d] Firm exposure: %s", self._iteration,
+                                 {k: f"{v:.1%}" for k, v in firm_exposure.items()})
 
                     # 5. Emit pod summaries to EventBus (for TUI and DataProvider)
                     for pod_id, gateway in self._pod_gateways.items():
