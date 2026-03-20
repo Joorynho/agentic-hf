@@ -1841,3 +1841,21 @@ button { font-family: inherit; cursor: pointer; }
 .ct-pnl { font-weight:600; }
 .ct-pnl.pos { color:var(--green,#00d68f); }
 .ct-pnl.neg { color:var(--red,#e84040); }
+
+/* ── Market Regime Badge ─────────────────────────────────────────────── */
+.regime-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 10px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 1.5px;
+  font-family: var(--font-mono);
+  border: 1px solid currentColor;
+  transition: color 0.3s, background 0.3s;
+}
+.regime-risk-on  { color: var(--green, #00d68f); background: rgba(0,214,143,0.08); }
+.regime-neutral  { color: var(--text-dim, #8899aa); background: rgba(136,153,170,0.08); }
+.regime-risk-off { color: #f0a500; background: rgba(240,165,0,0.08); }
+.regime-crisis   { color: var(--red, #e84040); background: rgba(232,64,64,0.08); animation: blink 1.5s ease-in-out infinite; }

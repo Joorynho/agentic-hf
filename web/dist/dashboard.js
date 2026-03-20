@@ -366,6 +366,16 @@ function escapeHtml(s) {
   return d.innerHTML;
 }
 
+function updateRegimeBadge(regimeLabel) {
+  var badge = document.getElementById('regime-badge');
+  if (!badge) return;
+  // Map label to CSS class suffix: "Risk-On" -> "risk-on", "Risk-Off" -> "risk-off", "Neutral" -> "neutral", "Crisis" -> "crisis"
+  var cls = regimeLabel.toLowerCase().replace(/\s+/g, '-').replace(/[^a-z-]/g, '');
+  badge.className = 'regime-badge regime-' + cls;
+  badge.textContent = regimeLabel.toUpperCase();
+  badge.title = 'Market regime: ' + regimeLabel + ' — updates each cycle';
+}
+
 function renderCurrentMarkets(signals) {
   const tbody = document.getElementById('current-markets-body');
   const countEl = document.getElementById('market-count');
@@ -868,6 +878,7 @@ function handleMessage(msg) {
         pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
         var ptsEl = document.getElementById('price-ts');
         if (ptsEl) ptsEl.textContent = new Date().toLocaleTimeString();
+        if (data.macro_regime) updateRegimeBadge(data.macro_regime);
       } else {
         // Enrichment: only merge research keys, never clobber core metrics
         if (!pods[pod_id]) pods[pod_id] = {};
