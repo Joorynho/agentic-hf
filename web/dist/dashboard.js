@@ -2713,6 +2713,7 @@ function showClosedPositionDetail(idx) {
   }
 
   var entryThesis = cleanThesis(p.entry_reasoning || p.entry_thesis || '', p.symbol);
+  var exitThesis = cleanThesis(p.exit_reasoning || '', p.symbol);
   var exitWhen = p.exit_when || '';
 
   overlay.innerHTML = '<div class="pos-modal">' +
@@ -2725,7 +2726,7 @@ function showClosedPositionDetail(idx) {
       '</div>' +
       '<div class="pos-hdr-right">' +
         '<div class="pos-hdr-avg">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div>' +
-        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + ' realized</div>' +
+        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + ' realized</div>' +
       '</div>' +
     '</div>' +
     '<div class="pos-grid">' +
@@ -2739,13 +2740,14 @@ function showClosedPositionDetail(idx) {
     '<div class="pos-section">' +
       '<div class="pos-section-title">Performance</div>' +
       '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
-        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Realized P&L</div><div class="pos-cell-val ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</div></div>' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Realized P&L</div><div class="pos-cell-val ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Conviction</div><div class="pos-cell-val">' + (((p.conviction || 0) * 100).toFixed(0)) + '%</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Side</div><div class="pos-cell-val">' + (p.side || 'long').toUpperCase() + '</div></div>' +
       '</div>' +
     '</div>' +
     (entryThesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(entryThesis) + '</div></div>' : '') +
+    (exitThesis ? '<div class="pos-section"><div class="pos-section-title">Exit Thesis</div><div class="pos-thesis" style="border-left:2px solid var(--accent-red,#e8384f);padding-left:8px">' + escapeHtml(exitThesis) + '</div></div>' : '') +
     (exitWhen ? '<div class="pos-section"><div class="pos-section-title">Exit Condition</div><div class="pos-thesis closed-exit-when">' + escapeHtml(exitWhen) + '</div></div>' : '') +
     (p.strategy_tag ? '<div class="pos-section"><div class="pos-section-title">Strategy</div><div style="font-size:11px;color:var(--text-secondary);padding:6px 0">' + escapeHtml(p.strategy_tag) + '</div></div>' : '') +
   '</div>';

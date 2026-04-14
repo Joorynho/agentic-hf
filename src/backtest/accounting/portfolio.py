@@ -139,6 +139,7 @@ class PortfolioAccountant:
                 "entry_time": entry_meta.get("entry_time", ""),
                 "exit_time": filled_at.isoformat() if filled_at else "",
                 "entry_reasoning": entry_meta.get("reasoning", ""),
+                "exit_reasoning": reasoning if qty < 0 else "",
                 "conviction": entry_meta.get("conviction", 0.5),
                 "strategy_tag": entry_meta.get("strategy_tag", ""),
                 "exit_when": entry_meta.get("exit_when", ""),

@@ -2156,6 +2156,7 @@ class SessionManager:
                     "exit_time": exit_time,
                     "holding_days": holding_days,
                     "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
+                    "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
                     "conviction": ct.get("conviction", 0),
                     "strategy_tag": ct.get("strategy_tag", ""),
                 })
@@ -2191,6 +2192,7 @@ class SessionManager:
                     "exit_time": exit_time,
                     "holding_days": holding_days,
                     "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
+                    "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
                     "conviction": ct.get("conviction", 0),
                     "strategy_tag": ct.get("strategy_tag", ""),
                 })
