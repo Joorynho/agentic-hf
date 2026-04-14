@@ -1986,6 +1986,12 @@ function updateActivityFeed() {
     var detail = item.detail || '';
     var hasExpandable = fullSummary.length > 80 || detail.length > 0;
     var shortSummary;
+    // Thesis verification events get a distinct badge colour
+    if (item.action === 'thesis_challenged') {
+      roleColor = '#e8a000';  // amber — reasoning flagged
+    } else if (item.action === 'thesis_revised') {
+      roleColor = '#00d68f';  // green — accepted after revision
+    }
     if (item.action === 'article_deep_dive' && item.urls) {
       shortSummary = escapeHtml(fullSummary) + ' ' +
         (item.urls || []).map(function(u) {

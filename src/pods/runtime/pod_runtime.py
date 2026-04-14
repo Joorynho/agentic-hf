@@ -9,6 +9,7 @@ from src.core.bus.event_bus import EventBus
 from src.core.concentration import check_concentration
 from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import PodStatus
+from src.agents.thesis_verifier import ThesisVerifier
 from src.core.models.execution import Order, RiskApprovalToken, PodPosition
 from src.core.models.market import Bar
 from src.core.models.pod_summary import PodSummary, PodRiskMetrics, PodExposureBucket
@@ -161,6 +162,70 @@ class PodRuntime:
         # 3. PM (with Signal↔PM challenge, max 5 iter — handled inside pm.run_cycle)
         pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
         ctx.update(pm_out)
+
+        # 3.1 Thesis verification: evaluate PM reasoning quality, request revision if weak
+        try:
+            from src.core.models.messages import AgentMessage as _AgentMessage
+            from datetime import timezone as _tz
+            _pm_decision = self._ns.get("last_pm_decision") or {}
+            _active = [t for t in _pm_decision.get("trades", []) if str(t.get("action", "HOLD")).upper() != "HOLD"]
+            if _active:
+                _verifier = ThesisVerifier()
+                _revision_occurred = False
+                for _round in range(2):
+                    _result = await _verifier.verify_with_llm(_pm_decision, self._pod_id)
+                    if _result.passed:
+                        if _revision_occurred:
+                            # Publish "thesis revised and verified" event
+                            await self._bus.publish("agent.activity", _AgentMessage(
+                                timestamp=datetime.now(_tz.utc),
+                                sender=f"{self._pod_id}.pm",
+                                recipient="dashboard",
+                                topic="agent.activity",
+                                payload={
+                                    "agent_id": f"{self._pod_id}_pm",
+                                    "agent_role": "PM",
+                                    "pod_id": self._pod_id,
+                                    "action": "thesis_revised",
+                                    "summary": f"{self._pod_id.upper()} PM: thesis strengthened after revision (score={_result.quality_score:.2f})",
+                                    "detail": _pm_decision.get("reasoning", "")[:300],
+                                },
+                            ), publisher_id=f"{self._pod_id}.pm")
+                        logger.debug("[%s] Thesis verified: score=%.2f", self._pod_id, _result.quality_score)
+                        break
+                    logger.info(
+                        "[%s] Thesis revision round %d: score=%.2f — requesting stronger reasoning",
+                        self._pod_id, _round + 1, _result.quality_score,
+                    )
+                    # Publish "thesis challenged" event
+                    await self._bus.publish("agent.activity", _AgentMessage(
+                        timestamp=datetime.now(_tz.utc),
+                        sender=f"{self._pod_id}.pm",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_pm",
+                            "agent_role": "PM",
+                            "pod_id": self._pod_id,
+                            "action": "thesis_challenged",
+                            "summary": f"{self._pod_id.upper()} PM: reasoning challenged (round {_round+1}, score={_result.quality_score:.2f})",
+                            "detail": _result.feedback[:300],
+                        },
+                    ), publisher_id=f"{self._pod_id}.pm")
+                    _revision_occurred = True
+                    self._ns.set("thesis_revision_feedback", {
+                        "feedback": _result.feedback,
+                        "round": _round + 1,
+                    })
+                    try:
+                        _revised = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
+                        if _revised:
+                            ctx.update(_revised)
+                        _pm_decision = self._ns.get("last_pm_decision") or _pm_decision
+                    finally:
+                        self._ns.set("thesis_revision_feedback", None)
+        except Exception as _e:
+            logger.debug("[%s] Thesis verification skipped: %s", self._pod_id, _e)
 
         # Emit pod macro view for cross-pod intelligence
         features = ctx.get("features", {})

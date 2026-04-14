@@ -373,6 +373,17 @@ class FXPMAgent(BasePodAgent):
             except Exception as e:
                 logger.debug("[%s] multiframe fetch error: %s", self._pod_id, e)
 
+        # Inject thesis revision feedback if ThesisVerifier requested a revision
+        _thesis_fb = self._ns.get("thesis_revision_feedback")
+        if _thesis_fb and _thesis_fb.get("feedback"):
+            user_content = (
+                f"[REVISION REQUEST — Round {_thesis_fb.get('round', 1)}]\n"
+                f"Your previous reasoning was flagged as lacking depth:\n"
+                f"{_thesis_fb['feedback']}\n"
+                f"Revise: cite specific data points, name a concrete catalyst, "
+                f"explain why this exact instrument. HOLD if evidence is insufficient.\n\n"
+            ) + user_content
+
         try:
             raw = llm_chat(
                 [

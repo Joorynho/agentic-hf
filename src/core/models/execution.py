@@ -127,6 +127,13 @@ class PositionSnapshot(BaseModel):
         return (self.current_price - self.cost_basis) / self.cost_basis * 100
 
 
+class VerificationResult(BaseModel):
+    """Result from ThesisVerifier quality check on a PM trade decision."""
+    passed: bool
+    quality_score: float  # 0–1; above 0.5 passes
+    feedback: str = ""  # actionable critique when not passed
+
+
 class PodPosition(BaseModel):
     """Position model exposed in PodSummary (crosses pod boundary)."""
     symbol: str

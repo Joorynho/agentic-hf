@@ -34,6 +34,7 @@ from src.data.adapters.market_tracker import MarketTracker
 from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.data.adapters.rss_adapter import RssAdapter
 from src.data.adapters.x_adapter import XAdapter
+from src.data.services.research_ingestion import ResearchIngestionService
 from src.data.adapters.price_service import PriceService
 from src.data.adapters.stockprices_adapter import StockPricesAdapter
 from src.data.adapters.coinmarketcap_adapter import CoinMarketCapAdapter
@@ -429,6 +430,16 @@ class SessionManager:
             self._source_attributors = {pod_id: SourceAttributor() for pod_id in self._pod_runtimes}
             logger.info("[session_manager] SourceAttributors initialized for %d pods", len(self._source_attributors))
 
+            # Create shared research ingestion service (fetches FRED/Polymarket/RSS/X once per 5 min)
+            self._research_ingestion = ResearchIngestionService(
+                fred_adapter=getattr(self, "_fred_adapter", None),
+                polymarket_adapter=PolymarketAdapter(),
+                rss_adapter=getattr(self, "_rss_adapter", None),
+                x_adapter=getattr(self, "_x_adapter", None),
+                interval_seconds=300,
+            )
+            logger.info("[session_manager] ResearchIngestionService created")
+
             # Initialize governance orchestrator with CEO, CIO, CRO agents
             ceo = CEOAgent(bus=self._event_bus, session_logger=self._session_logger)
             cio = CIOAgent(bus=self._event_bus, allocator=self._allocator, session_logger=self._session_logger)
@@ -680,6 +691,10 @@ class SessionManager:
         # Start background price ticker (updates prices between iterations)
         ticker_task = asyncio.create_task(self._run_price_ticker())
 
+        # Start shared research ingestion service (FRED/Poly/RSS/X fetched once per 5 min)
+        if hasattr(self, "_research_ingestion") and self._research_ingestion:
+            await self._research_ingestion.start()
+
         try:
             while self._session_active:
                 self._iteration += 1
@@ -695,6 +710,21 @@ class SessionManager:
 
                     # 1.5 Daily position review (fires once per calendar day)
                     await self._maybe_run_position_review()
+
+                    # 2. Inject shared research data into each pod namespace before researchers run
+                    if hasattr(self, "_research_ingestion") and self._research_ingestion and self._research_ingestion.last_fetch_time:
+                        _shared = self._research_ingestion.get_shared_data()
+                        for _pid, _rt in self._pod_runtimes.items():
+                            _ns = _rt._ns
+                            if _shared.get("fred_snapshot"):
+                                _ns.set("shared_fred_snapshot", _shared["fred_snapshot"])
+                            if _shared.get("poly_signals") is not None:
+                                _ns.set("shared_poly_signals", _shared["poly_signals"])
+                            if _shared.get("news_items") is not None:
+                                _ns.set("shared_news_items", _shared["news_items"])
+                            if _shared.get("x_feed") is not None:
+                                _ns.set("shared_x_feed", _shared["x_feed"])
+                        logger.debug("[session_manager] Injected shared research data into %d pod namespaces", len(self._pod_runtimes))
 
                     # 2. Run researcher cycles for all pods IN PARALLEL
                     async def _run_researcher(pod_id: str, runtime):
@@ -1079,6 +1109,8 @@ class SessionManager:
                 await ticker_task
             except asyncio.CancelledError:
                 pass
+            if hasattr(self, "_research_ingestion") and self._research_ingestion:
+                await self._research_ingestion.stop()
             await self.stop_session()
 
     async def _run_price_ticker(self) -> None:

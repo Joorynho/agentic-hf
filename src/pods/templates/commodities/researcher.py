@@ -94,16 +94,21 @@ class CommoditiesResearcher(BasePodAgent):
         current_universe = self.recall("universe") or list(COMMODITIES_SEED)
         self.store("universe", current_universe)
 
-        fred_snapshot = {}
-        if self.fred_adapter:
+        # FRED — use shared ingestion data if available, else fetch directly
+        fred_snapshot = self._ns.get("shared_fred_snapshot") or {}
+        if not fred_snapshot and self.fred_adapter:
             try:
                 fred_snapshot = await self.fred_adapter.fetch_snapshot()
             except Exception as e:
                 logger.info("[commodities.researcher] FRED failed: %s", e)
         self.store("fred_snapshot", fred_snapshot)
 
-        poly_signals = []
-        if self.polymarket_adapter:
+        # Polymarket — use shared data if available, else fetch directly
+        shared_poly = self._ns.get("shared_poly_signals")
+        poly_signals: list = []
+        if shared_poly is not None:
+            poly_signals = shared_poly
+        elif self.polymarket_adapter:
             try:
                 raw = await self.polymarket_adapter.fetch_signals([])
                 if self.market_tracker:
@@ -114,18 +119,27 @@ class CommoditiesResearcher(BasePodAgent):
                 logger.info("[commodities.researcher] Polymarket failed: %s", e)
         self.store("polymarket_signals", poly_signals)
 
-        news_items = []
-        if self.rss_adapter:
+        # News — use shared data if available (already dicts), else fetch directly
+        shared_news = self._ns.get("shared_news_items")
+        news_items: list = []
+        if shared_news is not None:
+            news_items = shared_news
+        elif self.rss_adapter:
             try:
-                news_items = await self.rss_adapter.fetch_news()
+                raw_news = await self.rss_adapter.fetch_news()
+                news_items = [n.model_dump(mode="json") if hasattr(n, "model_dump") else n for n in raw_news]
             except Exception as e:
                 logger.info("[commodities.researcher] RSS failed: %s", e)
-        self.store("news_items", [n.model_dump(mode="json") for n in news_items])
+        self.store("news_items", news_items)
 
-        x_feed, x_news = [], []
-        if self.x_adapter:
+        # X feed — use shared data if available, else fetch directly
+        shared_x = self._ns.get("shared_x_feed")
+        x_feed: list = []
+        if shared_x is not None:
+            x_feed = shared_x
+        elif self.x_adapter:
             try:
-                x_feed, x_news = await self.x_adapter.fetch_tweets()
+                x_feed, _ = await self.x_adapter.fetch_tweets()
             except Exception as e:
                 logger.info("[commodities.researcher] News feed failed: %s", e)
         self.store("x_feed", x_feed)
@@ -225,6 +239,37 @@ class CommoditiesResearcher(BasePodAgent):
             if not hasattr(self, "_web_searcher"):
                 self._web_searcher = WebSearchAdapter()
             self._web_searcher.reset_cycle()
+
+            # Deep-dive: fetch article content for high-relevancy scored headlines
+            deep_dives = []
+            candidates = [
+                h for h in scored_headlines
+                if h.get("relevancy", 0.0) >= 0.7 and h.get("impact", 0.0) >= 0.5
+            ]
+            for h in candidates[:2]:
+                title = h.get("title", "")
+                if not title:
+                    continue
+                results = await self._web_searcher.search(
+                    f"{title} commodities market analysis {now.strftime('%B %Y')}", max_results=3
+                )
+                if results:
+                    top = results[0]
+                    content = await self._web_searcher.fetch_page(top["url"]) if top.get("url") else ""
+                    deep_dives.append({
+                        "title": title,
+                        "url": top.get("url", ""),
+                        "snippet": top.get("snippet", ""),
+                        "content": content,
+                        "sentiment": h.get("sentiment", 0.0),
+                        "relevancy": h.get("relevancy", 0.0),
+                        "impact": h.get("impact", 0.0),
+                    })
+            if deep_dives:
+                self._ns.set("headline_deep_dives", deep_dives)
+                logger.info("[commodities.researcher] %d headline deep-dives fetched", len(deep_dives))
+
+            # Macro outlook search
             macro_outlook = self._ns.get("features", {}).get("macro_outlook", "") if self._ns.get("features") else ""
             if macro_outlook:
                 results = await self._web_searcher.search(f"commodities market {macro_outlook} outlook {now.strftime('%B %Y')}")
