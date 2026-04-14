@@ -864,6 +864,10 @@ function handleMessage(msg) {
   if (msg.type === 'session_status') {
     var sd = msg.data || {};
     updateSessionStatus(!!sd.active);
+    if (sd.iteration != null) {
+      iterCount = sd.iteration;
+      document.getElementById('iter-ctr').textContent = iterCount;
+    }
     return;
   }
   if (msg.type === 'pod_summary' || msg.type === 'pod_enrichment') {
@@ -951,8 +955,8 @@ function handleMessage(msg) {
         if (msg.type === 'pod_enrichment' || !data.status) return;
       }
 
-      iterCount++;
-      document.getElementById('iter-ctr').textContent = iterCount;
+      // Iteration counter is set from session_snapshot/session_status only
+      // (price ticker pod_summary messages are NOT iterations)
       // Track per-pod NAV for sparklines
       if (!podNavSpark[pod_id]) podNavSpark[pod_id] = [];
       podNavSpark[pod_id].push(data.nav || 0);

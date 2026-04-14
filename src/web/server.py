@@ -187,7 +187,12 @@ class EventBusListener:
                     existing = self._app_state['last_pod_summaries'].get(pod_id, {})
                     if existing:
                         existing_data = existing.get("data", {})
-                        existing_data.update(payload)
+                        # Never overwrite positions with empty during enrichment merge
+                        merge_payload = dict(payload)
+                        for k in ("positions", "current_positions"):
+                            if k in merge_payload and (not merge_payload[k] or (isinstance(merge_payload[k], list) and len(merge_payload[k]) == 0)):
+                                del merge_payload[k]
+                        existing_data.update(merge_payload)
                         existing["data"] = existing_data
                         existing["timestamp"] = message.timestamp.isoformat()
                     else:
@@ -310,10 +315,20 @@ class EventBusListener:
 
         governance = memory.get("governance", [])
         for g in governance:
+            # Transform raw governance dict to the same format _on_governance produces
+            auth_by = g.get("authorized_by", "CEO")
+            agent_label = auth_by.upper().replace("_LLM", "").replace("_RULE_BASED", "") if auth_by else "CEO"
             self._app_state['recent_governance'].append({
                 "type": "governance",
                 "timestamp": g.get("ts", g.get("timestamp", "")),
-                "data": g,
+                "data": {
+                    "agent": agent_label,
+                    "decision": "MANDATE_UPDATE",
+                    "reasoning": g.get("rationale", g.get("narrative", "")),
+                    "weights": g.get("pod_allocations", {}),
+                    "narrative": g.get("narrative", ""),
+                    "objectives": g.get("objectives", []),
+                },
             })
         self._app_state['recent_governance'] = self._app_state['recent_governance'][-20:]
         logger.info("[web] Injected restored memory: %d trades, %d governance", len(trades), len(governance))
@@ -511,28 +526,33 @@ def create_app(
             raise HTTPException(status_code=503, detail="Session not initialized")
         return sm.get_all_closed_trades()
 
+    @app.get("/api/positions")
+    async def get_current_positions():
+        """Get all current (open) positions across pods. Primary source for Top Holdings table.
+        Reads directly from SessionManager accountants — bypasses EventBus/WebSocket."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_all_positions"):
+            positions = sm.get_all_positions()
+            return {"positions": positions}
+        # Fallback when session not started
+        result = []
+        for pod_id, summary in (app.state.pod_summaries or {}).items():
+            positions = summary.get("current_positions") or summary.get("positions") or []
+            for p in positions if isinstance(positions, list) else []:
+                if p and (p.get("symbol") or p.get("qty") is not None):
+                    row = dict(p)
+                    row["_pod"] = pod_id
+                    result.append(row)
+        return {"positions": result}
+
     @app.get("/api/closed-positions")
     async def get_closed_positions():
         """Get all closed positions across all pods, sorted by exit time descending."""
         sm = app.state.session_manager
         if not sm:
             raise HTTPException(status_code=503, detail="Session not initialized")
-        results = []
-        pod_runtimes = getattr(sm, "_pod_runtimes", {})
-        for pod_key, rt in pod_runtimes.items():
-            accountant = getattr(rt, "_accountant", None)
-            if accountant is None:
-                continue
-            for trade in accountant.closed_trades:
-                enriched = dict(trade)
-                enriched["pod_id"] = pod_key
-                # Try to enrich with entry_thesis from metadata (may already be cleared)
-                symbol = enriched.get("symbol", "")
-                meta = accountant._entry_metadata.get(symbol, {})
-                enriched["entry_thesis"] = meta.get("entry_thesis", enriched.get("entry_reasoning", ""))
-                results.append(enriched)
-        results.sort(key=lambda t: t.get("exit_time", ""), reverse=True)
-        return {"closed_positions": results}
+        trades = sm.get_all_closed_trades()
+        return {"closed_positions": trades}
 
     @app.get("/api/risk", response_model=RiskStatusResponse)
     async def get_risk_status():
@@ -600,7 +620,7 @@ def create_app(
         try:
             async def _run():
                 await sm.start_live_session()
-                await sm.run_event_loop(interval_seconds=60.0, governance_freq=5)
+                await sm.run_event_loop(interval_seconds=60.0, governance_freq=2)
             asyncio.ensure_future(_run())
             await asyncio.sleep(0.5)
             status_msg = {
@@ -659,6 +679,24 @@ def create_app(
                 snapshot["data"]["iteration"] = app.state.iteration
                 sm = app.state.session_manager
                 snapshot["data"]["session_active"] = sm.session_active if sm else False
+                # Merge app.state.pod_summaries into snapshot so positions are never stale
+                # (last_pod_summaries may be empty or lack positions if populated only from EventBus)
+                for pod_id, raw in (app.state.pod_summaries or {}).items():
+                    rm = raw.get("risk_metrics") or {}
+                    data = dict(raw)
+                    data["nav"] = data.get("nav") or rm.get("nav", 0)
+                    data["daily_pnl"] = data.get("daily_pnl") or rm.get("daily_pnl", 0)
+                    data["current_positions"] = data.get("current_positions") or data.get("positions", [])
+                    data["positions"] = data["current_positions"]
+                    existing = snapshot["data"]["pod_summaries"].get(pod_id, {})
+                    existing_data = existing.get("data", {}) if isinstance(existing, dict) else {}
+                    existing_data.update(data)
+                    snapshot["data"]["pod_summaries"][pod_id] = {
+                        "type": "pod_summary",
+                        "pod_id": pod_id,
+                        "data": existing_data,
+                        "timestamp": raw.get("timestamp", existing.get("timestamp", "")),
+                    }
                 await websocket.send_json(snapshot)
             while True:
                 data = await websocket.receive_text()
@@ -683,6 +721,16 @@ def create_app(
         app.state.pod_summaries = pod_summaries
         app.state.risk_halt = risk_halt
         app.state.risk_halt_reason = risk_halt_reason
+
+        # Broadcast iteration update so dashboard shows real iteration count
+        if hasattr(app.state, "listener") and app.state.listener is not None:
+            try:
+                await app.state.listener.manager.broadcast({
+                    "type": "session_status",
+                    "data": {"active": True, "iteration": iteration},
+                })
+            except Exception:
+                pass
 
         # Sync into listener's last_pod_summaries so WebSocket snapshot includes research data
         # (Research tab reads fred_snapshot, polymarket_signals, x_feed from pod_summaries)

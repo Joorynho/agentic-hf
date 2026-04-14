@@ -492,6 +492,25 @@ class SessionManager:
                 # Backfill entry metadata for hydrated positions from memory trades
                 self._backfill_entry_metadata_from_memory(self._restored_memory)
 
+                # Restore governance decisions so they persist across restarts
+                restored_gov = self._restored_memory.get("governance", [])
+                if restored_gov:
+                    self._governance_decisions = list(restored_gov)
+                    logger.info("[session_manager] Restored %d governance decisions from memory", len(restored_gov))
+
+                # Restore research enrichment data to pod namespaces
+                restored_enrichment = self._restored_memory.get("enrichment", {})
+                for pod_id, enrich in restored_enrichment.items():
+                    rt = self._pod_runtimes.get(pod_id)
+                    if rt:
+                        ns = rt._ns
+                        for key in ("fred_snapshot", "fred_score", "polymarket_signals",
+                                    "polymarket_confidence", "macro_score", "poly_sentiment",
+                                    "social_score", "x_feed"):
+                            if key in enrich and not ns.get(key):
+                                ns.set(key, enrich[key])
+                        logger.info("[session_manager] Restored enrichment for %s", pod_id)
+
                 if self._web_app:
                     lsnr = getattr(self._web_app.state, "listener", None)
                     if lsnr:
@@ -918,6 +937,23 @@ class SessionManager:
                                     mandate.pod_allocations,
                                     mandate.firm_nav,
                                 )
+
+                                # Accumulate governance decisions for memory persistence
+                                self._governance_decisions.append({
+                                    "ts": datetime.now(timezone.utc).isoformat(),
+                                    "iteration": self._iteration,
+                                    "narrative": mandate.narrative,
+                                    "objectives": mandate.objectives,
+                                    "rationale": mandate.rationale,
+                                    "authorized_by": mandate.authorized_by,
+                                    "cio_approved": mandate.cio_approved,
+                                    "cro_approved": mandate.cro_approved,
+                                    "pod_allocations": mandate.pod_allocations,
+                                    "firm_nav": mandate.firm_nav,
+                                    "cro_halt": mandate.cro_halt,
+                                    "cro_halt_reason": mandate.cro_halt_reason,
+                                    "breached_pods": breached_pods,
+                                })
 
                             # Check for CRO halt
                             if governance_result.get("cro_halt"):
@@ -1569,6 +1605,13 @@ class SessionManager:
                     if isinstance(v, datetime):
                         entry[k] = v.isoformat()
                 governance.append(entry)
+
+            # Merge with previously loaded governance to preserve cross-session history
+            prev_gov = prev.get("governance", [])
+            seen_ts = {g.get("ts") for g in governance if g.get("ts")}
+            for pg in prev_gov:
+                if pg.get("ts") and pg["ts"] not in seen_ts:
+                    governance.insert(0, pg)
             governance = governance[-50:]
 
             total_nav = sum(ps.get("nav", 0) for ps in pods_state.values())
@@ -1576,6 +1619,7 @@ class SessionManager:
 
             outcomes_state: dict[str, dict] = {}
             signal_scores_state: dict[str, dict] = {}
+            enrichment_state: dict[str, dict] = {}
             for pod_id, runtime in self._pod_runtimes.items():
                 tracker = getattr(runtime, "_outcome_tracker", None)
                 if tracker and tracker.total_trades > 0:
@@ -1583,6 +1627,22 @@ class SessionManager:
                 scorer = getattr(runtime, "_signal_scorer", None)
                 if scorer and scorer.get_hit_rates():
                     signal_scores_state[pod_id] = scorer.to_state_dict()
+
+                # Save research enrichment data per pod
+                ns = runtime._ns
+                enrich: dict = {}
+                for key in ("fred_snapshot", "fred_score", "polymarket_signals",
+                            "polymarket_confidence", "macro_score", "poly_sentiment",
+                            "social_score"):
+                    val = ns.get(key)
+                    if val is not None:
+                        enrich[key] = val
+                # Save x_feed trimmed to 50 items
+                x_feed = ns.get("x_feed") or []
+                if x_feed:
+                    enrich["x_feed"] = x_feed[:50]
+                if enrich:
+                    enrichment_state[pod_id] = enrich
 
             memory = {
                 "last_updated": datetime.now(timezone.utc).isoformat(),
@@ -1596,6 +1656,7 @@ class SessionManager:
                 "pods": pods_state,
                 "trades": trades,
                 "governance": governance,
+                "enrichment": enrichment_state,
                 "trade_outcomes": outcomes_state,
                 "signal_scores": signal_scores_state,
             }
@@ -2072,6 +2133,31 @@ class SessionManager:
 
         all_trades.sort(key=lambda x: x.get("exit_time", ""), reverse=True)
         return all_trades
+
+    def get_all_positions(self) -> list[dict]:
+        """Get all open positions across all pods, directly from accountants.
+        Used by Top Holdings table — bypasses EventBus/WebSocket chain."""
+        result = []
+        for pod_id, runtime in self._pod_runtimes.items():
+            accountant = runtime._ns.get("accountant")
+            if not accountant:
+                continue
+            for symbol, snap in accountant.current_positions.items():
+                if snap.qty == 0:
+                    continue
+                meta = accountant._entry_metadata.get(symbol, {})
+                result.append({
+                    "_pod": pod_id,
+                    "symbol": symbol,
+                    "qty": snap.qty,
+                    "current_price": snap.current_price,
+                    "cost_basis": snap.cost_basis,
+                    "unrealized_pnl": snap.unrealized_pnl,
+                    "notional": snap.qty * snap.current_price,
+                    "entry_date": snap.entry_date or meta.get("entry_time", ""),
+                    "entry_thesis": snap.entry_thesis or meta.get("entry_thesis", ""),
+                })
+        return result
 
     def get_position_detail(self, pod_id: str, symbol: str) -> dict | None:
         """Get full position detail including fill history for a symbol in a pod."""
