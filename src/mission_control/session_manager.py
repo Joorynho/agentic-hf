@@ -2164,14 +2164,77 @@ class SessionManager:
         # Also include closed trades from restored memory (proper persisted data)
         prev = self._restored_memory or {}
         existing_keys = {(t["symbol"], t.get("exit_time", "")) for t in all_trades}
-        for pod_id, pod_trades in prev.get("closed_trades_state", {}).items():
-            for ct in pod_trades:
-                key = (ct.get("symbol", ""), ct.get("exit_time", ""))
-                if key in existing_keys:
+
+        saved_closed = prev.get("closed_trades_state", {})
+        if saved_closed:
+            for pod_id, pod_trades in saved_closed.items():
+                for ct in pod_trades:
+                    key = (ct.get("symbol", ""), ct.get("exit_time", ""))
+                    if key in existing_keys:
+                        continue
+                    existing_keys.add(key)
+                    entry_time = ct.get("entry_time", "")
+                    exit_time = ct.get("exit_time", "")
+                    holding_days = 0
+                    if entry_time and exit_time:
+                        try:
+                            e_d = datetime.fromisoformat(entry_time.split("T")[0]).date()
+                            x_d = datetime.fromisoformat(exit_time.split("T")[0]).date()
+                            holding_days = (x_d - e_d).days
+                        except Exception:
+                            pass
+                    all_trades.append({
+                        "pod_id": pod_id,
+                        "symbol": ct.get("symbol", ""),
+                        "side": ct.get("side", "long"),
+                        "entry_price": round(ct.get("entry_price", 0), 2),
+                        "exit_price": round(ct.get("exit_price", 0), 2),
+                        "qty": round(ct.get("qty", 0), 4),
+                        "realized_pnl": round(ct.get("realized_pnl", 0), 4),
+                        "entry_time": entry_time,
+                        "exit_time": exit_time,
+                        "holding_days": holding_days,
+                        "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
+                        "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
+                        "conviction": ct.get("conviction", 0),
+                        "strategy_tag": ct.get("strategy_tag", ""),
+                    })
+        else:
+            # Legacy fallback: reconstruct from trade log SELL fills + matched BUYs
+            old_trades = prev.get("trades", [])
+            buys_by_key: dict[tuple, list] = {}
+            for t in old_trades:
+                if (t.get("side") or "").upper() == "BUY":
+                    k = (t.get("pod_id", ""), t.get("symbol", ""))
+                    buys_by_key.setdefault(k, []).append(t)
+
+            for t in old_trades:
+                if (t.get("side") or "").upper() != "SELL":
                     continue
-                existing_keys.add(key)
-                entry_time = ct.get("entry_time", "")
-                exit_time = ct.get("exit_time", "")
+                pod_id = t.get("pod_id", "")
+                symbol = t.get("symbol", "")
+                exit_time = t.get("timestamp", "")
+                dedup_key = (symbol, exit_time)
+                if dedup_key in existing_keys:
+                    continue
+                existing_keys.add(dedup_key)
+
+                exit_price = t.get("fill_price") or t.get("filled_price") or 0
+                qty = round(abs(t.get("qty", 0)), 4)
+
+                # Match with the most recent BUY before this SELL
+                entry_price = 0.0
+                entry_time = ""
+                entry_reasoning_raw = ""
+                matching_buys = buys_by_key.get((pod_id, symbol), [])
+                for b in matching_buys:
+                    b_ts = b.get("timestamp", "")
+                    if b_ts <= exit_time:
+                        entry_price = b.get("fill_price") or b.get("filled_price") or 0
+                        entry_time = b.get("timestamp", "")
+                        entry_reasoning_raw = b.get("reasoning", "")
+
+                realized_pnl = qty * (exit_price - entry_price) if entry_price > 0 else 0.0
                 holding_days = 0
                 if entry_time and exit_time:
                     try:
@@ -2180,21 +2243,35 @@ class SessionManager:
                         holding_days = (x_d - e_d).days
                     except Exception:
                         pass
+
+                # Unwrap JSON-blob reasoning (older sessions stored raw TradeProposal)
+                def _unwrap(raw: str, sym: str) -> str:
+                    if raw and (raw.startswith('{"trades":') or raw.startswith("{'trades':")):
+                        try:
+                            proposal = json.loads(raw)
+                            for trade in proposal.get("trades", []):
+                                if trade.get("symbol") == sym:
+                                    return trade.get("reasoning", "")
+                        except Exception:
+                            pass
+                        return ""  # no matching symbol — don't show unrelated reasoning
+                    return raw
+
                 all_trades.append({
                     "pod_id": pod_id,
-                    "symbol": ct.get("symbol", ""),
-                    "side": ct.get("side", "long"),
-                    "entry_price": round(ct.get("entry_price", 0), 2),
-                    "exit_price": round(ct.get("exit_price", 0), 2),
-                    "qty": round(ct.get("qty", 0), 4),
-                    "realized_pnl": round(ct.get("realized_pnl", 0), 4),
+                    "symbol": symbol,
+                    "side": "long",
+                    "entry_price": round(entry_price, 2),
+                    "exit_price": round(exit_price, 2),
+                    "qty": qty,
+                    "realized_pnl": round(realized_pnl, 4),
                     "entry_time": entry_time,
                     "exit_time": exit_time,
                     "holding_days": holding_days,
-                    "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
-                    "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
-                    "conviction": ct.get("conviction", 0),
-                    "strategy_tag": ct.get("strategy_tag", ""),
+                    "entry_reasoning": _unwrap(entry_reasoning_raw, symbol)[:200],
+                    "exit_reasoning": _unwrap(t.get("reasoning", ""), symbol)[:200],
+                    "conviction": t.get("conviction", 0),
+                    "strategy_tag": t.get("strategy_tag", ""),
                 })
 
         all_trades.sort(key=lambda x: x.get("exit_time", ""), reverse=True)
