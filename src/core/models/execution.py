@@ -134,6 +134,18 @@ class VerificationResult(BaseModel):
     feedback: str = ""  # actionable critique when not passed
 
 
+class DiscoveredTicker(BaseModel):
+    """A ticker discovered via theme scanning. Persisted across sessions."""
+    symbol: str
+    theme: str                          # e.g. "AI Infrastructure"
+    thesis: str                         # Why this ticker was added
+    discovered_date: str                # ISO date string e.g. "2026-04-14"
+    next_review_date: str               # ISO date string — when to re-validate thesis
+    status: str = "active"             # "active" | "inactive"
+    invalidation_reason: str | None = None
+    source_headlines: list[str] = []    # Headlines that triggered discovery
+
+
 class PodPosition(BaseModel):
     """Position model exposed in PodSummary (crosses pod boundary)."""
     symbol: str
