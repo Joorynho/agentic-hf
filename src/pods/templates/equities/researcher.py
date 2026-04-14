@@ -15,6 +15,7 @@ from src.data.adapters.rss_adapter import RssAdapter
 from src.data.adapters.x_adapter import XAdapter
 from src.pods.base.agent import BasePodAgent
 from src.pods.base.namespace import PodNamespace
+from src.data.services.theme_scanner import ThemeScanner
 
 if TYPE_CHECKING:
     from src.data.adapters.price_service import PriceService
@@ -42,6 +43,83 @@ class EquitiesResearcher(BasePodAgent):
         self.rss_adapter = rss_adapter
         self.x_adapter = x_adapter
         self.price_service = price_service
+        self._last_theme_scan_date: str | None = None
+
+    def _should_run_theme_scan(self) -> bool:
+        """Returns True if theme scan hasn't run today yet."""
+        from datetime import date
+        today = date.today().isoformat()
+        return self._last_theme_scan_date != today
+
+    def _load_discovered_universe(self) -> dict:
+        """Load discovered tickers from namespace (restored from memory.json on startup)."""
+        return self._ns.get("discovered_tickers") or {}
+
+    def _build_active_universe(self, discovered: dict) -> list[str]:
+        """Build full universe = EQUITIES_SEED + active discovered tickers (no duplicates)."""
+        active = [sym for sym, t in discovered.items() if t.get("status") == "active"]
+        combined = list(dict.fromkeys(list(EQUITIES_SEED) + active))
+        return combined
+
+    async def _run_theme_scan(
+        self,
+        headlines: list[dict],
+        poly_signals: list[dict],
+        fred_snapshot: dict,
+        discovered: dict,
+        current_universe: list[str],
+    ) -> dict:
+        """Run daily theme scan. Returns updated discovered dict (merged with new finds)."""
+        from datetime import date
+        month = date.today().strftime("%B")
+        year = str(date.today().year)
+
+        scanner = ThemeScanner(web_searcher=getattr(self, "_web_searcher", None))
+
+        # 1. Discover new tickers
+        new_tickers = await scanner.scan(
+            headlines=headlines, poly_signals=poly_signals, fred_snapshot=fred_snapshot,
+            existing_discovered=discovered, existing_universe=current_universe,
+            month=month, year=year,
+        )
+
+        # 2. Review stale tickers (past next_review_date)
+        updated_discovered = dict(discovered)
+        today = date.today().isoformat()
+        for sym, ticker_data in list(updated_discovered.items()):
+            if ticker_data.get("status") == "active" and ticker_data.get("next_review_date", "") <= today:
+                updated = await scanner.review_ticker(ticker_data, month=month, year=year)
+                updated_discovered[sym] = updated
+                if updated["status"] == "inactive":
+                    logger.info("[equities.researcher] Ticker %s marked inactive: %s",
+                                sym, updated.get("invalidation_reason"))
+
+        # 3. Merge new tickers
+        themes_added = []
+        for t in new_tickers:
+            updated_discovered[t.symbol] = t.model_dump(mode="json")
+            themes_added.append(t.symbol)
+
+        if themes_added:
+            logger.info("[equities.researcher] Theme scan added: %s", themes_added)
+            try:
+                bus = self._ns.get("event_bus")
+                if bus:
+                    import asyncio
+                    asyncio.create_task(bus.publish("agent.activity", {
+                        "pod_id": "equities",
+                        "role": "researcher",
+                        "action": "universe_expanded",
+                        "content": f"Theme scanner added {len(themes_added)} tickers: {', '.join(themes_added)}",
+                        "timestamp": today,
+                    }))
+            except Exception:
+                pass
+
+        # 4. Save back to namespace
+        self._ns.set("discovered_tickers", updated_discovered)
+        self._last_theme_scan_date = today
+        return updated_discovered
 
     async def _review_universe(self, fred_snapshot, poly_signals, news_items, live_quotes) -> list[str]:
         """Use LLM to review and potentially update the tradeable universe daily."""
@@ -236,22 +314,25 @@ class EquitiesResearcher(BasePodAgent):
                     regime["fred_score"], regime["poly_sentiment"], regime["social_score"],
                     regime["macro_score"], len(news_items), len(x_feed), len(live_quotes))
 
-        # Daily LLM-driven universe review
-        last_review = self.recall("universe_last_review")
         now = datetime.now(timezone.utc)
-        should_review = last_review is None
-        if not should_review and last_review:
-            try:
-                last_dt = datetime.fromisoformat(last_review) if isinstance(last_review, str) else last_review
-                should_review = (now - last_dt).total_seconds() > 86400
-            except Exception:
-                should_review = True
-        if should_review:
-            news_dicts = [n.model_dump(mode="json") if hasattr(n, "model_dump") else n for n in news_items]
-            updated = await self._review_universe(fred_snapshot, poly_signals, news_dicts, live_quotes)
-            self.store("universe", updated)
-            self.store("universe_last_review", now.isoformat())
-            current_universe = updated
+
+        # Daily: run theme scanner + build universe from seed + discovered
+        if self._should_run_theme_scan():
+            discovered = self._load_discovered_universe()
+            current_universe = self._build_active_universe(discovered)
+            discovered = await self._run_theme_scan(
+                headlines=scored_headlines,
+                poly_signals=poly_signals,
+                fred_snapshot=fred_snapshot,
+                discovered=discovered,
+                current_universe=current_universe,
+            )
+            universe = self._build_active_universe(discovered)
+            self.store("universe", universe)
+            gateway = self._ns.get("gateway")
+            if gateway:
+                gateway.set_universe(universe)
+            current_universe = universe
 
         try:
             from src.data.adapters.web_search import WebSearchAdapter
