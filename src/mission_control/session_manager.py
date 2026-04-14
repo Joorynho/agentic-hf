@@ -1649,6 +1649,25 @@ class SessionManager:
             total_nav = sum(ps.get("nav", 0) for ps in pods_state.values())
             total_capital = sum(ps.get("starting_capital", 0) for ps in pods_state.values())
 
+            closed_trades_state: dict[str, list] = {}
+            prev_closed = prev.get("closed_trades_state", {})
+            for pod_id, runtime in self._pod_runtimes.items():
+                acct = runtime._ns.get("accountant")
+                current_closed: list[dict] = []
+                if acct:
+                    for ct in acct.closed_trades:
+                        entry: dict = {}
+                        for k, v in ct.items():
+                            entry[k] = v.isoformat() if isinstance(v, datetime) else v
+                        current_closed.append(entry)
+                # Merge with previously saved closed trades to preserve history
+                seen_keys = {(c.get("symbol"), c.get("exit_time")) for c in current_closed}
+                for pc in prev_closed.get(pod_id, []):
+                    if (pc.get("symbol"), pc.get("exit_time")) not in seen_keys:
+                        current_closed.append(pc)
+                if current_closed:
+                    closed_trades_state[pod_id] = current_closed[-100:]
+
             outcomes_state: dict[str, dict] = {}
             signal_scores_state: dict[str, dict] = {}
             enrichment_state: dict[str, dict] = {}
@@ -1691,6 +1710,7 @@ class SessionManager:
                 "enrichment": enrichment_state,
                 "trade_outcomes": outcomes_state,
                 "signal_scores": signal_scores_state,
+                "closed_trades_state": closed_trades_state,
             }
 
             self._MEMORY_JSON.write_text(
@@ -2140,28 +2160,40 @@ class SessionManager:
                     "strategy_tag": ct.get("strategy_tag", ""),
                 })
 
-        # Also include closed trades from restored memory
+        # Also include closed trades from restored memory (proper persisted data)
         prev = self._restored_memory or {}
-        for t in prev.get("trades", []):
-            side = (t.get("side") or "").upper()
-            if side != "SELL":
-                continue
-            pod_id = t.get("pod_id", "")
-            all_trades.append({
-                "pod_id": pod_id,
-                "symbol": t.get("symbol", ""),
-                "side": "long",
-                "entry_price": 0,
-                "exit_price": round(t.get("filled_price") or t.get("fill_price", 0), 2),
-                "qty": round(abs(t.get("qty", 0)), 4),
-                "realized_pnl": 0,
-                "entry_time": "",
-                "exit_time": t.get("timestamp", ""),
-                "holding_days": 0,
-                "entry_reasoning": "",
-                "conviction": 0,
-                "strategy_tag": "",
-            })
+        existing_keys = {(t["symbol"], t.get("exit_time", "")) for t in all_trades}
+        for pod_id, pod_trades in prev.get("closed_trades_state", {}).items():
+            for ct in pod_trades:
+                key = (ct.get("symbol", ""), ct.get("exit_time", ""))
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                entry_time = ct.get("entry_time", "")
+                exit_time = ct.get("exit_time", "")
+                holding_days = 0
+                if entry_time and exit_time:
+                    try:
+                        e_d = datetime.fromisoformat(entry_time.split("T")[0]).date()
+                        x_d = datetime.fromisoformat(exit_time.split("T")[0]).date()
+                        holding_days = (x_d - e_d).days
+                    except Exception:
+                        pass
+                all_trades.append({
+                    "pod_id": pod_id,
+                    "symbol": ct.get("symbol", ""),
+                    "side": ct.get("side", "long"),
+                    "entry_price": round(ct.get("entry_price", 0), 2),
+                    "exit_price": round(ct.get("exit_price", 0), 2),
+                    "qty": round(ct.get("qty", 0), 4),
+                    "realized_pnl": round(ct.get("realized_pnl", 0), 4),
+                    "entry_time": entry_time,
+                    "exit_time": exit_time,
+                    "holding_days": holding_days,
+                    "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
+                    "conviction": ct.get("conviction", 0),
+                    "strategy_tag": ct.get("strategy_tag", ""),
+                })
 
         all_trades.sort(key=lambda x: x.get("exit_time", ""), reverse=True)
         return all_trades

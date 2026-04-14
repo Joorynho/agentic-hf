@@ -2108,7 +2108,7 @@ function renderClosedTrades() {
   if (!tbody) return;
   if (badge) badge.textContent = _ctData.length + ' trade' + (_ctData.length !== 1 ? 's' : '');
   if (_ctData.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="8" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr>';
     return;
   }
   var totalPnl = 0;
@@ -2118,14 +2118,18 @@ function renderClosedTrades() {
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
     var thesis = (t.entry_reasoning || '').substring(0, 60);
     if (t.entry_reasoning && t.entry_reasoning.length > 60) thesis += '...';
+    var entryDate = t.entry_time ? t.entry_time.substring(0, 10) : '—';
+    var exitDate = t.exit_time ? t.exit_time.substring(0, 10) : '—';
     return '<tr>' +
       '<td class="pod-name">' + escapeHtml(t.pod_id || '').toUpperCase() + '</td>' +
       '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
       '<td class="r">$' + (t.entry_price || 0).toFixed(2) + '</td>' +
       '<td class="r">$' + (t.exit_price || 0).toFixed(2) + '</td>' +
       '<td class="r">' + (t.qty || 0) + '</td>' +
-      '<td class="r ct-pnl ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</td>' +
-      '<td class="r">' + (t.holding_days || '—') + '</td>' +
+      '<td class="r ct-pnl ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+      '<td class="r">' + (t.holding_days != null ? t.holding_days : '—') + '</td>' +
+      '<td>' + escapeHtml(entryDate) + '</td>' +
+      '<td>' + escapeHtml(exitDate) + '</td>' +
       '<td class="ct-thesis" title="' + escapeHtml(t.entry_reasoning || '') + '">' + escapeHtml(thesis) + '</td>' +
       '</tr>';
   }).join('');
@@ -2671,7 +2675,7 @@ function renderClosedPositions() {
       '<td class="r">$' + entryP.toFixed(2) + '</td>' +
       '<td class="r">$' + exitP.toFixed(2) + '</td>' +
       '<td class="r">' + (p.qty || 0) + '</td>' +
-      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + '</td>' +
+      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
       '<td class="r ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</td>' +
       '<td class="r">' + holdDays + '</td>' +
       '<td>' + entryDate + '</td>' +

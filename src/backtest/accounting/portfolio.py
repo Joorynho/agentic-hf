@@ -132,7 +132,7 @@ class PortfolioAccountant:
             self._closed_trades.append({
                 "symbol": symbol,
                 "side": "long" if prev_qty > 0 else "short",
-                "entry_price": entry_meta.get("entry_price", prev_cost),
+                "entry_price": entry_meta.get("entry_price") or prev_cost,
                 "exit_price": fill_price,
                 "qty": reduced_qty,
                 "realized_pnl": realized,
