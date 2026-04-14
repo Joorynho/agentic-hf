@@ -1,3 +1,4 @@
+import json
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from src.data.services.theme_scanner import ThemeScanner
@@ -34,7 +35,7 @@ async def test_run_web_searches_returns_summaries(scanner, mock_web_searcher):
 async def test_scrape_curated_sites_returns_list(scanner, mock_web_searcher):
     results = await scanner._scrape_curated_sites()
     assert isinstance(results, list)
-    assert len(results) >= 0
+    assert len(results) == 7  # one result per curated source
 
 
 @pytest.mark.asyncio
@@ -145,3 +146,36 @@ async def test_scan_end_to_end(scanner, mock_web_searcher):
     assert result[0].theme == "AI Infra"
     assert result[0].status == "active"
     assert result[0].next_review_date > result[0].discovered_date
+
+
+@pytest.mark.asyncio
+async def test_scan_respects_max_daily_adds(scanner, mock_web_searcher):
+    """scan() should return at most _MAX_DAILY_ADDS=3 tickers even if more are validated."""
+    from src.data.services.theme_scanner import _MAX_DAILY_ADDS
+
+    # Synthesize returns 5 candidates across 2 themes
+    synth_response = json.dumps({"themes": [
+        {"name": "AI Infra", "thesis": "Capex surge.", "confidence": 0.9, "tickers": [
+            {"symbol": "NBIS", "reason": "NVIDIA partner"},
+            {"symbol": "VRT", "reason": "Data center power"},
+            {"symbol": "CEG", "reason": "Nuclear energy for AI"},
+        ]},
+        {"name": "Defense", "thesis": "Geopolitical tensions.", "confidence": 0.8, "tickers": [
+            {"symbol": "AXON", "reason": "Tech defense"},
+            {"symbol": "HII", "reason": "Naval shipbuilding"},
+        ]},
+    ]})
+    # All 5 pass validation
+    validate_response = '{"valid": true, "reason": "Confirmed US-listed"}'
+
+    with patch("src.data.services.theme_scanner.llm_chat") as mock_llm, \
+         patch("src.data.services.theme_scanner.has_llm_key", return_value=True):
+        mock_llm.side_effect = [synth_response] + [validate_response] * 5
+        result = await scanner.scan(
+            headlines=[], poly_signals=[], fred_snapshot={},
+            existing_discovered={}, existing_universe=["SPY"],
+            month="April", year="2026",
+        )
+
+    assert len(result) <= _MAX_DAILY_ADDS
+    assert len(result) == 3
