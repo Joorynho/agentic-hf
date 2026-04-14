@@ -522,6 +522,15 @@ class SessionManager:
                                 ns.set(key, enrich[key])
                         logger.info("[session_manager] Restored enrichment for %s", pod_id)
 
+                # Restore discovered universe into pod namespaces
+                disc_univ = self._restored_memory.get("discovered_universe", {})
+                for pod_id, pod_disc in disc_univ.items():
+                    rt = self._pod_runtimes.get(pod_id)
+                    if rt and pod_disc.get("tickers"):
+                        rt._ns.set("discovered_tickers", pod_disc["tickers"])
+                        logger.info("[session_manager] Restored %d discovered tickers for %s",
+                                    len(pod_disc["tickers"]), pod_id)
+
                 if self._web_app:
                     lsnr = getattr(self._web_app.state, "listener", None)
                     if lsnr:
@@ -1695,6 +1704,22 @@ class SessionManager:
                 if enrich:
                     enrichment_state[pod_id] = enrich
 
+            # Collect discovered universe per pod (equities only for now)
+            discovered_universe: dict = {}
+            for pod_id, runtime in self._pod_runtimes.items():
+                tickers = runtime._ns.get("discovered_tickers")
+                prev_disc = (self._restored_memory or {}).get("discovered_universe", {})
+                if tickers:
+                    prev_tickers = prev_disc.get(pod_id, {}).get("tickers", {})
+                    merged = {**prev_tickers, **tickers}  # current session wins
+                    discovered_universe[pod_id] = {
+                        "tickers": merged,
+                        "last_scan_date": getattr(runtime, "_last_theme_scan_date", None) or "",
+                    }
+                elif pod_id in prev_disc:
+                    # Preserve previous session data if current session has nothing
+                    discovered_universe[pod_id] = prev_disc[pod_id]
+
             memory = {
                 "last_updated": datetime.now(timezone.utc).isoformat(),
                 "session_start": self._session_start.isoformat() if self._session_start else None,
@@ -1711,6 +1736,7 @@ class SessionManager:
                 "trade_outcomes": outcomes_state,
                 "signal_scores": signal_scores_state,
                 "closed_trades_state": closed_trades_state,
+                "discovered_universe": discovered_universe,
             }
 
             self._MEMORY_JSON.write_text(
