@@ -91,3 +91,15 @@ POD_UNIVERSES: dict[str, list[str]] = {
     "crypto": CRYPTO_SEED,
     "commodities": COMMODITIES_SEED,
 }
+
+# --- Theme Scanner: Curated Financial Sources ---
+# Scraped daily by ThemeScanner to detect emerging investment themes.
+THEME_SCANNER_SOURCES = [
+    "https://www.tradingkey.com/news",
+    "https://www.calcalistech.com/ctechnews",
+    "https://www.investing.com/news",
+    "https://www.thestreet.com/markets",
+    "https://simplywall.st/discover/gb/investing-ideas",
+    "https://simplywall.st/stocks",
+    "https://simplywall.st/markets/us",
+]

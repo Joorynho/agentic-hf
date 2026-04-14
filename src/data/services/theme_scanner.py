@@ -19,18 +19,9 @@ except Exception:  # pragma: no cover
     def has_llm_key():  # type: ignore[misc]
         return False
 
-logger = logging.getLogger(__name__)
+from src.core.config.universes import THEME_SCANNER_SOURCES as CURATED_SOURCES
 
-# Imported from config after Task 6 — defined locally for now
-CURATED_SOURCES = [
-    "https://www.tradingkey.com/news",
-    "https://www.calcalistech.com/ctechnews",
-    "https://www.investing.com/news",
-    "https://www.thestreet.com/markets",
-    "https://simplywall.st/discover/gb/investing-ideas",
-    "https://simplywall.st/stocks",
-    "https://simplywall.st/markets/us",
-]
+logger = logging.getLogger(__name__)
 
 _SEARCH_QUERIES = [
     "top performing stock market sectors this week {month} {year}",
