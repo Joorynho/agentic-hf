@@ -1,11 +1,9 @@
 from __future__ import annotations
-import json
 import logging
 from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from src.core.bus.event_bus import EventBus
 from src.core.config.universes import EQUITIES_SEED
-from src.core.models.messages import AgentMessage
 from src.core.scoring import compute_macro_score
 from src.data.adapters.fred_adapter import FredAdapter
 from src.data.adapters.sentiment import score_items, find_position_alerts
@@ -23,7 +21,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _PRICE_SAMPLE_SIZE = 10
-_MIN_SEED_RETENTION = 0.6
 
 
 class EquitiesResearcher(BasePodAgent):
@@ -120,71 +117,6 @@ class EquitiesResearcher(BasePodAgent):
         self._ns.set("discovered_tickers", updated_discovered)
         self._last_theme_scan_date = today
         return updated_discovered
-
-    async def _review_universe(self, fred_snapshot, poly_signals, news_items, live_quotes) -> list[str]:
-        """Use LLM to review and potentially update the tradeable universe daily."""
-        try:
-            from src.core.llm import llm_chat
-        except Exception:
-            return list(EQUITIES_SEED)
-
-        current = self.recall("universe") or list(EQUITIES_SEED)
-        headlines = [n.get("title", n.get("text", ""))[:80] for n in (news_items or [])[:15]]
-        movers = [f"{s}: ${q.get('price', 0):.2f} ({q.get('change_pct', 0):+.1f}%)"
-                  for s, q in (live_quotes or {}).items() if q.get("change_pct")][:10]
-        poly_top = [s.get("question", "")[:60] for s in (poly_signals or [])[:5]]
-
-        prompt = (
-            f"You are the equities researcher for a macro hedge fund.\n"
-            f"Current universe ({len(current)} symbols): {', '.join(current[:30])}{'...' if len(current) > 30 else ''}\n"
-            f"Seed universe has {len(EQUITIES_SEED)} symbols.\n\n"
-            f"Today's context:\n"
-            f"- Top headlines: {'; '.join(headlines[:8]) if headlines else 'none'}\n"
-            f"- Price movers: {'; '.join(movers[:6]) if movers else 'none'}\n"
-            f"- Polymarket signals: {'; '.join(poly_top) if poly_top else 'none'}\n"
-            f"- FRED macro: VIX={fred_snapshot.get('VIXCLS', '?')}, 10Y={fred_snapshot.get('DGS10', '?')}\n\n"
-            f"Review the universe. You may ADD up to 5 symbols or REMOVE up to 5 symbols "
-            f"based on current macro conditions and news. At least {int(_MIN_SEED_RETENTION*100)}% of the seed must remain.\n"
-            f"Respond with JSON: {{\"add\": [\"SYM1\"], \"remove\": [\"SYM2\"], \"reasoning\": \"...\"}}\n"
-            f"If no changes needed, return {{\"add\": [], \"remove\": [], \"reasoning\": \"Universe is appropriate\"}}"
-        )
-
-        try:
-            resp = llm_chat([{"role": "user", "content": prompt}], max_tokens=300)
-            start = resp.find("{")
-            end = resp.rfind("}") + 1
-            if start >= 0 and end > start:
-                parsed = json.loads(resp[start:end])
-                add_syms = [s.upper().strip() for s in parsed.get("add", []) if s.strip()][:5]
-                rm_syms = [s.upper().strip() for s in parsed.get("remove", []) if s.strip()][:5]
-                new_universe = [s for s in current if s not in rm_syms] + add_syms
-                # Enforce minimum seed retention
-                seed_kept = len([s for s in EQUITIES_SEED if s in new_universe])
-                if seed_kept < len(EQUITIES_SEED) * _MIN_SEED_RETENTION:
-                    logger.warning("[equities.researcher] Universe review would drop too many seed symbols, skipping")
-                    return current
-                # Publish universe change activity
-                if add_syms or rm_syms:
-                    reasoning = parsed.get("reasoning", "")[:300]
-                    await self._bus.publish("agent.activity", AgentMessage(
-                        timestamp=datetime.now(timezone.utc),
-                        sender=f"{self._pod_id}.researcher",
-                        recipient="dashboard",
-                        topic="agent.activity",
-                        payload={
-                            "agent_id": f"{self._pod_id}_researcher",
-                            "agent_role": "Researcher",
-                            "pod_id": self._pod_id,
-                            "action": "universe_update",
-                            "summary": f"Universe updated: +{len(add_syms)} -{len(rm_syms)} symbols ({', '.join(add_syms + rm_syms)})",
-                            "detail": reasoning,
-                        },
-                    ), publisher_id=f"{self._pod_id}.researcher")
-                    logger.info("[equities.researcher] Universe updated: +%s -%s", add_syms, rm_syms)
-                return new_universe
-        except Exception as e:
-            logger.info("[equities.researcher] Universe review LLM failed: %s", e)
-        return current
 
     async def run_cycle(self, context: dict) -> dict:
         current_universe = self.recall("universe") or list(EQUITIES_SEED)
