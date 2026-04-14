@@ -841,6 +841,7 @@ function handleMessage(msg) {
     updatePerfTable();
     calculateRisk();
     updateRiskTable();
+    fetchPositionsFromApi();
     updateTopHoldings();
     updateActivityFeed();
     updateDecisionTimeline();
@@ -870,7 +871,7 @@ function handleMessage(msg) {
     const pod_id = msg.pod_id || data.pod_id;
     if (pod_id) {
       if (msg.type === 'pod_summary') {
-        pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+      pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
         if (data.performance_metrics && Object.keys(data.performance_metrics).length > 0) {
           pods[pod_id].performance_metrics = data.performance_metrics;
         }
@@ -963,6 +964,7 @@ function handleMessage(msg) {
       updatePerfTable();
       calculateRisk();
       updateRiskTable();
+      fetchPositionsFromApi();
       updateTopHoldings();
       refreshOpenModal();
       if (document.getElementById('tab-execution') && document.getElementById('tab-execution').classList.contains('active')) fetchClosedTrades();
@@ -1073,17 +1075,49 @@ function updatePodsTable() {
 
 function getPodNav(d) { return d.nav ?? (d.risk_metrics && d.risk_metrics.nav) ?? 0; }
 function getPodPnl(d) { return d.daily_pnl ?? (d.risk_metrics && d.risk_metrics.daily_pnl) ?? 0; }
-function getPodPositions(d) { return d.current_positions || d.positions || []; }
+function getPodPositions(d) {
+  if (!d || typeof d !== 'object') return [];
+  var raw = d.current_positions || d.positions || (d.risk_metrics && d.risk_metrics.positions) || [];
+  return Array.isArray(raw) ? raw : (raw && typeof raw === 'object' ? Object.values(raw) : []);
+}
 function getPodInvested(d) { return d.invested ?? (d.risk_metrics && d.risk_metrics.invested) ?? 0; }
 function getPodCash(d) { return d.cash ?? (d.risk_metrics && d.risk_metrics.cash) ?? 0; }
 function getPodStartCap(d) { return d.starting_capital ?? (d.risk_metrics && d.risk_metrics.starting_capital) ?? 0; }
+
+// Positions from /api/positions — single source for Top Holdings, drilldown, and KPI
+var _positionsFromApi = [];
+var _positionsFetchInFlight = false;
+function fetchPositionsFromApi() {
+  if (_positionsFetchInFlight) return;
+  _positionsFetchInFlight = true;
+  fetch('/api/positions').then(function(r) { return r.json(); })
+    .then(function(res) {
+      _positionsFromApi = res.positions || [];
+      _positionsFetchInFlight = false;
+      // Merge into pods so position detail modal (buildPositionFromLocal) can find data
+      var byPod = {};
+      _positionsFromApi.forEach(function(p) {
+        var pid = p._pod || 'unknown';
+        if (!byPod[pid]) byPod[pid] = [];
+        byPod[pid].push(p);
+      });
+      Object.keys(byPod).forEach(function(pid) {
+        pods[pid] = pods[pid] || {};
+        pods[pid].current_positions = byPod[pid];
+        pods[pid].positions = byPod[pid];
+      });
+      updateTopHoldings();
+      updateFirmMetrics();
+    })
+    .catch(function() { _positionsFetchInFlight = false; });
+}
 
 function updateFirmMetrics() {
   const ids = Object.keys(pods);
   const nav = ids.reduce((s,id) => s + getPodNav(pods[id]), 0);
   const pnl = ids.reduce((s,id) => s + getPodPnl(pods[id]), 0);
   const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
-  const pos = ids.reduce((s,id) => {
+  const pos = _positionsFromApi.length > 0 ? _positionsFromApi.length : ids.reduce((s,id) => {
     const p = getPodPositions(pods[id]);
     return s + (Array.isArray(p) ? p.length : (p && typeof p === 'object' ? Object.keys(p).length : 0));
   }, 0);
@@ -1486,19 +1520,24 @@ function updateGovHub() {
 }
 
 // ─── 12. Top Holdings ──────────────────────────────────────────────────────
+// Uses _positionsFromApi (fetched from /api/positions) — same as drilldown and KPI
 function updateTopHoldings() {
   var tbody = document.getElementById('holdings-table');
   var badge = document.getElementById('holdings-badge');
   if (!tbody) return;
-  var allPos = [];
-  var ids = Object.keys(pods);
-  ids.forEach(function(id) {
-    var positions = getPodPositions(pods[id]);
-    var arr = Array.isArray(positions) ? positions : (positions && typeof positions === 'object' ? Object.values(positions) : []);
-    arr.forEach(function(p) {
-      if (p && (p.symbol || p.qty != null)) allPos.push(Object.assign({ _pod: id }, p));
+  var allPos;
+  if (_positionsFromApi.length > 0) {
+    allPos = _positionsFromApi.slice();
+  } else {
+    allPos = [];
+    Object.keys(pods).forEach(function(id) {
+      var positions = getPodPositions(pods[id]);
+      var arr = Array.isArray(positions) ? positions : (positions && typeof positions === 'object' ? Object.values(positions) : []);
+      arr.forEach(function(p) {
+        if (p && (p.symbol || p.qty != null)) allPos.push(Object.assign({ _pod: id }, p));
+      });
     });
-  });
+  }
   if (badge) badge.textContent = allPos.length + ' position' + (allPos.length !== 1 ? 's' : '');
   if (allPos.length === 0) {
     tbody.innerHTML = '<tr><td colspan="8" class="empty"><div class="empty-txt">No positions yet</div></td></tr>';
@@ -2123,8 +2162,7 @@ function openDrilldown(podId) {
   }).join('');
 
   var posTbody = document.getElementById('dd-positions');
-  var positions = getPodPositions(d);
-  var posArr = Array.isArray(positions) ? positions : (positions && typeof positions === 'object' ? Object.values(positions) : []);
+  var posArr = _positionsFromApi.filter(function(p) { return (p._pod || '').toLowerCase() === podId.toLowerCase(); });
   if (posArr.length > 0) {
     posTbody.innerHTML = posArr.map(function(p) {
       var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
