@@ -1588,7 +1588,7 @@ function updateTopHoldings() {
     var podEsc = escapeHtml(p._pod || '');
     var symEsc = escapeHtml(p.symbol || '');
     var entryDate = escapeHtml(p.entry_date || '—');
-    var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
+    var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis) : '';
     var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
     var alertInfo = _symbolAlerts[p.symbol || ''];
     var alertBadge = (alertInfo && alertInfo.length > 0)
@@ -2148,8 +2148,7 @@ function renderClosedTrades() {
     var pnl = t.realized_pnl || 0;
     totalPnl += pnl;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
-    var thesis = (t.entry_reasoning || '').substring(0, 60);
-    if (t.entry_reasoning && t.entry_reasoning.length > 60) thesis += '...';
+    var thesis = t.entry_reasoning || '';
     var entryDate = t.entry_time ? t.entry_time.substring(0, 10) : '—';
     var exitDate = t.exit_time ? t.exit_time.substring(0, 10) : '—';
     return '<tr>' +
@@ -2218,7 +2217,7 @@ function openDrilldown(podId) {
       var entryDate = escapeHtml(p.entry_date || '—');
       var podEsc = escapeHtml(podId);
       var symEsc = escapeHtml(p.symbol || '');
-      var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis.slice(0, 300)) : '';
+      var thesis = p.entry_thesis ? escapeHtml(p.entry_thesis) : '';
       var symTitle = thesis ? 'Entry thesis: ' + thesis : 'No entry thesis recorded';
       return '<tr class="holdings-row" onclick="showPositionDetail(\'' + podEsc + '\',\'' + symEsc + '\')" title="Click for full detail" style="cursor:pointer">' +
         '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
@@ -2498,13 +2497,13 @@ function renderReviews() {
             var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
             var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
             var entry = p.cost_basis || p.avg_entry || 0;
-            var thesis = p.entry_thesis ? p.entry_thesis.slice(0, 80) + (p.entry_thesis.length > 80 ? '…' : '') : '—';
+            var thesis = p.entry_thesis || '—';
             return '<tr><td><strong>' + tickerDisplay(p.symbol || '') + '</strong></td>' +
               '<td class="r">' + (p.qty || 0).toFixed(3) + '</td>' +
               '<td class="r">$' + entry.toFixed(2) + '</td>' +
               '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
               '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
-              '<td style="color:var(--text-dim);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(p.entry_thesis || '') + '">' + escapeHtml(thesis) + '</td></tr>';
+              '<td class="ct-thesis-cell" title="' + escapeHtml(thesis) + '">' + escapeHtml(thesis) + '</td></tr>';
           }).join('') +
           '</tbody></table></div>';
       }

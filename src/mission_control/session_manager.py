@@ -1396,7 +1396,7 @@ class SessionManager:
                         "days_held": days_held,
                         "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
                         "take_profit_pct": meta.get("take_profit_pct", 0.15),
-                        "entry_thesis": meta.get("reasoning", "")[:100],
+                        "entry_thesis": meta.get("reasoning", ""),
                     })
                 if pod_positions:
                     pos_data[pod_id] = pod_positions
@@ -2181,8 +2181,8 @@ class SessionManager:
                     "entry_time": entry_time,
                     "exit_time": exit_time,
                     "holding_days": holding_days,
-                    "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
-                    "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
+                    "entry_reasoning": ct.get("entry_reasoning") or "",
+                    "exit_reasoning": ct.get("exit_reasoning") or "",
                     "conviction": ct.get("conviction", 0),
                     "strategy_tag": ct.get("strategy_tag", ""),
                 })
@@ -2220,8 +2220,8 @@ class SessionManager:
                         "entry_time": entry_time,
                         "exit_time": exit_time,
                         "holding_days": holding_days,
-                        "entry_reasoning": (ct.get("entry_reasoning") or "")[:200],
-                        "exit_reasoning": (ct.get("exit_reasoning") or "")[:200],
+                        "entry_reasoning": ct.get("entry_reasoning") or "",
+                        "exit_reasoning": ct.get("exit_reasoning") or "",
                         "conviction": ct.get("conviction", 0),
                         "strategy_tag": ct.get("strategy_tag", ""),
                     })
