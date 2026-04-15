@@ -2294,8 +2294,8 @@ class SessionManager:
                     "entry_time": entry_time,
                     "exit_time": exit_time,
                     "holding_days": holding_days,
-                    "entry_reasoning": _unwrap(entry_reasoning_raw, symbol)[:200],
-                    "exit_reasoning": _unwrap(t.get("reasoning", ""), symbol)[:200],
+                    "entry_reasoning": _unwrap(entry_reasoning_raw, symbol),
+                    "exit_reasoning": _unwrap(t.get("reasoning", ""), symbol),
                     "conviction": t.get("conviction", 0),
                     "strategy_tag": t.get("strategy_tag", ""),
                 })

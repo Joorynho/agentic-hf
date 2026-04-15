@@ -1768,7 +1768,7 @@ function renderPositionModal(d, overlay) {
       qty: d.qty,
       fill_price: d.cost_basis,
       side: 'BUY',
-      reasoning: d.entry_thesis ? 'Entry: ' + cleanThesis(d.entry_thesis, d.symbol).slice(0, 150) : 'Position opened (fill data predates this session)',
+      reasoning: d.entry_thesis ? 'Entry: ' + cleanThesis(d.entry_thesis, d.symbol) : 'Position opened (fill data predates this session)',
       _synthetic: true
     }];
   }

@@ -1795,7 +1795,7 @@ button { font-family: inherit; cursor: pointer; }
 .fill-qty { color:#fff; }
 .fill-px  { color:var(--text-muted,#6a82a0); }
 .fill-date { float:right; color:var(--text-muted,#6a82a0); font-size:10px; }
-.fill-reason { width:100%; font-size:10px; color:var(--text-muted,#6a82a0); margin-top:2px; line-height:1.4; }
+.fill-reason { width:100%; font-size:10px; color:var(--text-muted,#6a82a0); margin-top:2px; line-height:1.4; max-height:120px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
 .fill-entry.fill-synthetic { opacity:0.75; border-left-style:dashed; }
 
 /* Partial exits */
