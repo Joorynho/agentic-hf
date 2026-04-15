@@ -172,6 +172,13 @@ class PortfolioAccountant:
         pos["quantity"] = new_qty
         pos["avg_cost"] = self._cost_basis[symbol]
 
+        # Update cash: BUY costs money, SELL returns money
+        notional = abs(qty) * fill_price
+        if qty > 0:  # BUY
+            self._cash -= notional
+        elif qty < 0:  # SELL
+            self._cash += notional
+
         # Log fill in audit trail
         self._fill_log.append(
             {
@@ -281,6 +288,14 @@ class PortfolioAccountant:
     @property
     def starting_capital(self) -> float:
         return self._starting_capital
+
+    @property
+    def cash(self) -> float:
+        return self._cash
+
+    def has_sufficient_cash(self, notional: float) -> bool:
+        """Check if the pod has enough cash to fund a BUY of the given notional value."""
+        return self._cash >= notional
 
     @property
     def realized_pnl(self) -> float:
@@ -401,6 +416,7 @@ class PortfolioAccountant:
 
         Each dict must have: symbol, qty, avg_entry, current_price.
         Call this BEFORE the first mark_to_market cycle.
+        Adjusts _cash to reflect cost of loaded positions.
         """
         for p in positions:
             sym = p["symbol"]
@@ -417,29 +433,37 @@ class PortfolioAccountant:
             }
             self._cost_basis[sym] = avg_entry
             self._last_price[sym] = current_price
+            # Deduct cost basis from cash (position was funded from capital)
+            self._cash -= abs(qty) * avg_entry
         if positions:
-            logger.info("[%s] Loaded %d positions from memory/Alpaca", self._pod_id, len(positions))
+            logger.info("[%s] Loaded %d positions from memory/Alpaca (cash=$%.2f)",
+                        self._pod_id, len(positions), self._cash)
 
     def reconcile_capital_from_positions(self, allocated_capital: float | None = None) -> None:
-        """Align starting_capital with loaded positions only when they exceed allocation.
+        """Ensure cash reflects loaded positions without inflating starting_capital.
 
-        Preserves allocated capital (e.g. $100 per pod): crypto with no positions
-        stays at 100; FX with 65 invested keeps NAV=100 and cash=35. Only reconcile
-        when hydrated positions exceed allocated_capital (e.g. Alpaca has 50k when
-        config allocated 100). Uses allocated_capital if provided, else _starting_capital.
+        Starting capital is NEVER increased beyond the allocated amount — this is
+        the hard capital constraint. If loaded positions cost more than the allocation,
+        cash goes negative (a legacy debt). The execution gate will prevent new BUYs
+        until the pod sells positions to free up cash.
         """
+        cap = allocated_capital if allocated_capital is not None and allocated_capital > 0 else self._starting_capital
         total_cost = sum(
             abs(p["quantity"]) * self._cost_basis.get(sym, p["avg_cost"])
             for sym, p in self._positions.items()
             if p.get("quantity", 0) != 0
         )
-        threshold = allocated_capital if allocated_capital is not None and allocated_capital > 0 else self._starting_capital
-        # Keep allocated capital: only reconcile when positions exceed allocation
-        if total_cost == 0 or total_cost <= threshold:
-            return
-        prev = self._starting_capital
-        self._starting_capital = total_cost
-        logger.info(
-            "[%s] Reconciled starting_capital: $%.2f -> $%.2f (%d positions)",
-            self._pod_id, prev, total_cost, len([p for p in self._positions.values() if p.get("quantity", 0) != 0]),
-        )
+        # Ensure cash = starting_capital - invested (load_positions already does this,
+        # but reconcile as safety net)
+        self._cash = cap - total_cost
+        if total_cost > cap:
+            logger.warning(
+                "[%s] Positions ($%.2f) exceed allocated capital ($%.2f) — cash is negative ($%.2f). "
+                "Pod must sell positions before buying new ones.",
+                self._pod_id, total_cost, cap, self._cash,
+            )
+        else:
+            logger.info(
+                "[%s] Reconciled: invested=$%.2f, cash=$%.2f, starting_capital=$%.2f",
+                self._pod_id, total_cost, self._cash, self._starting_capital,
+            )

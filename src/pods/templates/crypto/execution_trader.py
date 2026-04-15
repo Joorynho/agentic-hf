@@ -1,5 +1,6 @@
 from __future__ import annotations
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -157,6 +158,47 @@ class CryptoExecutionTrader(BasePodAgent):
         except Exception as e:
             logger.error("[crypto.exec] Error checking governance constraints: %s", e)
             # Continue with execution (fail-open for allocation checks)
+
+        # Hard cash gate: reject BUY orders when pod has insufficient cash
+        if order.side == Side.BUY:
+            accountant = self._ns.get("accountant")
+            if accountant:
+                est_price = order.limit_price or self.recall("last_prices", {}).get(order.symbol, 100.0)
+                required_notional = order.quantity * est_price
+                if not accountant.has_sufficient_cash(required_notional):
+                    available = accountant.cash
+                    if available <= 1.0:
+                        logger.warning(
+                            "[crypto.exec] Order %s rejected: insufficient cash ($%.2f available, $%.2f required)",
+                            order.id, available, required_notional,
+                        )
+                        self._session_logger and self._session_logger.log_reasoning(
+                            f"execution:{self._pod_id}",
+                            "order_rejected_insufficient_cash",
+                            f"Order {order.symbol} rejected: insufficient cash (${available:.2f} available, ${required_notional:.2f} required)",
+                        )
+                        return {
+                            "execution_rejected": True,
+                            "rejection_reason": "insufficient_cash",
+                            "rejection_detail": f"Need ${required_notional:.2f} but only ${available:.2f} cash available",
+                        }
+                    # Scale down to fit available cash
+                    scaled_qty = math.floor(available / est_price * 100) / 100
+                    if scaled_qty * est_price < 1.0:
+                        logger.warning(
+                            "[crypto.exec] Order %s rejected: scaled qty too small ($%.2f cash)",
+                            order.id, available,
+                        )
+                        return {
+                            "execution_rejected": True,
+                            "rejection_reason": "insufficient_cash",
+                            "rejection_detail": f"Cash ${available:.2f} too small for {order.symbol}",
+                        }
+                    logger.info(
+                        "[crypto.exec] Scaling order %s from %.4f to %.4f (cash limit: $%.2f)",
+                        order.id, order.quantity, scaled_qty, available,
+                    )
+                    order.quantity = scaled_qty
 
         try:
             logger.info(

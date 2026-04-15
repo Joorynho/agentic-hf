@@ -410,12 +410,14 @@ function renderCurrentMarkets(signals) {
     last.forEach(s => { prevByMarket[s.market_id || s.question] = s.implied_prob; });
   }
 
-  tbody.innerHTML = signals.map(s => {
+  tbody.innerHTML = signals.map((s, i) => {
     const q = s.question || s.market || JSON.stringify(s);
     const prevProb = prevByMarket[s.market_id || q];
     const delta = formatDelta(s.implied_prob, prevProb);
-    return '<tr title="' + escapeHtml(q).replace(/"/g, '&quot;') + '">' +
-      '<td>' + truncate(q, 40) + '</td>' +
+    const rowId = 'poly-row-' + i;
+    return '<tr class="poly-market-row" data-rowid="' + rowId + '" style="cursor:pointer">' +
+      '<td><span class="poly-q-short">' + truncate(q, 40) + '</span>' +
+      '<span class="poly-q-full" id="' + rowId + '" style="display:none;white-space:normal;word-break:break-word;color:var(--text-primary)">' + escapeHtml(q) + '</span></td>' +
       '<td class="num">' + statusBadge(s.status || 'Active') + '</td>' +
       '<td class="num">' + (s.yes_price != null ? s.yes_price.toFixed(2) : '—') + '</td>' +
       '<td class="num">' + (s.no_price != null ? s.no_price.toFixed(2) : '—') + '</td>' +
@@ -425,6 +427,20 @@ function renderCurrentMarkets(signals) {
       '<td class="num">' + formatEndDate(s.end_date) + '</td>' +
       '</tr>';
   }).join('');
+
+  // Click handler: toggle full question text
+  tbody.querySelectorAll('.poly-market-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+      var rowId = row.dataset.rowid;
+      var shortEl = row.querySelector('.poly-q-short');
+      var fullEl = document.getElementById(rowId);
+      if (!shortEl || !fullEl) return;
+      var isExpanded = fullEl.style.display !== 'none';
+      shortEl.style.display = isExpanded ? '' : 'none';
+      fullEl.style.display = isExpanded ? 'none' : '';
+      row.style.background = isExpanded ? '' : 'var(--bg-elevated)';
+    });
+  });
 }
 
 const COLORS = ['#00cfe8', '#f0a030', '#00c888', '#7c5cfc', '#e84040'];
@@ -533,14 +549,16 @@ function renderHistoryTable() {
 
   const rows = [];
   const recent = signalHistory.slice(-10).reverse();
-  recent.forEach(entry => {
+  recent.forEach((entry, entryIdx) => {
     const top5 = [...(entry.signals || [])]
       .sort((a, b) => (b.implied_prob || 0) - (a.implied_prob || 0))
       .slice(0, 5);
     top5.forEach((sig, i) => {
-      rows.push('<tr>' +
+      const hRowId = 'hist-row-' + entryIdx + '-' + i;
+      rows.push('<tr class="poly-market-row" data-rowid="' + hRowId + '" style="cursor:pointer">' +
         '<td class="num">' + (i === 0 ? formatTime(entry.ts) : '') + '</td>' +
-        '<td>' + truncate(sig.question, 35) + '</td>' +
+        '<td><span class="poly-q-short">' + truncate(sig.question, 35) + '</span>' +
+        '<span class="poly-q-full" id="' + hRowId + '" style="display:none;white-space:normal;word-break:break-word;color:var(--text-primary)">' + escapeHtml(sig.question || '') + '</span></td>' +
         '<td class="num accent">' + formatPct(sig.implied_prob) + '</td>' +
         '</tr>');
     });
@@ -548,6 +566,20 @@ function renderHistoryTable() {
   });
 
   tbody.innerHTML = rows.join('');
+
+  // Click handler: toggle full question text
+  tbody.querySelectorAll('.poly-market-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+      var rowId = row.dataset.rowid;
+      var shortEl = row.querySelector('.poly-q-short');
+      var fullEl = document.getElementById(rowId);
+      if (!shortEl || !fullEl) return;
+      var isExpanded = fullEl.style.display !== 'none';
+      shortEl.style.display = isExpanded ? '' : 'none';
+      fullEl.style.display = isExpanded ? 'none' : '';
+      row.style.background = isExpanded ? '' : 'var(--bg-elevated)';
+    });
+  });
 }
 
 function renderContributors(signals, confidence, macroScore, momentum) {
@@ -1126,7 +1158,7 @@ function updateFirmMetrics() {
     return s + (Array.isArray(p) ? p.length : (p && typeof p === 'object' ? Object.keys(p).length : 0));
   }, 0);
 
-  if (initialCapital === 0 && ids.length > 0) {
+  if (ids.length > 0) {
     initialCapital = ids.reduce(function(s, id) {
       return s + (getPodStartCap(pods[id]) || getPodNav(pods[id]));
     }, 0);
