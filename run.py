@@ -15,7 +15,7 @@ from src.web.server import create_app
 
 async def run_trading_session(manager: SessionManager):
     """Initialize pods, then run the event loop that fetches bars and emits summaries."""
-    await manager.start_live_session()
+    await manager.start_live_session(capital_per_pod=1000.0)
     await manager.run_event_loop(interval_seconds=60.0, governance_freq=5)
 
 
