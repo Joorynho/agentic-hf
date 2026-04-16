@@ -28,6 +28,7 @@ from src.core.position_aging import check_aging
 from src.core.concentration import aggregate_exposure
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
+from src.core.state.nav_store import NavStore
 from src.data.adapters.fred_adapter import FredAdapter
 from src.data.adapters.gdelt_adapter import GdeltAdapter
 from src.data.adapters.market_tracker import MarketTracker
@@ -39,6 +40,7 @@ from src.data.adapters.price_service import PriceService
 from src.data.adapters.stockprices_adapter import StockPricesAdapter
 from src.data.adapters.coinmarketcap_adapter import CoinMarketCapAdapter
 from src.data.adapters.alphavantage_adapter import AlphaVantageAdapter
+from src.data.adapters.benchmark import BenchmarkAdapter
 from src.core.models.allocation import MandateUpdate
 from src.core.models.market import Bar
 from src.core.models.config import PodConfig, RiskBudget, ExecutionConfig, BacktestConfig
@@ -201,6 +203,16 @@ class SessionManager:
         from src.core.source_attribution import SourceAttributor
         self._source_attributors: dict[str, SourceAttributor] = {}
 
+        # NAV history (SQLite), benchmarks, firm-level P&L continuity
+        self._nav_store: NavStore | None = None
+        self._benchmark_adapter: BenchmarkAdapter | None = None
+        self._benchmark_returns: dict = {}
+        self._firm_peak_nav: float = 0.0
+        self._firm_inception_pnl: float = 0.0
+        self._last_total_realized_snapshot: float = 0.0
+        self._last_drawdown_tier: str = "none"
+        self._cro_agent = None
+
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
     def set_web_app(self, app) -> None:
@@ -237,6 +249,16 @@ class SessionManager:
 
         self._start_time = datetime.now()
         self._session_start = datetime.now()
+        self._MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        if self._nav_store:
+            try:
+                self._nav_store.close()
+            except Exception:
+                pass
+            self._nav_store = None
+        self._nav_store = NavStore(str(self._MEMORY_DIR / "state.db"))
+        self._benchmark_adapter = BenchmarkAdapter()
+        self._benchmark_returns = {}
         self._capital_per_pod = capital_per_pod
         total_capital = capital_per_pod * len(POD_IDS)
 
@@ -444,6 +466,7 @@ class SessionManager:
             ceo = CEOAgent(bus=self._event_bus, session_logger=self._session_logger)
             cio = CIOAgent(bus=self._event_bus, allocator=self._allocator, session_logger=self._session_logger)
             cro = CROAgent(bus=self._event_bus)
+            self._cro_agent = cro
             self._cio_agent = cio
             self._governance = GovernanceOrchestrator(
                 ceo=ceo,
@@ -502,6 +525,20 @@ class SessionManager:
 
                 # Backfill entry metadata for hydrated positions from memory trades
                 self._backfill_entry_metadata_from_memory(self._restored_memory)
+
+                saved_pods = self._restored_memory.get("pods", {}) or {}
+                for pod_id, runtime in self._pod_runtimes.items():
+                    acct = runtime._ns.get("accountant")
+                    if acct and pod_id in saved_pods:
+                        acct.load_entry_state(saved_pods[pod_id])
+
+                firm_prev = self._restored_memory.get("firm", {}) or {}
+                self._firm_inception_pnl = float(firm_prev.get("inception_pnl", 0.0) or 0.0)
+                self._firm_peak_nav = float(firm_prev.get("peak_nav", 0.0) or 0.0)
+                self._last_total_realized_snapshot = sum(
+                    float(saved_pods.get(pid, {}).get("realized_pnl", 0) or 0)
+                    for pid in POD_IDS
+                )
 
                 # Restore governance decisions so they persist across restarts
                 restored_gov = self._restored_memory.get("governance", [])
@@ -671,6 +708,10 @@ class SessionManager:
                 pod_summaries=pod_dicts,
                 risk_halt=self._risk_halt,
                 risk_halt_reason=self._risk_halt_reason,
+                firm_inception_pnl=self._firm_inception_pnl,
+                firm_peak_nav=self._firm_peak_nav,
+                benchmark_returns=self._benchmark_returns,
+                drawdown_tier=self._last_drawdown_tier,
             )
         except Exception as e:
             logger.debug("[session_manager] Failed to update web state: %s", e)
@@ -850,8 +891,9 @@ class SessionManager:
                         attr = self._source_attributors.get(pod_id)
                         if attr:
                             try:
-                                closed = runtime._accountant.closed_trades
-                                if closed:
+                                _acct = runtime._ns.get("accountant")
+                                closed = _acct.closed_trades if _acct else []
+                                if closed and attr:
                                     attr.ingest_batch(closed)
                                     runtime._ns.set("source_weights", attr.weights())
                                     logger.debug(
@@ -864,6 +906,58 @@ class SessionManager:
                     # 4. Collect pod summaries for governance and emission
                     pod_summaries = await self._collect_pod_summaries()
                     logger.info("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
+
+                    # 4.0 Firm drawdown circuit breaker (vs peak NAV from memory)
+                    total_firm_nav = 0.0
+                    for s in pod_summaries.values():
+                        rm = getattr(s, "risk_metrics", None)
+                        if rm and getattr(rm, "nav", None) is not None:
+                            total_firm_nav += float(rm.nav)
+                    self._firm_peak_nav = max(self._firm_peak_nav, total_firm_nav)
+                    if self._cro_agent and self._firm_peak_nav > 0:
+                        dd_res = self._cro_agent.check_firm_drawdown(self._firm_peak_nav, total_firm_nav)
+                        tier = dd_res.get("tier", "none")
+                        for _pid, _rt in self._pod_runtimes.items():
+                            _rt._ns.set("drawdown_halt", tier == "halt")
+                            _rt._ns.set("drawdown_sizing_mult", 0.5 if tier == "orange" else 1.0)
+                        if tier != "none" and dd_res.get("message"):
+                            sev = (
+                                "critical"
+                                if tier == "halt"
+                                else "warning"
+                                if tier in ("yellow", "orange")
+                                else "info"
+                            )
+                            if tier != self._last_drawdown_tier or self._iteration % 5 == 0:
+                                try:
+                                    dd_msg = AgentMessage(
+                                        timestamp=datetime.now(timezone.utc),
+                                        sender="cro",
+                                        recipient="dashboard",
+                                        topic="risk.alert",
+                                        payload={
+                                            "pod_id": "firm",
+                                            "message": dd_res["message"],
+                                            "severity": sev,
+                                            "action": "firm_drawdown",
+                                            "drawdown_tier": tier,
+                                            "drawdown_pct": dd_res.get("drawdown_pct"),
+                                        },
+                                    )
+                                    await self._event_bus.publish(
+                                        "risk.alert", dd_msg, publisher_id="cro",
+                                    )
+                                except Exception as e:
+                                    logger.debug("[session_manager] drawdown alert: %s", e)
+                        self._last_drawdown_tier = tier
+
+                    # Benchmark reference returns (non-blocking)
+                    if self._iteration % 10 == 0 and self._benchmark_adapter and self._session_start:
+                        try:
+                            since = self._session_start.strftime("%Y-%m-%d")
+                            self._benchmark_returns = await self._benchmark_adapter.fetch_all(since)
+                        except Exception as e:
+                            logger.debug("[session_manager] benchmark fetch: %s", e)
 
                     # 4.1. Compute firm-wide sector concentration and push to each pod namespace
                     firm_exposure = aggregate_exposure(pod_summaries)
@@ -1494,11 +1588,13 @@ class SessionManager:
                 if isinstance(perf, dict) and isinstance(stats, dict):
                     pod_scores[pod_id] = score_pod(pod_id, perf, stats).score
 
-            if not pod_scores or not self._capital_allocator:
+            if not pod_scores or not self._allocator:
                 return
 
             # Suggest new allocations
-            new_allocs = self._capital_allocator.suggest_reallocation(pod_scores)
+            new_allocs = self._allocator.suggest_reallocation(
+                pod_scores, min_pct=0.15, max_pct=0.40,
+            )
             firm_nav = sum(
                 (s.risk_metrics.nav if (s.risk_metrics and s.risk_metrics.nav) else 0.0)
                 for s in pod_summaries.values()
@@ -1518,10 +1614,11 @@ class SessionManager:
 
                 if delta < -10.0:
                     # Pod needs to shrink — transfer available cash, mark trim target
-                    available_cash = getattr(runtime._accountant, "_cash", 0.0)
+                    acct_rb = runtime._ns.get("accountant")
+                    available_cash = getattr(acct_rb, "_cash", 0.0) if acct_rb else 0.0
                     transfer = min(available_cash, abs(delta))
-                    if transfer > 1.0:
-                        runtime._accountant._cash -= transfer
+                    if transfer > 1.0 and acct_rb:
+                        acct_rb._cash -= transfer
                         logger.info("[realloc] %s -> trim $%.2f (target $%.2f)", pod_id, transfer, target_capital)
                     runtime._ns.set("trim_target_capital", round(target_capital, 2))
                     # Clear any stale growth target
@@ -1539,7 +1636,7 @@ class SessionManager:
                     runtime._ns.delete("growth_target_capital")
 
             # Update allocator percentages
-            self._capital_allocator._allocations.update(new_allocs)
+            self._allocator._allocations.update(new_allocs)
             logger.info("[realloc] Capital reallocation applied: %s", new_allocs)
 
         except Exception as e:
@@ -1595,6 +1692,80 @@ class SessionManager:
     _MEMORY_DIR = Path(__file__).parent.parent.parent / "data"
     _MEMORY_JSON = _MEMORY_DIR / "memory.json"
     _MEMORY_MD = _MEMORY_DIR / "memory.md"
+
+    def _compute_execution_quality(self) -> dict[str, dict]:
+        """Aggregate fill / slippage stats per pod from PortfolioAccountant fill logs."""
+        out: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            if not acct:
+                continue
+            fills = getattr(acct, "_fill_log", []) or []
+            with_slip = [f for f in fills if f.get("slippage_bps") is not None]
+            slip_vals = [float(f["slippage_bps"]) for f in with_slip]
+            out[pod_id] = {
+                "total_fills": len(fills),
+                "fills_with_slippage_data": len(with_slip),
+                "avg_slippage_bps": round(sum(slip_vals) / len(slip_vals), 2) if slip_vals else None,
+                "max_slippage_bps": max(slip_vals) if slip_vals else None,
+            }
+        return out
+
+    def compute_nav_correlation(self, limit: int = 100) -> dict:
+        """Pairwise Pearson correlation of per-pod NAV returns from NavStore."""
+        if not self._nav_store:
+            return {"ids": [], "matrix": {}, "high_correlation_pairs": []}
+        raw = self._nav_store.read_history(pod_id=None, limit=limit * 20)
+        from collections import defaultdict
+
+        by_ts: dict[str, dict[str, float]] = defaultdict(dict)
+        for r in raw:
+            by_ts[r["ts"]][r["pod_id"]] = float(r["nav"])
+        ts_sorted = sorted(by_ts.keys())[-limit:]
+        if len(ts_sorted) < 3:
+            return {"ids": [], "matrix": {}, "high_correlation_pairs": []}
+        ids = sorted({p for t in ts_sorted for p in by_ts[t].keys()})
+        if len(ids) < 2:
+            return {"ids": ids, "matrix": {}, "high_correlation_pairs": []}
+        series: dict[str, list[float]] = {pid: [] for pid in ids}
+        for t in ts_sorted:
+            row = by_ts[t]
+            for pid in ids:
+                series[pid].append(row.get(pid, 0.0))
+        rets: dict[str, list[float]] = {pid: [] for pid in ids}
+        for pid in ids:
+            navs = series[pid]
+            for i in range(1, len(navs)):
+                prev = navs[i - 1]
+                rets[pid].append((navs[i] - prev) / prev if prev else 0.0)
+
+        def pearson(a: list[float], b: list[float]) -> float:
+            n = min(len(a), len(b))
+            if n < 2:
+                return 0.0
+            a, b = a[:n], b[:n]
+            sa, sb = sum(a), sum(b)
+            sa2 = sum(x * x for x in a)
+            sb2 = sum(x * x for x in b)
+            sab = sum(a[i] * b[i] for i in range(n))
+            den = ((n * sa2 - sa * sa) * (n * sb2 - sb * sb)) ** 0.5
+            if den == 0:
+                return 0.0
+            return (n * sab - sa * sb) / den
+
+        matrix: dict[str, dict[str, float]] = {}
+        high: list[dict] = []
+        for ia in ids:
+            matrix[ia] = {}
+            for ib in ids:
+                if ia == ib:
+                    matrix[ia][ib] = 1.0
+                else:
+                    v = pearson(rets[ia], rets[ib])
+                    matrix[ia][ib] = round(v, 4)
+                    if ia < ib and abs(v) > 0.7:
+                        high.append({"a": ia, "b": ib, "r": round(v, 4)})
+        return {"ids": ids, "matrix": matrix, "high_correlation_pairs": high}
 
     def _load_memory(self) -> dict | None:
         """Load previous session state from data/memory.json if it exists."""
@@ -1657,6 +1828,28 @@ class SessionManager:
 
             total_nav = sum(ps.get("nav", 0) for ps in pods_state.values())
             total_capital = sum(ps.get("starting_capital", 0) for ps in pods_state.values())
+
+            total_realized = sum(float(ps.get("realized_pnl", 0) or 0) for ps in pods_state.values())
+            delta_r = total_realized - self._last_total_realized_snapshot
+            self._firm_inception_pnl += delta_r
+            self._last_total_realized_snapshot = total_realized
+            self._firm_peak_nav = max(self._firm_peak_nav, total_nav)
+
+            exec_quality = self._compute_execution_quality()
+
+            ts_snap = datetime.now(timezone.utc).isoformat()
+            if self._nav_store:
+                for pod_id, ps in pods_state.items():
+                    nav_v = float(ps.get("nav", 0))
+                    cash_v = float(ps.get("cash", 0))
+                    realized_v = float(ps.get("realized_pnl", 0))
+                    invested_v = max(0.0, nav_v - cash_v)
+                    try:
+                        self._nav_store.write_snapshot(
+                            pod_id, nav_v, cash_v, invested_v, realized_v, ts=ts_snap,
+                        )
+                    except Exception as e:
+                        logger.debug("[session_manager] nav snapshot: %s", e)
 
             closed_trades_state: dict[str, list] = {}
             prev_closed = prev.get("closed_trades_state", {})
@@ -1728,7 +1921,10 @@ class SessionManager:
                     "total_nav": round(total_nav, 4),
                     "total_pnl": round(total_nav - total_capital, 4),
                     "initial_capital": round(total_capital, 4),
+                    "inception_pnl": round(self._firm_inception_pnl, 4),
+                    "peak_nav": round(self._firm_peak_nav, 4),
                 },
+                "execution_quality": exec_quality,
                 "pods": pods_state,
                 "trades": trades,
                 "governance": governance,
@@ -1931,12 +2127,12 @@ class SessionManager:
                         pass
 
                 acct._entry_dates[sym] = ts[:10]
-                acct._entry_theses[sym] = reasoning[:300] if reasoning else ""
+                acct._entry_theses[sym] = reasoning if reasoning else ""
                 if sym not in acct._entry_metadata:
                     acct._entry_metadata[sym] = {
                         "entry_price": acct._cost_basis.get(sym, 0),
                         "entry_time": ts,
-                        "reasoning": reasoning[:300] if reasoning else "",
+                        "reasoning": reasoning if reasoning else "",
                         "conviction": earliest.get("conviction", 0.5),
                         "strategy_tag": earliest.get("strategy_tag", ""),
                         "signal_snapshot": {},
@@ -1952,7 +2148,7 @@ class SessionManager:
                     "fill_price": earliest.get("filled_price") or earliest.get("fill_price", acct._cost_basis.get(sym, 0)),
                     "filled_at": ts,
                     "side": "BUY",
-                    "reasoning": reasoning[:200] if reasoning else "",
+                    "reasoning": reasoning if reasoning else "",
                 })
                 backfilled += 1
                 logger.info("[session_manager] Backfilled entry metadata for %s/%s: date=%s", pod_id, sym, ts[:10])
@@ -2006,6 +2202,14 @@ class SessionManager:
             logger.error("[session_manager] Error closing session logger: %s", e)
 
         # Close DuckDB audit log to release file lock (critical on Windows)
+        if self._nav_store:
+            try:
+                self._nav_store.close()
+                logger.info("[session_manager] NavStore closed")
+            except Exception as e:
+                logger.warning("[session_manager] Error closing NavStore: %s", e)
+            self._nav_store = None
+
         # Skip if session may be restarted via dashboard
         if not self._restartable:
             try:
@@ -2367,7 +2571,7 @@ class SessionManager:
                 "qty": abs(qty_val),
                 "fill_price": f.get("fill_price", 0),
                 "side": "BUY" if qty_val > 0 else "SELL",
-                "reasoning": (f.get("reasoning") or "")[:200],
+                "reasoning": f.get("reasoning") or "",
             })
 
         # Also include fills from restored memory
@@ -2383,7 +2587,7 @@ class SessionManager:
                 "qty": abs(t.get("qty", 0)),
                 "fill_price": t.get("filled_price") or t.get("fill_price", 0),
                 "side": (t.get("side") or "buy").upper(),
-                "reasoning": (t.get("reasoning") or "")[:200],
+                "reasoning": t.get("reasoning") or "",
             })
 
         fills.sort(key=lambda x: x.get("timestamp", ""))

@@ -278,8 +278,103 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'execution') fetchClosedTrades();
     if (btn.dataset.tab === 'closed') loadClosedPositions();
+    if (btn.dataset.tab === 'risk') fetchCorrelationAndRender();
+    if (btn.dataset.tab === 'performance') {
+      fetch('/api/benchmarks').then(function(r) { return r.json(); }).then(function(d) {
+        benchmarkReturns = (d && d.benchmarks) ? d.benchmarks : {};
+        updateNavChart();
+      }).catch(function() {});
+    }
+    if (btn.dataset.tab === 'operations' && typeof renderOpsOverview === 'function') renderOpsOverview();
   });
 });
+
+function setExecSubTab(name) {
+  document.querySelectorAll('.exec-subtab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.execsub === name);
+  });
+  var tl = document.getElementById('exec-subtab-tradelog');
+  var q = document.getElementById('exec-subtab-quality');
+  if (tl) tl.style.display = name === 'tradelog' ? 'block' : 'none';
+  if (q) q.style.display = name === 'quality' ? 'block' : 'none';
+  if (name === 'quality' && typeof renderExecutionQuality === 'function') renderExecutionQuality();
+}
+
+function setOpsSubTab(name) {
+  document.querySelectorAll('.ops-subtab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.opssub === name);
+  });
+  var s = document.getElementById('ops-subtab-summary');
+  var o = document.getElementById('ops-subtab-overview');
+  if (s) s.style.display = name === 'summary' ? 'block' : 'none';
+  if (o) o.style.display = name === 'overview' ? 'block' : 'none';
+  if (name === 'overview' && typeof renderOpsOverview === 'function') renderOpsOverview();
+}
+
+function renderExecutionQuality() {
+  var el = document.getElementById('exec-quality-panel');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><div class="empty-txt">Loading…</div></div>';
+  fetch('/api/execution-quality').then(function(r) { return r.json(); }).then(function(data) {
+    var pods = Object.keys(data || {}).sort();
+    if (pods.length === 0) {
+      el.innerHTML = '<div class="empty"><div class="empty-txt">No execution data</div></div>';
+      return;
+    }
+    var html = '<div class="kpi-row">';
+    pods.forEach(function(pid) {
+      var s = data[pid] || {};
+      var nf = s.fills_with_slippage_data || 0;
+      html += '<div class="kpi"><div class="kpi-lbl">' + pid.toUpperCase() + '</div>';
+      if (nf === 0) {
+        html += '<div class="kpi-val">—</div><div class="kpi-sub">No slippage data yet</div>';
+      } else {
+        html += '<div class="kpi-val">' + (s.avg_slippage_bps != null ? s.avg_slippage_bps + ' bps' : '—') + '</div>';
+        html += '<div class="kpi-sub">max ' + (s.max_slippage_bps != null ? s.max_slippage_bps : '—') + ' bps · ' + (s.total_fills || 0) + ' fills</div>';
+      }
+      html += '</div>';
+    });
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(function() {
+    el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load execution quality</div></div>';
+  });
+}
+
+function renderOpsOverview() {
+  var cards = document.getElementById('pod-strategy-cards');
+  var feed = document.getElementById('live-thesis-feed');
+  var reg = document.getElementById('regime-overview');
+  if (!cards || !feed || !reg) return;
+  var ids = Object.keys(pods).sort();
+  cards.innerHTML = ids.map(function(id) {
+    var d = pods[id] || {};
+    var nav = d.nav || 0;
+    var pm = d.performance_metrics || {};
+    var wr = pm.max_drawdown != null ? 'DD ' + (pm.max_drawdown * 100).toFixed(0) + '%' : '—';
+    var posc = (d.current_positions && d.current_positions.length) ? d.current_positions.length : 0;
+    var act = '—';
+    var ag = agentActivity[id + '_pm'] || agentActivity[id + '.pm'];
+    if (ag && ag[0]) act = (ag[0].summary || '').slice(0, 80);
+    return '<div class="kpi" style="min-width:140px"><div class="kpi-lbl">' + id.toUpperCase() + '</div>' +
+      '<div class="kpi-val">$' + nav.toFixed(0) + '</div>' +
+      '<div class="kpi-sub">' + wr + ' · ' + posc + ' pos</div>' +
+      '<div class="kpi-sub" style="font-size:9px">' + escapeHtml(act) + '</div></div>';
+  }).join('');
+  feed.innerHTML = '<div class="sec-hdr"><span class="sec-title">Latest PM activity</span></div>' +
+    activityFeed.slice(0, 12).map(function(a) {
+      if ((a.agent_role || '').indexOf('PM') === -1 && (a.agent_id || '').indexOf('pm') === -1) return '';
+      return '<div style="font-size:10px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.06)"><b>' +
+        escapeHtml(a.pod_id || '') + '</b> ' + escapeHtml(a.summary || '') +
+        (a.detail ? '<div style="color:var(--text-muted);white-space:pre-wrap;max-height:120px;overflow-y:auto">' +
+        escapeHtml(a.detail) + '</div>' : '') + '</div>';
+    }).join('') || '<div class="empty-txt">No PM feed yet</div>';
+  reg.innerHTML = ids.map(function(id) {
+    var d = pods[id] || {};
+    var mr = d.macro_regime || (d.features && d.features.macro_outlook) || '—';
+    return '<div style="font-size:11px;margin-bottom:6px"><b>' + id.toUpperCase() + '</b> regime: ' + escapeHtml(String(mr)) + '</div>';
+  }).join('');
+}
 
 function switchResearchSubTab(name) {
   document.querySelectorAll('.sub-tab-btn').forEach(b => {
@@ -808,6 +903,30 @@ function handleMessage(msg) {
     if (snap.iteration) iterCount = snap.iteration;
     document.getElementById('iter-ctr').textContent = iterCount || '—';
     if (snap.session_active !== undefined) updateSessionStatus(!!snap.session_active);
+    if (snap.firm_inception_pnl !== undefined && snap.firm_inception_pnl !== null) {
+      firmInceptionPnl = snap.firm_inception_pnl;
+    }
+    if (snap.benchmark_returns && typeof snap.benchmark_returns === 'object') {
+      benchmarkReturns = snap.benchmark_returns;
+    }
+    if (snap.drawdown_tier) drawdownTierBadge = snap.drawdown_tier;
+    fetch('/api/nav-history?limit=200').then(function(r) { return r.json(); }).then(function(data) {
+      var hist = (data && data.history) ? data.history : [];
+      if (hist.length === 0) return;
+      navHistory = [];
+      hist.forEach(function(h) {
+        var tsMs = Date.parse(h.ts) || Date.now();
+        navHistory.push({
+          t: new Date(tsMs).toLocaleTimeString(),
+          ts: tsMs,
+          firmNav: h.nav || 0,
+          pods: {},
+          drawdown: 0
+        });
+      });
+      if (navHistory.length > MAX_HISTORY) navHistory = navHistory.slice(-MAX_HISTORY);
+      updateNavChart();
+    }).catch(function() {});
     var podSums = snap.pod_summaries || {};
     for (var pid in podSums) {
       var m = podSums[pid];
@@ -900,6 +1019,15 @@ function handleMessage(msg) {
       iterCount = sd.iteration;
       document.getElementById('iter-ctr').textContent = iterCount;
     }
+    if (sd.firm_inception_pnl != null && sd.firm_inception_pnl !== undefined) {
+      firmInceptionPnl = sd.firm_inception_pnl;
+    }
+    if (sd.benchmark_returns && typeof sd.benchmark_returns === 'object') {
+      benchmarkReturns = sd.benchmark_returns;
+    }
+    if (sd.drawdown_tier) drawdownTierBadge = sd.drawdown_tier;
+    updateFirmMetrics();
+    updateNavChart();
     return;
   }
   if (msg.type === 'pod_summary' || msg.type === 'pod_enrichment') {
@@ -1028,7 +1156,9 @@ function handleMessage(msg) {
     const ra = msg.data;
     riskAlerts.unshift(ra);
     if (riskAlerts.length > 50) riskAlerts.pop();
-    updateRiskAlertBanner();
+    var sev = ra.severity || (ra.action === 'firm_drawdown' ? 'warning' : 'warning');
+    var txt = ra.message || ra.reason || JSON.stringify(ra);
+    updateRiskAlertBanner(sev, txt);
     if (typeof triggerRiskAlert === 'function') triggerRiskAlert(ra);
   } else if (msg.type === 'agent_activity') {
     var act = msg.data;
@@ -1184,7 +1314,9 @@ function updateFirmMetrics() {
   var cpnlEl = document.getElementById('kpi-cpnl');
   var cretEl = document.getElementById('kpi-cret');
   if (cpnlEl && initialCapital > 0) {
-    var cpnl = nav - initialCapital;
+    var cpnl = (firmInceptionPnl != null && typeof firmInceptionPnl === 'number')
+      ? firmInceptionPnl
+      : (nav - initialCapital);
     var cret = (cpnl / initialCapital) * 100;
     cpnlEl.textContent = (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2);
     cpnlEl.className = 'kpi-val ' + (cpnl >= 0 ? 'pos' : 'neg');
@@ -1228,6 +1360,7 @@ function updateNavChart() {
   const labels = filtered.map(h => h.t);
   const ids    = Object.keys(pods).sort();
   const FALLBACK_COLORS = ['#00d4f0','#00d68f','#8b6cff','#f5a623'];
+  const BENCH_DASH = ['#8899aa','#667788','#99aabb','#778899'];
 
   const datasets = [
     { label:'FIRM NAV', data: filtered.map(h => h.firmNav),
@@ -1239,6 +1372,30 @@ function updateNavChart() {
       pointRadius:0, tension:0.3, fill:false,
     })),
   ];
+  if (filtered.length >= 2 && benchmarkReturns && typeof benchmarkReturns === 'object') {
+    var fi = 0;
+    ids.forEach(function(pid) {
+      var b = benchmarkReturns[pid];
+      if (!b || b.return_pct == null) return;
+      var start = filtered[0].firmNav || 1;
+      var ret = Number(b.return_pct) / 100;
+      var line = filtered.map(function(h, idx) {
+        var t = idx / Math.max(filtered.length - 1, 1);
+        return start * (1 + ret * t);
+      });
+      datasets.push({
+        label: 'BMK ' + pid.toUpperCase(),
+        data: line,
+        borderColor: BENCH_DASH[fi % BENCH_DASH.length],
+        borderWidth: 1,
+        borderDash: [5, 4],
+        pointRadius: 0,
+        tension: 0.2,
+        fill: false,
+      });
+      fi++;
+    });
+  }
 
   if (navChart) {
     navChart.data.labels   = labels;
@@ -1408,7 +1565,8 @@ function calculateRisk() {
 
 function updateRiskAlertBanner(severity, message) {
   const el = document.getElementById('risk-banner');
-  el.className   = 'risk-banner ' + severity;
+  var cls = severity === 'critical' ? 'critical' : (severity === 'info' ? 'info' : 'warning');
+  el.className   = 'risk-banner ' + cls;
   el.textContent = message;
   riskAlerts.push({ severity, message, ts: new Date().toISOString() });
   document.getElementById('kpi-alerts').textContent = riskAlerts.length;
@@ -1550,7 +1708,7 @@ function updateGovHub() {
         <span class="gov-time">${tm}</span>
       </div>
       <div class="gov-card-body">${d.decision}</div>
-      ${d.reasoning ? `<div class="gov-card-sub">${d.reasoning.slice(0,120)}${d.reasoning.length>120?'…':''}</div>` : ''}
+      ${d.reasoning ? `<div class="gov-card-sub">${d.reasoning}</div>` : ''}
     </div>`;
   }).join('');
 }
@@ -1945,11 +2103,9 @@ function updateDecisionTimeline() {
     var ts = ev.ts ? new Date(ev.ts).toLocaleTimeString('en-GB', { hour12: false }) : '';
     var detailText = ev.detail || '';
     var fullSummary = ev.summary || '';
-    var shortSummary = fullSummary.length > 120 ? fullSummary.substring(0, 120) + '…' : fullSummary;
-    var hasExpandable = detailText.length > 0 || fullSummary.length > 120;
-    var expandContent = detailText.length > 0
-      ? (fullSummary.length > 120 ? escapeHtml(fullSummary) + '\n\n───\n\n' + escapeHtml(detailText) : escapeHtml(detailText))
-      : escapeHtml(fullSummary);
+    var shortSummary = fullSummary;
+    var hasExpandable = detailText.length > 0;
+    var expandContent = escapeHtml(detailText);
     var cardId = 'tl-' + (ev.ts || '') + '-' + (ev.agent_role || '');
     return '<div class="tl-card" id="' + cardId + '">' +
       '<div class="tl-header">' +
@@ -2320,6 +2476,44 @@ function corrColor(v) {
   }
   var r = Math.round(180 + Math.abs(v) * 75);
   return 'rgba(' + r + ',50,50,' + (0.15 + Math.abs(v) * 0.5) + ')';
+}
+
+function fetchCorrelationAndRender() {
+  fetch('/api/correlation?limit=100').then(function(r) { return r.json(); }).then(function(data) {
+    if (data && data.ids && data.ids.length >= 2 && data.matrix) {
+      renderCorrelationFromApi(data);
+      var banner = document.getElementById('risk-banner');
+      if (data.high_correlation_pairs && data.high_correlation_pairs.length && banner) {
+        var extra = 'High correlation: ' + data.high_correlation_pairs.map(function(p) {
+          return p.a + '/' + p.b + ' r=' + p.r;
+        }).join('; ');
+        banner.className = 'risk-banner warning';
+        banner.textContent = extra;
+      }
+    } else {
+      renderCorrelationHeatmap();
+    }
+  }).catch(function() { renderCorrelationHeatmap(); });
+}
+
+function renderCorrelationFromApi(data) {
+  var container = document.getElementById('correlation-heatmap');
+  if (!container) return;
+  var ids = data.ids;
+  var mx = data.matrix;
+  var html = '<table class="corr-table"><thead><tr><th></th>';
+  ids.forEach(function(id) { html += '<th>' + id.toUpperCase() + '</th>'; });
+  html += '</tr></thead><tbody>';
+  ids.forEach(function(a) {
+    html += '<tr><td class="corr-label">' + a.toUpperCase() + '</td>';
+    ids.forEach(function(b) {
+      var v = (mx[a] && mx[a][b] != null) ? mx[a][b] : 0;
+      html += '<td class="corr-cell" style="background:' + corrColor(v) + '">' + Number(v).toFixed(2) + '</td>';
+    });
+    html += '</tr>';
+  });
+  html += '</tbody></table>';
+  container.innerHTML = html;
 }
 
 function renderCorrelationHeatmap() {
