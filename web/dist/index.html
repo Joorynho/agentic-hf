@@ -98,6 +98,11 @@
 
     <!-- OPERATIONS -->
     <div class="tab-pane active" id="tab-operations">
+      <div class="sub-tab-bar ops-subtab-bar">
+        <button type="button" class="sub-tab-btn ops-subtab-btn active" data-opssub="summary" onclick="setOpsSubTab('summary')">Summary</button>
+        <button type="button" class="sub-tab-btn ops-subtab-btn" data-opssub="overview" onclick="setOpsSubTab('overview')">Overview</button>
+      </div>
+      <div id="ops-subtab-summary" class="ops-subtab-pane">
       <div class="kpi-row">
         <div class="kpi">
           <div class="kpi-lbl">Firm NAV</div>
@@ -190,6 +195,15 @@
           <div id="dd-reasoning" class="dd-reasoning"></div>
         </div>
       </div>
+      </div>
+      <div id="ops-subtab-overview" class="ops-subtab-pane" style="display:none">
+        <div class="sec-hdr"><span class="sec-title">Strategy cards</span></div>
+        <div class="kpi-row" id="pod-strategy-cards"></div>
+        <div class="sec-hdr" style="margin-top:10px"><span class="sec-title">Live thesis feed</span></div>
+        <div id="live-thesis-feed" class="tbl-wrap" style="max-height:280px;overflow-y:auto"></div>
+        <div class="sec-hdr" style="margin-top:10px"><span class="sec-title">Regime</span></div>
+        <div id="regime-overview"></div>
+      </div>
     </div>
 
     <!-- PERFORMANCE -->
@@ -200,6 +214,7 @@
         <button class="tf-btn" data-tf="60" onclick="setChartTimeframe(60)">1h</button>
         <button class="tf-btn active" data-tf="0" onclick="setChartTimeframe(0)">ALL</button>
         <button class="export-btn" onclick="exportNavHistory()" style="margin-left:auto">CSV</button>
+        <button class="chart-expand-btn" onclick="expandNavChart()" title="Expand chart">&#x2922;</button>
       </div>
       <div class="chart-wrap"><canvas id="navChart"></canvas></div>
       <div class="chart-wrap dd-chart-wrap"><canvas id="ddChart"></canvas></div>
@@ -269,6 +284,11 @@
         <div class="kpi"><div class="kpi-lbl">Total Trades</div><div class="kpi-val" id="kpi-trades">0</div></div>
         <div class="kpi"><div class="kpi-lbl">Filled</div><div class="kpi-val" id="kpi-filled">0</div></div>
       </div>
+      <div class="sub-tab-bar exec-subtab-bar">
+        <button type="button" class="sub-tab-btn exec-subtab-btn active" data-execsub="tradelog" onclick="setExecSubTab('tradelog')">Trade Log</button>
+        <button type="button" class="sub-tab-btn exec-subtab-btn" data-execsub="quality" onclick="setExecSubTab('quality')">Quality</button>
+      </div>
+      <div id="exec-subtab-tradelog" class="exec-subtab-pane">
       <div>
         <div class="sec-hdr">
           <span class="sec-title">Trade Log</span>
@@ -305,6 +325,10 @@
             <tbody id="ct-table"><tr><td colspan="10" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr></tbody>
           </table>
         </div>
+      </div>
+      </div>
+      <div id="exec-subtab-quality" class="exec-subtab-pane" style="display:none">
+        <div id="exec-quality-panel" class="tbl-wrap"></div>
       </div>
     </div>
 
@@ -695,6 +719,19 @@
 
   </div><!-- /right-panel -->
 </div><!-- /app -->
+
+<!-- NAV chart expand modal -->
+<div id="nav-chart-modal" onclick="closeNavChartModal(event)">
+  <div class="modal-inner" onclick="event.stopPropagation()">
+    <div class="modal-hdr">
+      <span class="modal-title">Portfolio NAV — Full View</span>
+      <button class="modal-close" onclick="closeNavChartModal()">&times;</button>
+    </div>
+    <div class="modal-canvas-wrap">
+      <canvas id="modal-nav-chart"></canvas>
+    </div>
+  </div>
+</div>
 
 <!-- JS modules: order matters (tower → motion → dashboard) -->
 <script src="tower.js"></script>

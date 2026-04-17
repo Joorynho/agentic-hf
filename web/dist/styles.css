@@ -1817,6 +1817,8 @@ button { font-family: inherit; cursor: pointer; }
   background:var(--bg-surface,#0e1a28); padding:10px 12px; border-radius:4px;
   border:1px solid var(--border-dim,#2a3a50);
   white-space:pre-wrap; word-break:break-word;
+  max-height:220px;
+  overflow-y:auto;
 }
 .closed-exit-when {
   border-left: 3px solid var(--cyan);
@@ -1829,8 +1831,15 @@ button { font-family: inherit; cursor: pointer; }
 
 /* Thesis cells in compact tables — overflow hidden, full text in title tooltip */
 .ct-thesis, .ct-thesis-cell {
-  max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  color: var(--text-dim); cursor: default;
+  max-width: 420px;
+  max-height: 200px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+  cursor: default;
+  font-size: 11px;
+  line-height: 1.4;
 }
 .pos-empty { font-size:12px; color:var(--text-muted,#6a82a0); padding:8px; text-align:center; }
 
@@ -1911,4 +1920,105 @@ button { font-family: inherit; cursor: pointer; }
 @keyframes alertPulse {
   0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(232,64,64,0.4); }
   50% { opacity: 0.8; box-shadow: 0 0 0 4px rgba(232,64,64,0); }
+}
+
+/* ── Pod row collaboration pulse ─────────────────────────────────────── */
+@keyframes podSignalPulse {
+  0%   { background: transparent; }
+  20%  { background: rgba(0,207,232,0.12); box-shadow: inset 0 0 0 1px rgba(0,207,232,0.3); }
+  100% { background: transparent; box-shadow: none; }
+}
+@keyframes podGovCascade {
+  0%   { background: transparent; }
+  20%  { background: rgba(139,108,255,0.14); box-shadow: inset 0 0 0 1px rgba(139,108,255,0.35); }
+  100% { background: transparent; box-shadow: none; }
+}
+.pod-signal-pulse {
+  animation: podSignalPulse 1.2s ease-out forwards;
+}
+.pod-gov-cascade {
+  animation: podGovCascade 1.4s ease-out forwards;
+}
+
+/* ── NAV chart expand modal ──────────────────────────────────────────── */
+#nav-chart-modal {
+  display: none;
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  background: rgba(5,8,14,0.88);
+  backdrop-filter: blur(6px);
+  align-items: center;
+  justify-content: center;
+}
+#nav-chart-modal.open {
+  display: flex;
+}
+#nav-chart-modal .modal-inner {
+  position: relative;
+  width: 92vw;
+  max-width: 1400px;
+  height: 72vh;
+  background: var(--bg2,#0d1117);
+  border: 1px solid var(--border,#1e2530);
+  border-radius: 8px;
+  padding: 20px 24px 16px;
+  display: flex;
+  flex-direction: column;
+}
+#nav-chart-modal .modal-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+}
+#nav-chart-modal .modal-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary,#e8eaf0);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+#nav-chart-modal .modal-close {
+  background: none;
+  border: 1px solid var(--border,#1e2530);
+  color: var(--text-secondary,#8899aa);
+  font-size: 18px;
+  line-height: 1;
+  width: 28px;
+  height: 28px;
+  border-radius: 4px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: color 120ms, border-color 120ms;
+}
+#nav-chart-modal .modal-close:hover {
+  color: var(--text-primary,#e8eaf0);
+  border-color: #3a4555;
+}
+#nav-chart-modal .modal-canvas-wrap {
+  flex: 1;
+  position: relative;
+  min-height: 0;
+}
+#modal-nav-chart {
+  width: 100% !important;
+  height: 100% !important;
+}
+.chart-expand-btn {
+  background: none;
+  border: 1px solid var(--border,#1e2530);
+  color: var(--text-secondary,#8899aa);
+  font-size: 13px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  cursor: pointer;
+  margin-left: 6px;
+  transition: color 120ms, border-color 120ms;
+}
+.chart-expand-btn:hover {
+  color: var(--text-primary,#e8eaf0);
+  border-color: #3a4555;
 }

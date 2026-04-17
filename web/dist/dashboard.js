@@ -1144,6 +1144,7 @@ function handleMessage(msg) {
     if (t.pod_id && typeof triggerPodHeartbeat === 'function') {
       triggerPodHeartbeat(t.pod_id);
     }
+    triggerPodRowPulse(t.pod_id, 'trade');
     const srcFloor = podFloorMap[t.pod_id] ?? 0;
     if (typeof createDataRoute === 'function') createDataRoute(srcFloor, 4, 0x00cfe8);
   } else if (msg.type === 'governance') {
@@ -1151,6 +1152,7 @@ function handleMessage(msg) {
     if (gv.agent && gv.decision) {
       recordGov(gv.agent, gv.decision, gv.reasoning || '', gv.weights || null);
       if (typeof triggerGovernanceLightFlow === 'function') triggerGovernanceLightFlow(gv.agent);
+      triggerPodRowPulse(null, 'gov');
     }
   } else if (msg.type === 'risk_alert') {
     const ra = msg.data;
@@ -1170,6 +1172,7 @@ function handleMessage(msg) {
     updateActivityFeed();
     updateDecisionTimeline();
     if (typeof triggerAgentActivity === 'function') triggerAgentActivity(act.pod_id, act.agent_role);
+    if (act.pod_id) triggerPodRowPulse(act.pod_id, 'trade');
     if (act.action === 'new_report' && act.filename) {
       onNewReport(act.filename);
     }
@@ -1228,7 +1231,7 @@ function updatePodsTable() {
     const navTitle = `Invested: $${invested.toFixed(2)} | Cash: $${cash.toFixed(2)}`;
     var pm = pods[id] ? (pods[id].performance_metrics || {}) : {};
     var sharpeStr = (pm.sharpe != null && pm.sharpe !== 0) ? Number(pm.sharpe).toFixed(2) : '—';
-    return `<tr onclick="openDrilldown('${id}')" style="cursor:pointer" title="${navTitle}">
+    return `<tr data-pod="${id}" onclick="openDrilldown('${id}')" style="cursor:pointer" title="${navTitle}">
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r"><span title="${navTitle}">$${nav.toFixed(2)}</span></td>
       <td class="r">${spark}</td>
@@ -1237,6 +1240,34 @@ function updatePodsTable() {
       <td class="r"><span class="badge ${stCls}">${st}</span></td>
     </tr>`;
   }).join('');
+}
+
+function triggerPodRowPulse(podId, type) {
+  // type: 'trade' (cyan) or 'gov' (purple cascade across all pods)
+  if (type === 'gov') {
+    var rows = document.querySelectorAll('#pods-table tr[data-pod]');
+    rows.forEach(function(row, i) {
+      setTimeout(function() {
+        row.classList.remove('pod-signal-pulse', 'pod-gov-cascade');
+        void row.offsetWidth;
+        row.classList.add('pod-gov-cascade');
+        row.addEventListener('animationend', function handler() {
+          row.classList.remove('pod-gov-cascade');
+          row.removeEventListener('animationend', handler);
+        });
+      }, i * 120);
+    });
+  } else {
+    var row = document.querySelector('#pods-table tr[data-pod="' + podId + '"]');
+    if (!row) return;
+    row.classList.remove('pod-signal-pulse', 'pod-gov-cascade');
+    void row.offsetWidth;
+    row.classList.add('pod-signal-pulse');
+    row.addEventListener('animationend', function handler() {
+      row.classList.remove('pod-signal-pulse');
+      row.removeEventListener('animationend', handler);
+    });
+  }
 }
 
 function getPodNav(d) { return d.nav ?? (d.risk_metrics && d.risk_metrics.nav) ?? 0; }
@@ -1360,8 +1391,6 @@ function updateNavChart() {
   const labels = filtered.map(h => h.t);
   const ids    = Object.keys(pods).sort();
   const FALLBACK_COLORS = ['#00d4f0','#00d68f','#8b6cff','#f5a623'];
-  const BENCH_DASH = ['#8899aa','#667788','#99aabb','#778899'];
-
   const datasets = [
     { label:'FIRM NAV', data: filtered.map(h => h.firmNav),
       borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
@@ -1372,29 +1401,27 @@ function updateNavChart() {
       pointRadius:0, tension:0.3, fill:false,
     })),
   ];
+  // Show S&P 500 (equities/SPY) benchmark as a dotted reference line
   if (filtered.length >= 2 && benchmarkReturns && typeof benchmarkReturns === 'object') {
-    var fi = 0;
-    ids.forEach(function(pid) {
-      var b = benchmarkReturns[pid];
-      if (!b || b.return_pct == null) return;
+    var spyBench = benchmarkReturns['equities'];
+    if (spyBench && spyBench.return_pct != null) {
       var start = filtered[0].firmNav || 1;
-      var ret = Number(b.return_pct) / 100;
-      var line = filtered.map(function(h, idx) {
+      var ret = Number(spyBench.return_pct) / 100;
+      var spyLine = filtered.map(function(h, idx) {
         var t = idx / Math.max(filtered.length - 1, 1);
         return start * (1 + ret * t);
       });
       datasets.push({
-        label: 'BMK ' + pid.toUpperCase(),
-        data: line,
-        borderColor: BENCH_DASH[fi % BENCH_DASH.length],
-        borderWidth: 1,
-        borderDash: [5, 4],
+        label: 'S&P 500',
+        data: spyLine,
+        borderColor: 'rgba(160,170,185,0.5)',
+        borderWidth: 1.5,
+        borderDash: [4, 4],
         pointRadius: 0,
-        tension: 0.2,
+        tension: 0.1,
         fill: false,
       });
-      fi++;
-    });
+    }
   }
 
   if (navChart) {
@@ -1420,6 +1447,49 @@ function updateNavChart() {
       },
     },
   });
+}
+
+var _modalNavChart = null;
+function expandNavChart() {
+  var modal = document.getElementById('nav-chart-modal');
+  if (!modal) return;
+  modal.classList.add('open');
+  document.addEventListener('keydown', _navModalKeyHandler);
+  // Build the chart inside the modal using same data as navChart
+  var ctx = document.getElementById('modal-nav-chart');
+  if (!ctx) return;
+  if (_modalNavChart) { _modalNavChart.destroy(); _modalNavChart = null; }
+  if (!navChart) return;
+  _modalNavChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: navChart.data.labels.slice(),
+      datasets: navChart.data.datasets.map(function(ds) {
+        return Object.assign({}, ds, { data: ds.data.slice() });
+      }),
+    },
+    options: Object.assign({}, navChart.options, {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: Object.assign({}, (navChart.options || {}).plugins, {
+        legend: { display: true, position: 'top',
+          labels: { color: '#a0b8d0', font: { size: 11, family: "'IBM Plex Mono', monospace" }, padding: 12, usePointStyle: true, pointStyle: 'line' } },
+        tooltip: { backgroundColor: '#243050', titleColor: '#00d4f0',
+          bodyColor: '#f0f4fa', borderColor: '#4a5e80', borderWidth: 1, padding: 10 },
+      }),
+    }),
+  });
+}
+function _navModalKeyHandler(e) {
+  if (e.key === 'Escape') closeNavChartModal();
+}
+function closeNavChartModal(e) {
+  if (e && e.target && e.target.id !== 'nav-chart-modal') return;
+  var modal = document.getElementById('nav-chart-modal');
+  if (modal) modal.classList.remove('open');
+  document.removeEventListener('keydown', _navModalKeyHandler);
+  if (_modalNavChart) { _modalNavChart.destroy(); _modalNavChart = null; }
 }
 
 function getRealPerfMetrics() {
