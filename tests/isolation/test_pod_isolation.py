@@ -49,7 +49,7 @@ def test_pod_summary_has_no_raw_positions_or_signals():
         risk_metrics=metrics,
         exposure_buckets=[PodExposureBucket(asset_class="equity_us", direction="long", notional_pct_nav=0.85)],
         expected_return_estimate=0.12, turnover_daily_pct=0.05, heartbeat_ok=True)
-    fields = set(summary.model_fields.keys())
+    fields = set(PodSummary.model_fields.keys())
     # Note: "positions" IS now part of PodSummary (Phase 1.3) - it contains aggregated position data, not raw internal state
     assert "positions" in fields, "PodSummary should include positions from PortfolioAccountant (Phase 1.3)"
     assert "signal_value" not in fields, "PodSummary must not expose raw signal internals"

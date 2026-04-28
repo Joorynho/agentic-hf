@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -31,6 +32,28 @@ from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
 
 logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cors_origins() -> list[str]:
+    configured = os.getenv("DASHBOARD_CORS_ORIGINS", "").strip()
+    if configured:
+        return [part.strip() for part in configured.split(",") if part.strip()]
+    if os.getenv("ENVIRONMENT", "development").strip().lower() == "production":
+        return []
+    return ["*"]
+
+
+def _session_control_enabled() -> bool:
+    """Disable start/stop controls by default in production deployments."""
+    is_production = os.getenv("ENVIRONMENT", "development").strip().lower() == "production"
+    return _env_bool("MISSION_CONTROL_ENABLE_SESSION_CONTROL", default=not is_production)
 
 
 class ConnectionManager:
@@ -347,6 +370,15 @@ class EventBusListener:
             },
         }
 
+    def get_snapshot_with_app_state(self, app) -> dict:
+        """Session snapshot merged with firm-level fields from FastAPI app.state."""
+        snap = self.get_snapshot()
+        snap["data"]["firm_inception_pnl"] = getattr(app.state, "firm_inception_pnl", 0.0)
+        snap["data"]["firm_peak_nav"] = getattr(app.state, "firm_peak_nav", 0.0)
+        snap["data"]["benchmark_returns"] = getattr(app.state, "benchmark_returns", {}) or {}
+        snap["data"]["drawdown_tier"] = getattr(app.state, "drawdown_tier", "none")
+        return snap
+
 
 # Response models for REST endpoints
 class PodSummaryResponse(BaseModel):
@@ -368,6 +400,8 @@ class SessionInfoResponse(BaseModel):
     iteration: int
     uptime_seconds: float
     num_pods: int
+    firm_inception_pnl: float = 0.0
+    firm_peak_nav: float = 0.0
 
 
 class RiskStatusResponse(BaseModel):
@@ -400,24 +434,47 @@ def create_app(
     Returns:
         FastAPI application instance
     """
+    manager = ConnectionManager()
+    listener: Optional[EventBusListener] = None
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        """Initialize and clean up dashboard runtime resources."""
+        nonlocal listener
+        if app.state.event_bus:
+            listener = EventBusListener(app.state.event_bus, manager)
+            app.state.listener = listener
+            await listener.subscribe()
+            logger.info("[web] App startup complete, EventBus listener subscribed")
+
+        try:
+            yield
+        finally:
+            logger.info("[web] App shutting down, closing %d connections", len(manager.active_connections))
+            for connection in manager.active_connections.copy():
+                try:
+                    await connection.close()
+                except Exception:
+                    pass
+
     app = FastAPI(
         title="Agentic HF Mission Control",
         description="Real-time trading dashboard and governance API",
         version="2.1.0",
+        lifespan=lifespan,
     )
 
     # Add CORS middleware for cross-origin requests
+    cors_origins = _cors_origins()
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_credentials=True,
+        allow_origins=cors_origins,
+        allow_credentials=cors_origins != ["*"],
         allow_methods=["*"],
         allow_headers=["*"],
     )
 
     # State
-    manager = ConnectionManager()
-    listener: Optional[EventBusListener] = None
     app.state.connection_manager = manager
     app.state.event_bus = event_bus
     app.state.session_start_time = session_start_time or datetime.now(timezone.utc)
@@ -426,29 +483,13 @@ def create_app(
     app.state.pod_summaries: dict[str, dict] = {}
     app.state.risk_halt = False
     app.state.risk_halt_reason: Optional[str] = None
+    app.state.firm_inception_pnl: float = 0.0
+    app.state.firm_peak_nav: float = 0.0
+    app.state.benchmark_returns: dict = {}
+    app.state.drawdown_tier: str = "none"
     app.state.session_manager = session_manager
     if session_manager:
         session_manager._restartable = True
-
-    @app.on_event("startup")
-    async def startup():
-        """Initialize EventBus listener on app startup."""
-        nonlocal listener
-        if app.state.event_bus:
-            listener = EventBusListener(app.state.event_bus, manager)
-            app.state.listener = listener
-            await listener.subscribe()
-            logger.info("[web] App startup complete, EventBus listener subscribed")
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        """Cleanup on shutdown."""
-        logger.info("[web] App shutting down, closing %d connections", len(manager.active_connections))
-        for connection in manager.active_connections.copy():
-            try:
-                await connection.close()
-            except Exception:
-                pass
 
     # REST endpoints
     @app.get("/health", response_model=HealthResponse)
@@ -467,6 +508,8 @@ def create_app(
             iteration=app.state.iteration,
             uptime_seconds=uptime,
             num_pods=4,
+            firm_inception_pnl=getattr(app.state, "firm_inception_pnl", 0.0),
+            firm_peak_nav=getattr(app.state, "firm_peak_nav", 0.0),
         )
 
     @app.get("/api/pods", response_model=dict)
@@ -554,6 +597,40 @@ def create_app(
         trades = sm.get_all_closed_trades()
         return {"closed_positions": trades}
 
+    @app.get("/api/nav-history")
+    async def get_nav_history(limit: int = 200):
+        """Firm NAV history from SQLite NavStore (for chart pre-population)."""
+        sm = app.state.session_manager
+        if not sm or not getattr(sm, "_nav_store", None):
+            return {"history": []}
+        try:
+            hist = sm._nav_store.read_firm_history(limit=limit)
+            return {"history": hist}
+        except Exception as e:
+            logger.debug("[web] nav-history: %s", e)
+            return {"history": []}
+
+    @app.get("/api/execution-quality")
+    async def get_execution_quality():
+        """Per-pod slippage stats from live accountants."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        return sm._compute_execution_quality()
+
+    @app.get("/api/benchmarks")
+    async def get_benchmarks():
+        """Last-fetched benchmark returns (refreshed periodically in SessionManager)."""
+        return {"benchmarks": getattr(app.state, "benchmark_returns", {}) or {}}
+
+    @app.get("/api/correlation")
+    async def get_correlation(limit: int = 100):
+        """Cross-pod NAV return correlation matrix."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        return sm.compute_nav_correlation(limit=limit)
+
     @app.get("/api/risk", response_model=RiskStatusResponse)
     async def get_risk_status():
         """Get current risk status."""
@@ -564,13 +641,18 @@ def create_app(
         )
 
     @app.get("/api/audit", response_model=dict)
-    async def get_audit_log():
-        """Get recent audit log entries (stub for MVP)."""
-        return {
-            "entries": [],
-            "count": 0,
-            "note": "Audit log endpoint not yet implemented",
-        }
+    async def get_audit_log(limit: int = 100, topic: Optional[str] = None):
+        """Get recent EventBus audit log entries."""
+        bus = app.state.event_bus
+        audit_log = getattr(bus, "_audit_log", None) if bus else None
+        if not audit_log or not hasattr(audit_log, "recent_messages"):
+            return {"entries": [], "count": 0, "note": "Audit log is not configured"}
+        try:
+            entries = audit_log.recent_messages(limit=limit, topic=topic)
+            return {"entries": entries, "count": len(entries)}
+        except Exception as exc:
+            logger.warning("[web] audit query failed: %s", exc)
+            raise HTTPException(status_code=500, detail="Audit log query failed")
 
     # --- Session control endpoints ---
 
@@ -592,6 +674,8 @@ def create_app(
     @app.post("/api/session/stop")
     async def stop_session():
         """Stop the running trading session."""
+        if not _session_control_enabled():
+            raise HTTPException(status_code=403, detail="Session controls are disabled")
         sm = app.state.session_manager
         if not sm:
             raise HTTPException(status_code=503, detail="SessionManager not available")
@@ -612,6 +696,8 @@ def create_app(
     @app.post("/api/session/start")
     async def start_session():
         """Start a new trading session (if not already running)."""
+        if not _session_control_enabled():
+            raise HTTPException(status_code=403, detail="Session controls are disabled")
         sm = app.state.session_manager
         if not sm:
             raise HTTPException(status_code=503, detail="SessionManager not available")
@@ -675,7 +761,7 @@ def create_app(
         try:
             # Send session snapshot on connect so client recovers state
             if listener:
-                snapshot = listener.get_snapshot()
+                snapshot = listener.get_snapshot_with_app_state(app)
                 snapshot["data"]["iteration"] = app.state.iteration
                 sm = app.state.session_manager
                 snapshot["data"]["session_active"] = sm.session_active if sm else False
@@ -714,6 +800,10 @@ def create_app(
         pod_summaries: dict[str, dict],
         risk_halt: bool = False,
         risk_halt_reason: Optional[str] = None,
+        firm_inception_pnl: float = 0.0,
+        firm_peak_nav: float = 0.0,
+        benchmark_returns: Optional[dict] = None,
+        drawdown_tier: str = "none",
     ):
         """Update session state in app (called by SessionManager)."""
         app.state.iteration = iteration
@@ -721,13 +811,25 @@ def create_app(
         app.state.pod_summaries = pod_summaries
         app.state.risk_halt = risk_halt
         app.state.risk_halt_reason = risk_halt_reason
+        app.state.firm_inception_pnl = firm_inception_pnl
+        app.state.firm_peak_nav = firm_peak_nav
+        if benchmark_returns is not None:
+            app.state.benchmark_returns = benchmark_returns
+        app.state.drawdown_tier = drawdown_tier
 
         # Broadcast iteration update so dashboard shows real iteration count
         if hasattr(app.state, "listener") and app.state.listener is not None:
             try:
                 await app.state.listener.manager.broadcast({
                     "type": "session_status",
-                    "data": {"active": True, "iteration": iteration},
+                    "data": {
+                        "active": True,
+                        "iteration": iteration,
+                        "firm_inception_pnl": getattr(app.state, "firm_inception_pnl", 0.0),
+                        "firm_peak_nav": getattr(app.state, "firm_peak_nav", 0.0),
+                        "benchmark_returns": getattr(app.state, "benchmark_returns", {}) or {},
+                        "drawdown_tier": getattr(app.state, "drawdown_tier", "none"),
+                    },
                 })
             except Exception:
                 pass
@@ -783,5 +885,5 @@ def create_app(
     return app
 
 
-# Create app instance for uvicorn
+# Create app instance for uvicorn and container entrypoints.
 app = create_app()

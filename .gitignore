@@ -37,6 +37,15 @@ ENV/
 
 # Testing
 .pytest_cache/
+.pytest-tmp*/
+tmp_pytest*/
+tmp_pytest_cache*/
+tmp_pytest_runtime/
+tmp_test*/
+tmp_verify*/
+tmp_py_manual/
+tmp_manual/
+tasks/env-*-before-path-fix*.reg
 .coverage
 htmlcov/
 

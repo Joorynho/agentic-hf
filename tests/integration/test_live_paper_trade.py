@@ -26,9 +26,13 @@ from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.pods.base.namespace import PodNamespace
 from src.pods.templates.beta.execution_trader import BetaExecutionTrader
 
-HAS_ALPACA = bool(os.getenv("ALPACA_API_KEY") and os.getenv("ALPACA_SECRET_KEY"))
+RUN_LIVE_ALPACA = os.getenv("RUN_LIVE_ALPACA_TESTS") == "1"
+HAS_ALPACA = RUN_LIVE_ALPACA and bool(os.getenv("ALPACA_API_KEY") and os.getenv("ALPACA_SECRET_KEY"))
 
-pytestmark = pytest.mark.skipif(not HAS_ALPACA, reason="No Alpaca credentials")
+pytestmark = pytest.mark.skipif(
+    not HAS_ALPACA,
+    reason="Live Alpaca tests are opt-in: set RUN_LIVE_ALPACA_TESTS=1 with paper credentials",
+)
 
 
 def _make_token(pod_id="beta", order_id=None) -> RiskApprovalToken:

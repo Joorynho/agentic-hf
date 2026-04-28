@@ -1133,3 +1133,31 @@ git commit -am "feat: position reviewer references original entry thesis for eac
 | 13 | Position reviewer gets entry thesis | 4 | ☐ |
 
 **Expected outcome:** Agents that learn from mistakes, size bets by conviction, adapt to market conditions, and share intelligence — directly improving PnL through better decision quality at every level of the system.
+# Current Sprint: Stabilization And Hardening
+
+Goal: make the existing platform easier to install, verify, operate, and trust before adding more trading intelligence.
+
+Checklist:
+- [x] Align repo documentation with the current product: 4 active pods, static dashboard served from `web/dist`, `python run.py` on port 8001, and correct test commands.
+- [x] Make dependency metadata installable from a fresh checkout by completing `pyproject.toml` and adding `requirements.txt`.
+- [x] Harden test isolation so normal pytest runs do not use `.env` live credentials and do not rely on blocked Windows temp directories.
+- [x] Replace the placeholder `/api/audit` route with real recent audit-log data.
+- [x] Add production controls around dashboard session start/stop and document the deployment switches.
+- [x] Verify the focused backend, web, and test-isolation suites.
+
+Review:
+- Rewrote `README.md` around the active 4-pod Python/static-dashboard product.
+- Added complete install metadata in `pyproject.toml` and `requirements.txt`.
+- Updated Docker to serve the checked-in `web/dist` dashboard without requiring a missing package lock.
+- Hardened pytest isolation: no live Alpaca unless `RUN_LIVE_ALPACA_TESTS=1`; workspace-local temp fixtures avoid Windows ACL failures.
+- Implemented `/api/audit` from DuckDB `AuditLog.recent_messages`.
+- Guarded session start/stop in production unless `MISSION_CONTROL_ENABLE_SESSION_CONTROL=true`.
+- Verification: `python -m pytest tests -q --tb=short --disable-warnings -o cache_dir="C:\Users\PW1868\Agentic HF\tmp_pytest_cache_full3"` passed with 529 passed, 2 skipped.
+
+Product-readiness audit:
+- Ready enough for continued backend/product work: dependency metadata is installable, the static dashboard entrypoint matches Docker/uvicorn, normal tests are isolated from live LLM and Alpaca credentials, `/api/audit` now returns real data, and production session controls fail closed.
+- Demo caveat: manual browser smoke was intentionally skipped in this pass. Before showing the product externally, run the dashboard locally and click through Command, Intelligence, Research, Performance, Execution, Operations, Risk, Attribution, Macro Indicators, and Reports.
+- Remaining readiness gaps: `/api/nav-history`, `/api/execution-quality`, `/api/benchmarks`, and `/api/correlation` need explicit REST tests if they are part of the shipped dashboard contract; the dashboard still uses browser alerts for disabled session controls instead of an in-app status banner; `/health` does not yet expose broker/research/LLM dependency readiness; production deployment docs should include the admin PowerShell `PATH` repair note for this workstation only, not as a product requirement.
+- Recommended next implementation pass: add a system health panel with Alpaca/FRED/Polymarket/LLM status, replace start/stop alerts with an inline operational banner, and add endpoint tests for the remaining dashboard data APIs.
+
+---

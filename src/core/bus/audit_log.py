@@ -43,6 +43,41 @@ class AuditLog:
         cols = [d[0] for d in self._conn.description]
         return [dict(zip(cols, row)) for row in result]
 
+    def recent_messages(self, limit: int = 100, topic: str | None = None) -> list[dict]:
+        """Return recent audit messages with decoded JSON payloads."""
+        limit = max(1, min(int(limit), 500))
+        params: list[object] = []
+        where = ""
+        if topic:
+            where = "WHERE topic = ?"
+            params.append(topic)
+        params.append(limit)
+        rows = self._conn.execute(
+            f"""
+            SELECT id, timestamp, sender, recipient, topic, payload, correlation_id
+            FROM messages
+            {where}
+            ORDER BY timestamp DESC
+            LIMIT ?
+            """,
+            params,
+        ).fetchall()
+        cols = [d[0] for d in self._conn.description]
+        messages = []
+        for row in rows:
+            item = dict(zip(cols, row))
+            payload = item.get("payload")
+            if isinstance(payload, str):
+                try:
+                    item["payload"] = json.loads(payload)
+                except json.JSONDecodeError:
+                    item["payload"] = payload
+            ts = item.get("timestamp")
+            if hasattr(ts, "isoformat"):
+                item["timestamp"] = ts.isoformat()
+            messages.append(item)
+        return messages
+
     def kv_set(self, key: str, value) -> None:
         """Store a key-value pair (upsert)."""
         now = datetime.now(timezone.utc)

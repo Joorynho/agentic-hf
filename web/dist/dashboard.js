@@ -194,13 +194,19 @@ function toggleSession() {
   if (sessionActive) {
     if (!confirm('Stop the trading session? All pods will be halted.')) return;
     fetch('/api/session/stop', { method: 'POST' })
-      .then(function(r) { return r.json(); })
-      .then(function(d) { if (d.ok) updateSessionStatus(false); })
+      .then(function(r) { return r.json().then(function(d) { d._status = r.status; return d; }); })
+      .then(function(d) {
+        if (d.ok) updateSessionStatus(false);
+        else if (d.detail) alert(d.detail);
+      })
       .catch(function(e) { console.error('stop failed', e); });
   } else {
     fetch('/api/session/start', { method: 'POST' })
-      .then(function(r) { return r.json(); })
-      .then(function(d) { if (d.ok) updateSessionStatus(true); })
+      .then(function(r) { return r.json().then(function(d) { d._status = r.status; return d; }); })
+      .then(function(d) {
+        if (d.ok) updateSessionStatus(true);
+        else if (d.detail) alert(d.detail);
+      })
       .catch(function(e) { console.error('start failed', e); });
   }
 }

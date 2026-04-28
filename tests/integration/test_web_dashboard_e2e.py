@@ -4,6 +4,7 @@ import json
 import logging
 import tempfile
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -36,12 +37,15 @@ def event_bus(audit_log):
 
 @pytest.fixture
 def alpaca_adapter():
-    """Create mock Alpaca adapter (uses paper trading)."""
-    # Skip if ALPACA credentials not in .env
-    import os
-    if not os.getenv("ALPACA_API_KEY") or not os.getenv("ALPACA_SECRET_KEY"):
-        pytest.skip("Alpaca credentials not configured")
-    return AlpacaAdapter()
+    """Create mock Alpaca adapter; web tests must not touch live broker APIs."""
+    adapter = AsyncMock(spec=AlpacaAdapter)
+    adapter.fetch_account = AsyncMock(
+        return_value={"equity": 10000.0, "cash": 10000.0, "buying_power": 5000.0, "position_count": 0}
+    )
+    adapter.fetch_bars = AsyncMock(return_value={})
+    adapter.get_open_positions = AsyncMock(return_value={})
+    adapter.get_earliest_buy_dates = AsyncMock(return_value={})
+    return adapter
 
 
 @pytest.fixture

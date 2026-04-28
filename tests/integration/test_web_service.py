@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
 from fastapi.testclient import TestClient
-from websockets.client import connect as ws_connect
+from websockets.asyncio.client import connect as ws_connect
 
 from src.web.server import create_app, ConnectionManager, EventBusListener
 from src.core.bus.event_bus import EventBus
@@ -298,13 +298,24 @@ class TestRESTEndpoints:
         assert data["risk_halt"] is True
         assert data["risk_halt_reason"] == "VAR breach in pod alpha"
 
-    def test_get_audit_log(self, client):
-        """Test get audit log endpoint."""
+    def test_get_audit_log(self, client, event_bus):
+        """Test get audit log endpoint returns recorded EventBus messages."""
+        msg = AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender="system",
+            recipient="dashboard",
+            topic="system.audit",
+            payload={"event": "smoke", "ok": True},
+        )
+        asyncio.run(event_bus.publish("system.audit", msg, publisher_id="system"))
+
         response = client.get("/api/audit")
         assert response.status_code == 200
         data = response.json()
         assert "entries" in data
         assert "count" in data
+        assert data["count"] >= 1
+        assert data["entries"][0]["payload"]["event"] == "smoke"
 
 
 class TestWebSocketIntegration:
@@ -578,3 +589,14 @@ class TestSessionControl:
         client = TestClient(app)
         resp = client.post("/api/session/start")
         assert resp.status_code == 503
+
+    def test_session_controls_disabled_by_default_in_production(self, event_bus, mock_session_manager, monkeypatch):
+        """Production deployments require an explicit opt-in for dashboard controls."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        monkeypatch.delenv("MISSION_CONTROL_ENABLE_SESSION_CONTROL", raising=False)
+        app = create_app(event_bus=event_bus, session_manager=mock_session_manager)
+        client = TestClient(app)
+
+        resp = client.post("/api/session/start")
+        assert resp.status_code == 403
+        assert "disabled" in resp.json()["detail"].lower()
