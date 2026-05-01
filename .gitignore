@@ -69,6 +69,8 @@ data_cache/
 # Session memory (persisted state)
 data/memory.json
 data/memory.md
+data/state.db
+data/backups/
 
 # Generated reports
 reports/

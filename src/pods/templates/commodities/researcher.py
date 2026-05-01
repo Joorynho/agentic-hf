@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Optional, TYPE_CHECKING
 from src.core.bus.event_bus import EventBus
 from src.core.config.universes import COMMODITIES_SEED
+from src.core.factor_exposure import validate_dynamic_profile
 from src.core.models.messages import AgentMessage
 from src.core.scoring import compute_macro_score
 from src.data.adapters.fred_adapter import FredAdapter
@@ -63,7 +64,14 @@ class CommoditiesResearcher(BasePodAgent):
             f"- Movers: {'; '.join(movers[:6]) if movers else 'none'}\n"
             f"- Oil={fred_snapshot.get('DCOILWTICO', '?')}, VIX={fred_snapshot.get('VIXCLS', '?')}\n\n"
             f"ADD up to 5 or REMOVE up to 5 symbols. At least {int(_MIN_SEED_RETENTION*100)}% of seed must remain.\n"
-            f"JSON: {{\"add\": [], \"remove\": [], \"reasoning\": \"...\"}}"
+            f"For every added symbol, classify its economic risk factors. Use broad factors only: "
+            f"gold_beta, precious_metals, oil, natural_gas, energy_equities, agriculture, "
+            f"industrial_metals, copper, uranium, battery_metals, miners_equity, broad_commodities, "
+            f"usd_inverse, real_rates, equity_beta.\n"
+            f"JSON: {{\"add\": [], \"remove\": [], \"classifications\": ["
+            f"{{\"symbol\": \"USO\", \"primary_factor\": \"oil\", \"exposures\": {{\"oil\": 1.0}}, "
+            f"\"confidence\": 0.8, \"reasoning\": \"why this factor map is valid\"}}], "
+            f"\"reasoning\": \"...\"}}"
         )
         try:
             resp = llm_chat([{"role": "user", "content": prompt}], max_tokens=300)
@@ -76,6 +84,17 @@ class CommoditiesResearcher(BasePodAgent):
                 seed_kept = len([s for s in COMMODITIES_SEED if s in new_universe])
                 if seed_kept < len(COMMODITIES_SEED) * _MIN_SEED_RETENTION:
                     return current
+                dynamic_profiles = dict(self.recall("factor_profiles") or {})
+                classifications = parsed.get("classifications", [])
+                if isinstance(classifications, list):
+                    for raw in classifications:
+                        if not isinstance(raw, dict):
+                            continue
+                        profile = validate_dynamic_profile(str(raw.get("symbol", "")), raw)
+                        if profile.symbol and profile.symbol in add_syms:
+                            dynamic_profiles[profile.symbol] = profile.to_dict()
+                    if dynamic_profiles:
+                        self.store("factor_profiles", dynamic_profiles)
                 if add_syms or rm_syms:
                     await self._bus.publish("agent.activity", AgentMessage(
                         timestamp=datetime.now(timezone.utc), sender=f"{self._pod_id}.researcher",

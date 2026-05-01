@@ -24,6 +24,9 @@ class PodRiskMetrics(BaseModel):
     net_leverage: float
     var_95_1d: float
     es_95_1d: float
+    risk_mode: str = "normal"
+    factor_exposures: dict = Field(default_factory=dict)
+    factor_breaches: list[str] = Field(default_factory=list)
 
 
 class PodExposureBucket(BaseModel):

@@ -113,6 +113,75 @@ var TICKER_NAMES = {
   'SKY/USD':'Sky', 'XTZ/USD':'Tezos', 'YFI/USD':'Yearn Finance',
 };
 
+var COMMODITY_FACTOR_LIMITS = {
+  gold_beta: 0.35,
+  precious_metals: 0.45,
+  miners_equity: 0.35,
+  silver_beta: 0.30,
+  oil: 0.45,
+  natural_gas: 0.35,
+  energy_equities: 0.45,
+  agriculture: 0.45,
+  industrial_metals: 0.45,
+  copper: 0.35,
+  uranium: 0.30,
+  battery_metals: 0.35,
+  broad_commodities: 0.60,
+  usd_inverse: 0.60,
+  real_rates: 0.60,
+  equity_beta: 0.45
+};
+
+var COMMODITY_FACTOR_PROFILES = {
+  GLD:{gold_beta:1.0, precious_metals:1.0, real_rates:0.45, usd_inverse:0.30},
+  IAU:{gold_beta:1.0, precious_metals:1.0, real_rates:0.45, usd_inverse:0.30},
+  SGOL:{gold_beta:1.0, precious_metals:1.0, real_rates:0.45, usd_inverse:0.30},
+  PAXG:{gold_beta:1.0, precious_metals:1.0, real_rates:0.45, usd_inverse:0.30},
+  GDX:{gold_beta:0.85, precious_metals:0.90, miners_equity:1.0, equity_beta:0.35},
+  GDXJ:{gold_beta:0.90, precious_metals:0.90, miners_equity:1.0, equity_beta:0.45},
+  NEM:{gold_beta:0.80, precious_metals:0.80, miners_equity:1.0, equity_beta:0.35},
+  GOLD:{gold_beta:0.80, precious_metals:0.80, miners_equity:1.0, equity_beta:0.35},
+  SLV:{silver_beta:1.0, precious_metals:0.80, usd_inverse:0.25},
+  PSLV:{silver_beta:1.0, precious_metals:0.80, usd_inverse:0.25},
+  SIL:{silver_beta:0.85, precious_metals:0.75, miners_equity:0.75, equity_beta:0.35},
+  USO:{oil:1.0, usd_inverse:0.20},
+  BNO:{oil:1.0, usd_inverse:0.20},
+  XLE:{oil:0.70, energy_equities:1.0, equity_beta:0.45},
+  XOP:{oil:0.80, energy_equities:1.0, equity_beta:0.55},
+  OIH:{oil:0.75, energy_equities:1.0, equity_beta:0.50},
+  UNG:{natural_gas:1.0, usd_inverse:0.15},
+  AMLP:{oil:0.45, natural_gas:0.35, energy_equities:0.85, equity_beta:0.35},
+  DBA:{agriculture:1.0, usd_inverse:0.20},
+  CORN:{agriculture:1.0, usd_inverse:0.20},
+  WEAT:{agriculture:1.0, usd_inverse:0.20},
+  SOYB:{agriculture:1.0, usd_inverse:0.20},
+  MOO:{agriculture:0.70, equity_beta:0.50},
+  COW:{agriculture:1.0},
+  MOS:{agriculture:0.75, equity_beta:0.45},
+  NTR:{agriculture:0.75, equity_beta:0.45},
+  GSG:{broad_commodities:1.0, oil:0.50, agriculture:0.20, industrial_metals:0.20},
+  PDBC:{broad_commodities:1.0, oil:0.35, agriculture:0.25, industrial_metals:0.20},
+  COM:{broad_commodities:1.0},
+  DJP:{broad_commodities:1.0},
+  COMT:{broad_commodities:1.0},
+  CPER:{copper:1.0, industrial_metals:0.85, usd_inverse:0.20},
+  COPX:{copper:0.85, industrial_metals:0.80, miners_equity:0.70, equity_beta:0.45},
+  DBB:{industrial_metals:1.0, copper:0.35, usd_inverse:0.20},
+  PICK:{industrial_metals:0.75, miners_equity:0.80, equity_beta:0.45},
+  XME:{industrial_metals:0.65, miners_equity:0.85, equity_beta:0.55},
+  REMX:{battery_metals:0.80, industrial_metals:0.50, miners_equity:0.70, equity_beta:0.45},
+  FCX:{copper:0.85, industrial_metals:0.75, miners_equity:0.55, equity_beta:0.45},
+  BHP:{industrial_metals:0.70, miners_equity:0.75, equity_beta:0.45},
+  RIO:{industrial_metals:0.70, miners_equity:0.75, equity_beta:0.45},
+  VALE:{industrial_metals:0.70, miners_equity:0.75, equity_beta:0.50},
+  AA:{industrial_metals:0.80, miners_equity:0.50, equity_beta:0.45},
+  CLF:{industrial_metals:0.80, miners_equity:0.50, equity_beta:0.55},
+  URA:{uranium:1.0, miners_equity:0.65, equity_beta:0.45},
+  URNM:{uranium:1.0, miners_equity:0.65, equity_beta:0.45},
+  LIT:{battery_metals:0.85, equity_beta:0.50},
+  BATT:{battery_metals:0.85, equity_beta:0.50}
+};
+
 /** Return "TICKER (Full Name)" or just "TICKER" if unknown */
 function tickerDisplay(symbol) {
   if (!symbol) return '';
@@ -284,8 +353,13 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'execution') fetchClosedTrades();
     if (btn.dataset.tab === 'closed') loadClosedPositions();
-    if (btn.dataset.tab === 'risk') fetchCorrelationAndRender();
+    if (btn.dataset.tab === 'risk') {
+      fetchPositionsFromApi();
+      fetchCorrelationAndRender();
+      renderFactorRiskTable();
+    }
     if (btn.dataset.tab === 'performance') {
+      fetchClosedTrades(true);
       fetch('/api/benchmarks').then(function(r) { return r.json(); }).then(function(d) {
         benchmarkReturns = (d && d.benchmarks) ? d.benchmarks : {};
         updateNavChart();
@@ -1287,6 +1361,74 @@ function getPodInvested(d) { return d.invested ?? (d.risk_metrics && d.risk_metr
 function getPodCash(d) { return d.cash ?? (d.risk_metrics && d.risk_metrics.cash) ?? 0; }
 function getPodStartCap(d) { return d.starting_capital ?? (d.risk_metrics && d.risk_metrics.starting_capital) ?? 0; }
 
+function dateOnly(value) {
+  if (value == null || value === '') return '';
+  var text = String(value);
+  return text.length >= 10 ? text.slice(0, 10) : text;
+}
+
+function displayDateOnly(value) {
+  return dateOnly(value) || '-';
+}
+
+function getAllocationBaseCapital(ids) {
+  var startTotal = ids.reduce(function(sum, id) {
+    return sum + (getPodStartCap(pods[id] || {}) || 0);
+  }, 0);
+  if (startTotal > 0) return startTotal;
+  if (initialCapital > 0) return initialCapital;
+
+  var navTotal = ids.reduce(function(sum, id) {
+    return sum + (getPodNav(pods[id] || {}) || 0);
+  }, 0);
+  if (navTotal > 0) return navTotal;
+  return ids.length > 0 ? ids.length * 1000 : 0;
+}
+
+function normalizeAllocationWeights(rawWeights, ids) {
+  var weights = {};
+  var complete = rawWeights && typeof rawWeights === 'object' && ids.length > 0;
+
+  if (complete) {
+    ids.forEach(function(id) {
+      var value = rawWeights[id];
+      if (value == null) value = rawWeights[id.toUpperCase()];
+      value = Number(value);
+      if (Number.isFinite(value) && value > 0) {
+        weights[id] = value;
+      } else {
+        complete = false;
+      }
+    });
+
+    if (complete) {
+      var maxWeight = Math.max.apply(null, Object.values(weights));
+      if (maxWeight > 1) {
+        Object.keys(weights).forEach(function(id) { weights[id] = weights[id] / 100; });
+      }
+      var totalWeight = Object.values(weights).reduce(function(sum, value) { return sum + value; }, 0);
+      if (totalWeight > 0) {
+        Object.keys(weights).forEach(function(id) { weights[id] = weights[id] / totalWeight; });
+        return weights;
+      }
+    }
+  }
+
+  var totalStart = ids.reduce(function(sum, id) {
+    return sum + (getPodStartCap(pods[id] || {}) || 0);
+  }, 0);
+  if (totalStart > 0) {
+    ids.forEach(function(id) {
+      weights[id] = (getPodStartCap(pods[id] || {}) || 0) / totalStart;
+    });
+    return weights;
+  }
+
+  var equalWeight = ids.length > 0 ? 1 / ids.length : 0;
+  ids.forEach(function(id) { weights[id] = equalWeight; });
+  return weights;
+}
+
 // Positions from /api/positions — single source for Top Holdings, drilldown, and KPI
 var _positionsFromApi = [];
 var _positionsFetchInFlight = false;
@@ -1311,6 +1453,7 @@ function fetchPositionsFromApi() {
       });
       updateTopHoldings();
       updateFirmMetrics();
+      renderFactorRiskTable();
     })
     .catch(function() { _positionsFetchInFlight = false; });
 }
@@ -1636,6 +1779,7 @@ function calculateRisk() {
 
   document.getElementById('kpi-alerts').textContent = riskAlerts.length;
   updateRiskTable();
+  renderFactorRiskTable();
   renderCorrelationHeatmap();
 }
 
@@ -1675,6 +1819,96 @@ function updateRiskTable() {
 }
 
 // ─── 10. Execution ─────────────────────────────────────────────────────────
+function getCommodityOpenPositions() {
+  var positions = [];
+  if (_positionsFromApi && _positionsFromApi.length > 0) {
+    positions = _positionsFromApi.filter(function(p) {
+      return String(p._pod || p.pod_id || '').toLowerCase() === 'commodities';
+    });
+  }
+  if (positions.length === 0) {
+    var pod = pods.commodities || {};
+    positions = getPodPositions(pod).map(function(p) {
+      return Object.assign({ _pod: 'commodities' }, p || {});
+    });
+  }
+  return positions;
+}
+
+function buildClientCommodityFactorReport() {
+  var pod = pods.commodities || {};
+  var positions = getCommodityOpenPositions();
+  if (!positions.length) return { factors: {}, source: 'client_fallback' };
+
+  var nav = getPodNav(pod) || positions.reduce(function(sum, p) {
+    return sum + Math.abs(Number(p.notional || ((p.qty || 0) * (p.current_price || p.cost_basis || 0))) || 0);
+  }, 0);
+  var factors = {};
+
+  positions.forEach(function(p) {
+    var symbol = String(p.symbol || '').toUpperCase();
+    var profile = COMMODITY_FACTOR_PROFILES[symbol];
+    var notional = Math.abs(Number(p.notional || ((p.qty || 0) * (p.current_price || p.cost_basis || 0))) || 0);
+    if (!profile || notional <= 0) return;
+
+    Object.keys(profile).forEach(function(factor) {
+      var factorNotional = notional * Number(profile[factor] || 0);
+      if (factorNotional <= 0) return;
+      if (!factors[factor]) {
+        factors[factor] = {
+          notional: 0,
+          pct_nav: 0,
+          limit_pct: COMMODITY_FACTOR_LIMITS[factor] || 0.40,
+          breach: false,
+          symbols: []
+        };
+      }
+      factors[factor].notional += factorNotional;
+      if (factors[factor].symbols.indexOf(symbol) === -1) factors[factor].symbols.push(symbol);
+    });
+  });
+
+  Object.keys(factors).forEach(function(factor) {
+    factors[factor].pct_nav = nav > 0 ? factors[factor].notional / nav : 0;
+    factors[factor].breach = factors[factor].pct_nav > factors[factor].limit_pct;
+  });
+
+  return { factors: factors, risk_mode: 'dashboard_fallback', source: 'client_fallback' };
+}
+
+function renderFactorRiskTable() {
+  var tbody = document.getElementById('factor-risk-table');
+  if (!tbody) return;
+  var pod = pods.commodities || pods.Commodities || null;
+  var report = pod && (pod.factor_exposures || (pod.risk_metrics && pod.risk_metrics.factor_exposures));
+  if (!report || !report.factors || Object.keys(report.factors || {}).length === 0) {
+    report = buildClientCommodityFactorReport();
+  }
+  var factors = report && report.factors ? report.factors : {};
+  var rows = Object.keys(factors).sort(function(a, b) {
+    return (factors[b].pct_nav || 0) - (factors[a].pct_nav || 0);
+  });
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty"><div class="empty-txt">No commodity factor exposure yet</div><div class="empty-hint">Open commodity positions will be mapped here by shared risk factor</div></td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.slice(0, 10).map(function(factor) {
+    var row = factors[factor] || {};
+    var pct = (row.pct_nav || 0) * 100;
+    var lim = (row.limit_pct || 0) * 100;
+    var breach = !!row.breach;
+    var badge = breach ? '<span class="badge b-halted">BREACH</span>' : '<span class="badge b-active">OK</span>';
+    var syms = Array.isArray(row.symbols) ? row.symbols.join(', ') : '';
+    return `<tr>
+      <td class="pod-name">${factor.replace(/_/g, ' ').toUpperCase()}</td>
+      <td>${syms ? escapeHtml(syms) : '-'}</td>
+      <td class="r ${breach ? 'neg' : ''}">${pct.toFixed(1)}%</td>
+      <td class="r">${lim.toFixed(1)}%</td>
+      <td class="r">${badge}</td>
+    </tr>`;
+  }).join('');
+}
+
 function addTrade(podId, symbol, side, qty, price, status, orderId) {
   status = status || 'FILLED';
   orderId = orderId || null;
@@ -1760,15 +1994,22 @@ var latestAllocWeights = {};
 function updateGovHub() {
   const ids = Object.keys(pods).sort();
   const names = ids.length > 0 ? ids : ['equities','fx','crypto','commodities'];
-  const firmNav = ids.reduce(function(s, id) { return s + (pods[id] ? pods[id].nav || 0 : 0); }, 0);
+  const baseCapital = getAllocationBaseCapital(names);
+  const allocWeights = normalizeAllocationWeights(latestAllocWeights, names);
   document.getElementById('alloc-grid').innerHTML = names.map(id => {
-    const nav = pods[id] ? pods[id].nav || 0 : 0;
-    const pct = latestAllocWeights[id] != null ? (latestAllocWeights[id] * 100).toFixed(0) + '%'
-              : firmNav > 0 ? (nav / firmNav * 100).toFixed(0) + '%' : '—';
+    const weight = allocWeights[id] || 0;
+    const allocation = baseCapital * weight;
+    const currentNav = getPodNav(pods[id] || {});
+    const nav = currentNav > 0 ? currentNav : allocation;
+    const pct = weight > 0 ? (weight * 100).toFixed(0) + '%' : '-';
+    const allocationLabel = allocation > 0 ? 'Allocated $' + allocation.toFixed(0) : 'Allocated -';
+    const navDelta = currentNav > 0 && allocation > 0 ? currentNav - allocation : 0;
+    const navClass = navDelta > 0.005 ? ' pos' : navDelta < -0.005 ? ' neg' : '';
     return `<div class="alloc-tile">
       <div class="alloc-pod">${id.toUpperCase()}</div>
-      <div class="alloc-val">$${nav > 0 ? nav.toFixed(0) : '—'}</div>
-      <div class="alloc-pct">${pct}</div>
+      <div class="alloc-val${navClass}">$${nav > 0 ? nav.toFixed(2) : '—'}</div>
+      <div class="alloc-pct">Current NAV</div>
+      <div class="alloc-sub">${allocationLabel} · ${pct}</div>
     </div>`;
   }).join('');
 
@@ -2008,21 +2249,31 @@ function renderPositionModal(d, overlay) {
   }
   var fillsHtml = '';
   if (fills.length > 0) {
-    fillsHtml = fills.map(function(f) {
+    fillsHtml = fills.map(function(f, idx) {
       var isBuy = f.side === 'BUY';
       var cls = (isBuy ? 'fill-buy' : 'fill-sell') + (f._synthetic ? ' fill-synthetic' : '');
       var icon = isBuy ? '+' : '-';
       var ts = f.timestamp ? new Date(f.timestamp).toLocaleDateString() : '—';
-      return '<div class="fill-entry ' + cls + '">' +
-        '<span class="fill-icon">' + icon + '</span>' +
-        '<div class="fill-info">' +
-          '<span class="fill-side">' + f.side + '</span> ' +
-          '<span class="fill-qty">' + f.qty + '</span> @ ' +
-          '<span class="fill-px">$' + (f.fill_price || 0).toFixed(2) + '</span>' +
-          '<span class="fill-date">' + ts + '</span>' +
-        '</div>' +
-        (f.reasoning ? '<div class="fill-reason">' + escapeHtml(cleanThesis(f.reasoning, d.symbol)) + '</div>' : '') +
-      '</div>';
+      var thesisText = cleanThesis(f.entry_thesis || f.reasoning || '', d.symbol);
+      var conv = f.conviction > 0 ? ' · ' + (f.conviction * 100).toFixed(0) + '% conviction' : '';
+      var tag = f.strategy_tag ? ' · ' + escapeHtml(f.strategy_tag) : '';
+      var openAttr = (idx === fills.length - 1 || f._synthetic) ? ' open' : '';
+      return '<details class="fill-entry ' + cls + '"' + openAttr + '>' +
+        '<summary class="fill-summary">' +
+          '<span class="fill-icon">' + icon + '</span>' +
+          '<span class="fill-info">' +
+            '<span class="fill-side">' + escapeHtml(f.side || '') + '</span> ' +
+            '<span class="fill-qty">' + escapeHtml(String(f.qty || 0)) + '</span> @ ' +
+            '<span class="fill-px">$' + (f.fill_price || 0).toFixed(2) + '</span>' +
+            '<span class="fill-meta">' + conv + tag + '</span>' +
+          '</span>' +
+          '<span class="fill-date">' + escapeHtml(ts) + '</span>' +
+          '<span class="fill-caret">▾</span>' +
+        '</summary>' +
+        (thesisText
+          ? '<div class="fill-reason"><div class="fill-reason-label">Entry / Expansion Thesis</div>' + escapeHtml(thesisText) + '</div>'
+          : '<div class="fill-reason fill-reason-empty">No PM reasoning captured for this fill.</div>') +
+      '</details>';
     }).join('');
   } else {
     fillsHtml = '<div class="pos-empty">No fill history available</div>';
@@ -2103,17 +2354,18 @@ function renderPositionModal(d, overlay) {
     (function() {
       var rh = d.reasoning_history;
       if (!rh || !rh.length) return '';
-      var items = rh.slice(0, 10).map(function(r) {
+      var items = rh.map(function(r, idx) {
         var actionCls = r.action === 'HOLD' ? 'rh-hold' : r.action === 'BUY' ? 'rh-buy' : 'rh-sell';
         var ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : '';
         var conv = r.conviction > 0 ? ' (' + (r.conviction * 100).toFixed(0) + '% conviction)' : '';
-        return '<div class="rh-entry ' + actionCls + '">' +
-          '<div class="rh-header"><span class="rh-badge">' + escapeHtml(r.action) + '</span><span class="rh-ts">' + ts + conv + '</span></div>' +
-          '<div class="rh-text">' + escapeHtml(r.reasoning || '') + '</div>' +
-        '</div>';
+        var text = cleanThesis(r.reasoning || '', d.symbol);
+        return '<details class="pmh-entry ' + actionCls + '"' + (idx === 0 ? ' open' : '') + '>' +
+          '<summary class="pmh-header"><span class="rh-badge">' + escapeHtml(r.action) + '</span><span class="rh-ts">' + escapeHtml(ts + conv) + '</span><span class="pmh-caret">▾</span></summary>' +
+          '<div class="pmh-text">' + escapeHtml(text || 'No reasoning captured.') + '</div>' +
+        '</details>';
       }).join('');
       return '<div class="pos-section"><div class="pos-section-title">PM Reasoning History (' + rh.length + ' entries)</div>' +
-        '<div class="rh-list">' + items + '</div></div>';
+        '<div class="pmh-list">' + items + '</div></div>';
     })() +
   '</div>';
 }
@@ -2351,17 +2603,18 @@ function exportNavHistory() {
 var _ctLastFetch = 0;
 var _ctData = [];
 
-function fetchClosedTrades() {
+function fetchClosedTrades(force) {
   var now = Date.now();
-  if (now - _ctLastFetch < 15000) return;
+  if (!force && now - _ctLastFetch < 15000) return;
   _ctLastFetch = now;
   var controller = new AbortController();
   var timeout = setTimeout(function() { controller.abort(); }, 4000);
   fetch('/api/trades/closed', { signal: controller.signal })
     .then(function(r) { clearTimeout(timeout); if (!r.ok) throw new Error(r.statusText); return r.json(); })
     .then(function(data) {
-      _ctData = data;
+      _ctData = Array.isArray(data) ? data : (data && (data.value || data.closed_positions)) || [];
       renderClosedTrades();
+      renderOutcomeStats();
     })
     .catch(function() { clearTimeout(timeout); });
 }
@@ -2381,8 +2634,8 @@ function renderClosedTrades() {
     totalPnl += pnl;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
     var thesis = t.entry_reasoning || '';
-    var entryDate = t.entry_time ? t.entry_time.substring(0, 10) : '—';
-    var exitDate = t.exit_time ? t.exit_time.substring(0, 10) : '—';
+    var entryDate = displayDateOnly(t.entry_date || t.entry_time);
+    var exitDate = displayDateOnly(t.exit_date || t.exit_time);
     return '<tr>' +
       '<td class="pod-name">' + escapeHtml(t.pod_id || '').toUpperCase() + '</td>' +
       '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
@@ -2845,20 +3098,62 @@ function toggleRhEntry(bodyId) {
   if (el) el.classList.toggle('open');
 }
 
+function buildClosedOutcomeStatsByPod() {
+  var grouped = {};
+  (_ctData || []).forEach(function(t) {
+    var pid = String(t.pod_id || t._pod || 'unknown').toLowerCase();
+    if (!grouped[pid]) grouped[pid] = { trades: [], total_pnl: 0, wins: 0, winners: [], losers: [] };
+    var pnl = Number(t.realized_pnl || 0);
+    grouped[pid].trades.push(t);
+    grouped[pid].total_pnl += pnl;
+    if (pnl > 0) {
+      grouped[pid].wins += 1;
+      grouped[pid].winners.push(pnl);
+    } else if (pnl < 0) {
+      grouped[pid].losers.push(pnl);
+    }
+  });
+
+  var stats = {};
+  Object.keys(grouped).forEach(function(pid) {
+    var g = grouped[pid];
+    var n = g.trades.length || 0;
+    var winTotal = g.winners.reduce(function(sum, value) { return sum + value; }, 0);
+    var lossTotal = g.losers.reduce(function(sum, value) { return sum + value; }, 0);
+    stats[pid] = {
+      total_trades: n,
+      win_rate: n > 0 ? g.wins / n : 0,
+      avg_pnl: n > 0 ? g.total_pnl / n : 0,
+      total_pnl: g.total_pnl,
+      avg_winner: g.winners.length > 0 ? winTotal / g.winners.length : 0,
+      avg_loser: g.losers.length > 0 ? lossTotal / g.losers.length : 0
+    };
+  });
+  return stats;
+}
+
 function renderOutcomeStats() {
   var container = document.getElementById('outcome-grid');
   var badge = document.getElementById('outcomes-total-badge');
   if (!container) return;
 
-  var podIds = Object.keys(pods).filter(function(pid) {
-    var s = pods[pid].trade_outcome_stats || {};
+  var apiStats = buildClosedOutcomeStatsByPod();
+  var statsByPod = Object.keys(apiStats).length > 0 ? apiStats : Object.keys(pods).reduce(function(acc, pid) {
+    acc[pid] = pods[pid].trade_outcome_stats || {};
+    return acc;
+  }, {});
+  var podIds = Object.keys(statsByPod).filter(function(pid) {
+    var s = statsByPod[pid] || {};
     return s.total_trades > 0;
   });
 
   var totalTrades = podIds.reduce(function(sum, pid) {
-    return sum + ((pods[pid].trade_outcome_stats || {}).total_trades || 0);
+    return sum + ((statsByPod[pid] || {}).total_trades || 0);
   }, 0);
-  if (badge) badge.textContent = totalTrades + ' trade' + (totalTrades !== 1 ? 's' : '');
+  if (badge) {
+    badge.textContent = totalTrades + ' closed trade' + (totalTrades !== 1 ? 's' : '');
+    badge.title = 'Closed-trade stats exclude open/unrealized P&L. Use NAV P&L to reconcile with Pod Returns.';
+  }
 
   if (podIds.length === 0) {
     container.innerHTML = '<div class="outcome-pod-card"><div class="empty-txt">No closed trades yet</div></div>';
@@ -2866,10 +3161,14 @@ function renderOutcomeStats() {
   }
 
   container.innerHTML = podIds.map(function(pid) {
-    var s = pods[pid].trade_outcome_stats || {};
+    var s = statsByPod[pid] || {};
+    var pod = pods[pid] || {};
+    var startCap = getPodStartCap(pod);
+    var navPnl = startCap > 0 ? getPodNav(pod) - startCap : null;
     var wrCls = s.win_rate >= 0.5 ? 'pos' : 'neg';
     var avgCls = s.avg_pnl >= 0 ? 'pos' : 'neg';
     var totCls = s.total_pnl >= 0 ? 'pos' : 'neg';
+    var navCls = navPnl == null ? '' : navPnl >= 0 ? 'pos' : 'neg';
 
     function stat(lbl, val, cls) {
       return '<div class="outcome-stat">' +
@@ -2884,7 +3183,8 @@ function renderOutcomeStats() {
         stat('Trades', s.total_trades || 0, '') +
         stat('Win Rate', ((s.win_rate || 0) * 100).toFixed(0) + '%', wrCls) +
         stat('Avg P&amp;L', (s.avg_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.avg_pnl) || 0).toFixed(2), avgCls) +
-        stat('Total P&amp;L', (s.total_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.total_pnl) || 0).toFixed(2), totCls) +
+        stat('Closed P&amp;L', (s.total_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.total_pnl) || 0).toFixed(2), totCls) +
+        stat('NAV P&amp;L', navPnl == null ? '-' : (navPnl >= 0 ? '+' : '') + '$' + Math.abs(navPnl).toFixed(2), navCls) +
         stat('Avg Winner', '+$' + (s.avg_winner || 0).toFixed(2), 'pos') +
         stat('Avg Loser', '$' + (s.avg_loser || 0).toFixed(2), 'neg') +
       '</div>' +
@@ -2962,12 +3262,14 @@ function renderClosedPositions() {
     var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
     if (p.side === 'short') retPct = -retPct;
     var retCls = retPct >= 0 ? 'pos' : 'neg';
-    var entryDate = (p.entry_time || '').slice(0, 10) || '—';
-    var exitDate = (p.exit_time || '').slice(0, 10) || '—';
+    var entryRaw = p.entry_time || p.entry_date || '';
+    var exitRaw = p.exit_time || p.exit_date || '';
+    var entryDate = displayDateOnly(entryRaw);
+    var exitDate = displayDateOnly(exitRaw);
     var holdDays = '—';
-    if (p.entry_time && p.exit_time) {
+    if (entryRaw && exitRaw) {
       try {
-        holdDays = Math.round((new Date(p.exit_time) - new Date(p.entry_time)) / 86400000) + 'd';
+        holdDays = Math.round((new Date(exitRaw) - new Date(entryRaw)) / 86400000) + 'd';
       } catch(e) {}
     }
     return '<tr class="holdings-row" style="cursor:pointer" onclick="showClosedPositionDetail(' + idx + ')" title="Click for details">' +
@@ -3006,11 +3308,13 @@ function showClosedPositionDetail(idx) {
   var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
   if (p.side === 'short') retPct = -retPct;
   var retCls = retPct >= 0 ? 'pos' : 'neg';
-  var entryDate = (p.entry_time || '').slice(0, 10) || '—';
-  var exitDate = (p.exit_time || '').slice(0, 10) || '—';
+  var entryRaw = p.entry_time || p.entry_date || '';
+  var exitRaw = p.exit_time || p.exit_date || '';
+  var entryDate = displayDateOnly(entryRaw);
+  var exitDate = displayDateOnly(exitRaw);
   var holdDays = '—';
-  if (p.entry_time && p.exit_time) {
-    try { holdDays = Math.round((new Date(p.exit_time) - new Date(p.entry_time)) / 86400000); } catch(e) {}
+  if (entryRaw && exitRaw) {
+    try { holdDays = Math.round((new Date(exitRaw) - new Date(entryRaw)) / 86400000); } catch(e) {}
   }
 
   var entryThesis = cleanThesis(p.entry_reasoning || p.entry_thesis || '', p.symbol);

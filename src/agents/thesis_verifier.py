@@ -32,6 +32,9 @@ _WEAK_PHRASES = [
     "generally positive", "generally negative", "overall positive",
 ]
 
+_REQUIRED_REASONING_LABELS = ("thesis:", "entry:", "invalidation:", "risk:")
+_PRECIOUS_METALS_SYMBOLS = {"GLD", "GDX", "GDXJ", "SLV", "IAU", "SGOL", "SIL", "SILJ", "PAXG"}
+
 # Minimum useful reasoning length for a non-HOLD decision
 _MIN_REASONING_LEN = 60
 
@@ -51,9 +54,11 @@ class ThesisVerifier:
 
         score = 1.0
         issues: list[str] = []
-        reasoning_lower = reasoning.lower()
+        trade_reasoning = "\n".join(str(t.get("reasoning", "")) for t in active_trades)
+        combined_reasoning = "\n".join(p for p in (reasoning, trade_reasoning) if p).strip()
+        reasoning_lower = combined_reasoning.lower()
 
-        if not reasoning or len(reasoning) < _MIN_REASONING_LEN:
+        if not combined_reasoning or len(combined_reasoning) < _MIN_REASONING_LEN:
             issues.append(f"reasoning is too brief ({len(reasoning)} chars — aim for 80+)")
             score -= 0.35
 
@@ -65,6 +70,33 @@ class ThesisVerifier:
         if generic_count >= 2:
             issues.append("reasoning relies on generic macro phrases without a specific catalyst")
             score -= 0.20
+
+        missing_labels = [label for label in _REQUIRED_REASONING_LABELS if label not in reasoning_lower]
+        if len(missing_labels) >= 2:
+            issues.append(
+                "reasoning is not tradeable enough: include THESIS, ENTRY, INVALIDATION, and RISK sections"
+            )
+            score -= 0.20
+
+        has_precious_trade = any(str(t.get("symbol", "")).upper() in _PRECIOUS_METALS_SYMBOLS for t in active_trades)
+        if has_precious_trade or "gold" in reasoning_lower:
+            gold_inputs = {
+                "real yields/TIPS": ("real yield" in reasoning_lower or "tips" in reasoning_lower),
+                "breakevens/inflation": ("breakeven" in reasoning_lower or "inflation" in reasoning_lower),
+                "Fed reaction": ("fed" in reasoning_lower or "fomc" in reasoning_lower),
+                "USD/dollar": ("usd" in reasoning_lower or "dollar" in reasoning_lower or "dxy" in reasoning_lower),
+            }
+            missing_gold_inputs = [name for name, present in gold_inputs.items() if not present]
+            if len(missing_gold_inputs) >= 2:
+                issues.append(
+                    "precious-metals thesis must address real yields/TIPS, inflation breakevens, Fed reaction, and USD"
+                )
+                score -= 0.20
+            if "negative real rates" in reasoning_lower:
+                issues.append(
+                    "gold thesis claims negative real rates; verify against current TIPS/real-yield data or remove the claim"
+                )
+                score -= 0.15
 
         for t in active_trades:
             conv = float(t.get("conviction", 0.5))

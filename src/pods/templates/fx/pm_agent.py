@@ -8,6 +8,10 @@ import uuid
 from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order, TradeProposal
 from src.core.models.messages import AgentMessage
+from src.core.thesis_quality import (
+    TRADEABLE_ENTRY_THESIS_STANDARD,
+    tradeable_entry_thesis_instruction,
+)
 from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.pods.base.agent import BasePodAgent
 
@@ -318,6 +322,7 @@ class FXPMAgent(BasePodAgent):
             if memory_block:
                 user_content = memory_block + "\n\n" + user_content
         user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 FX ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
+        user_content += tradeable_entry_thesis_instruction("FX")
 
         aging_alerts = self._ns.get("aging_alerts") or []
         if aging_alerts:
@@ -385,12 +390,13 @@ class FXPMAgent(BasePodAgent):
             ) + user_content
 
         try:
+            system_prompt = _FX_SYSTEM + "\n\n" + TRADEABLE_ENTRY_THESIS_STANDARD
             raw = llm_chat(
                 [
-                    {"role": "system", "content": _FX_SYSTEM},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             decision = extract_json(raw)
 
@@ -401,14 +407,14 @@ class FXPMAgent(BasePodAgent):
             search_queries = decision.get("search_queries", [])
             if search_queries and isinstance(search_queries, list):
                 decision, raw_search = await self._web_search_and_decide(
-                    search_queries[:2], user_content, _FX_SYSTEM, decision
+                    search_queries[:2], user_content, system_prompt, decision
                 )
                 raw = raw_search or raw
 
             read_urls = decision.get("read_articles", [])
             if read_urls and isinstance(read_urls, list):
                 decision, raw_second = await self._read_articles_and_decide(
-                    read_urls, user_content, _FX_SYSTEM, decision
+                    read_urls, user_content, system_prompt, decision
                 )
                 response_text = raw_second or raw
             else:
@@ -541,7 +547,7 @@ class FXPMAgent(BasePodAgent):
         try:
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             if self._session_logger:
                 self._session_logger.log_reasoning(f"pm:{self._pod_id}", "web_search_response", raw or "")
@@ -593,7 +599,7 @@ class FXPMAgent(BasePodAgent):
         try:
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             logger.info("[fx.pm] Article deep-dive complete (%d articles read)", len(articles))
             if self._session_logger:

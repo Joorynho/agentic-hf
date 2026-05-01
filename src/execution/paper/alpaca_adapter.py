@@ -419,7 +419,7 @@ class AlpacaAdapter:
         try:
             position = self._client.get_position(symbol)
             side = "sell" if position.side == "long" else "buy"
-            qty = float(position.qty)
+            qty = abs(float(position.qty))
             return await self.place_order(symbol, qty, side, order_type="market")
         except Exception as exc:
             logger.error("[alpaca] close_position failed for %s: %s", symbol, exc)

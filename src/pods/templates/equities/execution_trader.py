@@ -63,17 +63,35 @@ class EquitiesExecutionTrader(BasePodAgent):
                 "rejection_detail": risk_halt_reason,
             }
 
+        drawdown_halt = context.get("drawdown_halt", False)
+        if drawdown_halt and order.side == Side.BUY:
+            logger.error("[equities.exec] Order %s rejected: firm drawdown halt (no new buys)", order.id)
+            return {
+                "execution_rejected": True,
+                "rejection_reason": "drawdown_halt",
+                "rejection_detail": "Firm drawdown — new buys halted",
+            }
+
+        sizing_mult = float(context.get("drawdown_sizing_mult", 1.0))
+
         # If Alpaca adapter is available, execute via Alpaca; otherwise queue for paper adapter
         if self._alpaca:
-            return await self._execute_via_alpaca(order, token, mandate=mandate)
+            return await self._execute_via_alpaca(order, token, mandate=mandate, sizing_mult=sizing_mult)
         else:
             return self._queue_for_paper_adapter(order)
 
     async def _execute_via_alpaca(
-        self, order: Order, token: RiskApprovalToken, mandate: Optional[MandateUpdate] = None
+        self,
+        order: Order,
+        token: RiskApprovalToken,
+        mandate: Optional[MandateUpdate] = None,
+        sizing_mult: float = 1.0,
     ) -> dict:
         """Execute order via Alpaca API, respecting CIO allocation and CRO risk constraints."""
         try:
+            if sizing_mult < 1.0 and sizing_mult > 0 and order.side == Side.BUY:
+                order = order.model_copy(update={"quantity": max(1e-6, order.quantity * sizing_mult)})
+
             # Check allocation constraint (from CIO mandate)
             if mandate and self._pod_id in mandate.pod_allocations:
                 allocation_pct = mandate.pod_allocations[self._pod_id]
@@ -260,12 +278,15 @@ class EquitiesExecutionTrader(BasePodAgent):
                 if accountant:
                     signed_qty = result.fill_qty if order.side == Side.BUY else -result.fill_qty
                     pm_meta = self._ns.get("pm_trade_metadata") or {}
+                    last_prices = self.recall("last_prices", {})
+                    expected_price = last_prices.get(order.symbol)
                     accountant.record_fill_direct(
                         order_id=result.order_id or "",
                         symbol=order.symbol,
                         qty=signed_qty,
                         fill_price=result.fill_price or 0.0,
                         filled_at=result.filled_at,
+                        entry_thesis=pm_meta.get("entry_thesis") or pm_meta.get("reasoning", ""),
                         reasoning=pm_meta.get("reasoning", ""),
                         strategy_tag=pm_meta.get("strategy_tag", order.strategy_tag),
                         signal_snapshot=pm_meta.get("signal_snapshot"),
@@ -274,6 +295,7 @@ class EquitiesExecutionTrader(BasePodAgent):
                         take_profit_pct=pm_meta.get("take_profit_pct"),
                         exit_when=pm_meta.get("exit_when", ""),
                         max_hold_days=pm_meta.get("max_hold_days", 0),
+                        expected_price=expected_price,
                     )
 
                 try:
@@ -315,6 +337,7 @@ class EquitiesExecutionTrader(BasePodAgent):
                             else datetime.now().isoformat()
                         ),
                         "status": result.status,
+                        "entry_thesis": pm_meta.get("entry_thesis") or pm_meta.get("reasoning", ""),
                         "reasoning": pm_meta.get("reasoning", ""),
                         "conviction": pm_meta.get("conviction", 0.5),
                         "strategy_tag": pm_meta.get("strategy_tag", ""),

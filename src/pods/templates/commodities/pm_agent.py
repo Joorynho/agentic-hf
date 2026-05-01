@@ -9,6 +9,10 @@ from src.core.llm import has_llm_key, llm_chat, extract_json
 from src.core.models.enums import Side, OrderType
 from src.core.models.execution import Order, TradeProposal
 from src.core.models.messages import AgentMessage
+from src.core.thesis_quality import (
+    TRADEABLE_ENTRY_THESIS_STANDARD,
+    tradeable_entry_thesis_instruction,
+)
 from src.pods.base.agent import BasePodAgent
 
 logger = logging.getLogger(__name__)
@@ -56,7 +60,9 @@ ANTI-PATTERNS (will get your trades rejected):
 - No edge: if you can't identify a supply/demand mispricing, don't trade
 - Ignoring USD direction when it contradicts your commodity thesis
 
-Implementation uses commodity ETFs: GLD, SLV, USO, UNG, DBA, CORN, WEAT, GDX, XME, etc.
+Implementation can use commodity ETFs, commodity producer equities, and related liquid instruments
+that Alpaca supports. You may propose symbols outside the seed universe only when the researcher
+has identified a timely catalyst and the symbol has a clear commodity risk factor.
 
 Rules:
 - Commodities are cyclical. Position with the macro trend, not against it.
@@ -86,6 +92,9 @@ POSITION SIZING:
 - Medium conviction (0.5-0.7): max 10% of NAV
 - High conviction (>0.7): up to 20% of NAV
 - Hard cap: 20% of NAV per position, 40% of cash per cycle
+- Never stack multiple trades on the same economic driver. Gold, gold miners, and silver miners
+  can all share precious-metals stress risk; oil producers and oil ETFs can share oil beta.
+- If risk context says reduce-only, propose only HOLD or risk-reducing SELLs.
 - Scale down in high-vol regimes. The Risk agent enforces hard limits.
 Output qty as a specific number of shares/units, not a percentage."""
 
@@ -217,7 +226,7 @@ class CommoditiesPMAgent(BasePodAgent):
         try:
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             if self._session_logger:
                 self._session_logger.log_reasoning(f"pm:{self._pod_id}", "web_search_response", raw or "")
@@ -269,7 +278,7 @@ class CommoditiesPMAgent(BasePodAgent):
         try:
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             logger.info("[commodities.pm] Article deep-dive complete (%d articles read)", len(articles))
             if self._session_logger:
@@ -297,6 +306,8 @@ class CommoditiesPMAgent(BasePodAgent):
         cash = sizing.get("available_cash", 0)
         if nav <= 0:
             return (qty, "")
+        if side == Side.BUY and (sizing.get("risk_mode") == "reduce_only" or cash <= 0):
+            return (0, "reduce-only: no buy capacity")
 
         est_price = self._estimate_price(symbol)
         if est_price <= 0:
@@ -432,6 +443,13 @@ class CommoditiesPMAgent(BasePodAgent):
             sections.append(f"  Current leverage: {sizing.get('current_leverage', 0):.2f}x")
             sections.append(f"  Max leverage: {sizing.get('max_leverage', 2.0):.1f}x")
             sections.append(f"  Max position size: ${sizing.get('position_limit_notional', 0):,.2f} (20% of NAV — above 10% requires max conviction)")
+            if sizing.get("risk_mode"):
+                sections.append(f"  Risk mode: {sizing.get('risk_mode')}")
+            factor_text = sizing.get("factor_exposure_text")
+            if factor_text:
+                sections.append("\n## Current Commodity Factor Exposure")
+                sections.append(str(factor_text))
+                sections.append("  Do not add to breached factors. Prefer HOLD or risk-reducing SELLs when factor exposure is breached.")
             for p in sizing.get("positions_summary", []):
                 sections.append(f"  Position: {p['symbol']} qty={p['qty']:.1f} notional=${p['notional']:,.0f} pnl=${p['unrealized_pnl']:,.2f}")
 
@@ -523,6 +541,7 @@ class CommoditiesPMAgent(BasePodAgent):
             if memory_block:
                 user_content = memory_block + "\n\n" + user_content
         user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 commodity ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
+        user_content += tradeable_entry_thesis_instruction("commodities")
 
         aging_alerts = self._ns.get("aging_alerts") or []
         if aging_alerts:
@@ -590,12 +609,13 @@ class CommoditiesPMAgent(BasePodAgent):
             ) + user_content
 
         try:
+            system_prompt = _COMMODITIES_SYSTEM + "\n\n" + TRADEABLE_ENTRY_THESIS_STANDARD
             raw = llm_chat(
                 [
-                    {"role": "system", "content": _COMMODITIES_SYSTEM},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
-                max_tokens=1200,
+                max_tokens=2400,
             )
             decision = extract_json(raw)
 
@@ -606,14 +626,14 @@ class CommoditiesPMAgent(BasePodAgent):
             search_queries = decision.get("search_queries", [])
             if search_queries and isinstance(search_queries, list):
                 decision, raw_search = await self._web_search_and_decide(
-                    search_queries[:2], user_content, _COMMODITIES_SYSTEM, decision
+                    search_queries[:2], user_content, system_prompt, decision
                 )
                 raw = raw_search or raw
 
             read_urls = decision.get("read_articles", [])
             if read_urls and isinstance(read_urls, list):
                 decision, raw_second = await self._read_articles_and_decide(
-                    read_urls, user_content, _COMMODITIES_SYSTEM, decision
+                    read_urls, user_content, system_prompt, decision
                 )
                 response_text = raw_second or raw
             else:

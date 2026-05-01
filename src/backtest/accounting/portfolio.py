@@ -70,6 +70,8 @@ class PortfolioAccountant:
         take_profit_pct: float | None = None,
         exit_when: str = "",
         max_hold_days: int = 0,
+        expected_price: float | None = None,
+        entry_thesis: str = "",
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -102,14 +104,16 @@ class PortfolioAccountant:
         prev_qty = pos["quantity"]
         prev_cost = self._cost_basis[symbol]
         new_qty = prev_qty + qty
+        fill_entry_thesis = self._coalesce_entry_thesis(entry_thesis, reasoning)
 
         # Store entry metadata when opening a new position
         if prev_qty == 0 and qty != 0:
-            self._entry_theses[symbol] = reasoning or ""
+            self._entry_theses[symbol] = fill_entry_thesis
             self._entry_dates[symbol] = filled_at.strftime("%Y-%m-%d") if filled_at else ""
             self._entry_metadata[symbol] = {
                 "entry_price": fill_price,
                 "entry_time": filled_at.isoformat() if filled_at else "",
+                "entry_thesis": fill_entry_thesis,
                 "reasoning": reasoning,
                 "conviction": conviction,
                 "strategy_tag": strategy_tag,
@@ -138,6 +142,7 @@ class PortfolioAccountant:
                 "realized_pnl": realized,
                 "entry_time": entry_meta.get("entry_time", ""),
                 "exit_time": filled_at.isoformat() if filled_at else "",
+                "entry_thesis": entry_meta.get("entry_thesis") or entry_meta.get("reasoning", ""),
                 "entry_reasoning": entry_meta.get("reasoning", ""),
                 "exit_reasoning": reasoning if qty < 0 else "",
                 "conviction": entry_meta.get("conviction", 0.5),
@@ -179,6 +184,10 @@ class PortfolioAccountant:
         elif qty < 0:  # SELL
             self._cash += notional
 
+        slippage_bps: float | None = None
+        if expected_price and expected_price != 0:
+            slippage_bps = round((fill_price - expected_price) / expected_price * 10_000.0, 1)
+
         # Log fill in audit trail
         self._fill_log.append(
             {
@@ -187,7 +196,10 @@ class PortfolioAccountant:
                 "symbol": symbol,
                 "qty": qty,
                 "fill_price": fill_price,
+                "expected_price": expected_price,
+                "slippage_bps": slippage_bps,
                 "notional": qty * fill_price,
+                "entry_thesis": fill_entry_thesis,
                 "reasoning": reasoning,
                 "strategy_tag": strategy_tag,
                 "signal_snapshot": signal_snapshot or {},
@@ -198,6 +210,17 @@ class PortfolioAccountant:
         logger.debug(
             f"[{self._pod_id}] Fill recorded: {symbol} {qty:+.1f} @ ${fill_price:.2f}"
         )
+
+    @staticmethod
+    def _coalesce_entry_thesis(entry_thesis: str | None = "", reasoning: str | None = "") -> str:
+        """Return the best non-empty human-readable entry thesis."""
+        for candidate in (entry_thesis, reasoning):
+            if candidate is None:
+                continue
+            text = str(candidate).strip()
+            if text:
+                return text
+        return ""
 
     def append_reasoning(
         self,
@@ -256,7 +279,11 @@ class PortfolioAccountant:
                     cost_basis=self._cost_basis.get(symbol, 0.0),
                     current_price=current_price,
                     unrealized_pnl=unrealized_pnl,
-                    entry_thesis=self._entry_theses.get(symbol, ""),
+                    entry_thesis=(
+                        self._entry_theses.get(symbol)
+                        or meta.get("entry_thesis")
+                        or meta.get("reasoning", "")
+                    ),
                     entry_date=self._entry_dates.get(symbol, ""),
                     stop_loss_pct=meta.get("stop_loss_pct", 0.05),
                     take_profit_pct=meta.get("take_profit_pct", 0.15),
@@ -400,6 +427,15 @@ class PortfolioAccountant:
                     "avg_entry": self._cost_basis.get(sym, pos["avg_cost"]),
                     "current_price": self._last_price.get(sym, pos["avg_cost"]),
                 })
+        entry_metadata_ser: dict[str, dict] = {}
+        for sym, meta in self._entry_metadata.items():
+            ser: dict = {}
+            for k, v in meta.items():
+                if isinstance(v, datetime):
+                    ser[k] = v.isoformat()
+                else:
+                    ser[k] = v
+            entry_metadata_ser[sym] = ser
         return {
             "pod_id": self._pod_id,
             "nav": round(self.nav, 4),
@@ -409,7 +445,37 @@ class PortfolioAccountant:
             "cash": round(self._cash, 4),
             "positions": positions,
             "fills": len(self._fill_log),
+            "entry_theses": dict(self._entry_theses),
+            "entry_dates": dict(self._entry_dates),
+            "entry_metadata": entry_metadata_ser,
         }
+
+    def load_entry_state(self, state: dict) -> None:
+        """Restore entry thesis / dates / metadata from persisted pod state."""
+        if not state:
+            return
+        et = state.get("entry_theses")
+        if isinstance(et, dict):
+            self._entry_theses.update({k: str(v) for k, v in et.items()})
+        ed = state.get("entry_dates")
+        if isinstance(ed, dict):
+            self._entry_dates.update({k: str(v) for k, v in ed.items()})
+        em = state.get("entry_metadata")
+        if not isinstance(em, dict):
+            return
+        for sym, meta in em.items():
+            if not isinstance(meta, dict):
+                continue
+            restored_meta = dict(meta)
+            thesis = self._coalesce_entry_thesis(
+                restored_meta.get("entry_thesis"),
+                restored_meta.get("reasoning"),
+            )
+            if thesis:
+                restored_meta["entry_thesis"] = thesis
+                if not self._entry_theses.get(sym):
+                    self._entry_theses[sym] = thesis
+            self._entry_metadata[sym] = restored_meta
 
     def load_positions(self, positions: list[dict]) -> None:
         """Inject positions from Alpaca or memory into the accountant.

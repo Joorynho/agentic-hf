@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from src.core.bus.event_bus import EventBus
+from src.core.factor_exposure import factor_limit_pct
 from src.core.models.enums import EventType, PodStatus
 from src.core.models.messages import AgentMessage, Event
 from src.core.models.pod_summary import PodSummary
@@ -35,6 +36,45 @@ class CROAgent:
     @property
     def agent_id(self) -> str:
         return _AGENT_ID
+
+    def check_firm_drawdown(self, firm_peak_nav: float, firm_current_nav: float) -> dict:
+        """Firm-level drawdown vs all-time peak NAV (restored from memory).
+
+        Tiers (drawdown is negative when below peak):
+        - dd <= -10% -> halt (block new buys; sizing handled by namespace)
+        - dd <= -8%  -> orange (50% sizing — applied in execution layer)
+        - dd <= -5%  -> yellow (warn only)
+        """
+        if firm_peak_nav <= 0:
+            return {
+                "tier": "none",
+                "drawdown_pct": 0.0,
+                "message": "",
+            }
+        dd_pct = (firm_current_nav - firm_peak_nav) / firm_peak_nav
+        if dd_pct <= -0.10:
+            return {
+                "tier": "halt",
+                "drawdown_pct": dd_pct,
+                "message": f"Firm drawdown {dd_pct:.1%} from peak — new buys halted",
+            }
+        if dd_pct <= -0.08:
+            return {
+                "tier": "orange",
+                "drawdown_pct": dd_pct,
+                "message": f"Firm drawdown {dd_pct:.1%} from peak — position sizing reduced 50%",
+            }
+        if dd_pct <= -0.05:
+            return {
+                "tier": "yellow",
+                "drawdown_pct": dd_pct,
+                "message": f"Firm drawdown {dd_pct:.1%} from peak — monitor risk",
+            }
+        return {
+            "tier": "none",
+            "drawdown_pct": dd_pct,
+            "message": "",
+        }
 
     async def check_all_pods(self, pod_summaries) -> list[str]:
         """Run full firm-level risk checks. Returns list of pod_ids with breaches."""
@@ -79,6 +119,14 @@ class CROAgent:
             )
             return True
 
+        if getattr(m, "factor_breaches", None):
+            await self._publish_alert(
+                summary.pod_id,
+                "Factor concentration breach: " + "; ".join(m.factor_breaches[:3]),
+                severity="warning",
+            )
+            return True
+
         # VaR check
         if m.var_95_1d > 0.025:
             await self._publish_alert(
@@ -112,6 +160,24 @@ class CROAgent:
                 f"Avg firm leverage {avg_leverage:.2f}x exceeds {_FIRM_LEVERAGE_LIMIT}x limit",
                 severity="warning",
             )
+
+        firm_nav = sum(s.risk_metrics.nav for s in active if s.risk_metrics and s.risk_metrics.nav > 0)
+        if firm_nav <= 0:
+            return
+        factor_notional: dict[str, float] = {}
+        for summary in active:
+            report = getattr(summary.risk_metrics, "factor_exposures", {}) or {}
+            for factor, row in (report.get("factors") or {}).items():
+                factor_notional[factor] = factor_notional.get(factor, 0.0) + float(row.get("notional", 0.0) or 0.0)
+        for factor, notional in factor_notional.items():
+            pct = notional / firm_nav
+            limit = factor_limit_pct(factor)
+            if pct > limit:
+                await self._publish_alert(
+                    "firm",
+                    f"Firm factor exposure {factor} is {pct:.0%}, above {limit:.0%} limit",
+                    severity="warning",
+                )
 
     async def firm_kill_switch(self, reason: str) -> None:
         """Halt the entire firm. All pods receive KILL_SWITCH."""

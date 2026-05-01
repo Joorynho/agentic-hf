@@ -98,11 +98,12 @@ class CapitalAllocator:
         self,
         pod_scores: dict[str, float],   # pod_id -> 0-1 score
         min_pct: float = 0.10,           # floor per pod (10%)
+        max_pct: float = 1.0,            # ceiling per pod (default: no cap)
     ) -> dict[str, float]:
         """
         Returns new allocation percentages based on scores.
-        Higher score -> higher allocation. All pods guaranteed >= min_pct.
-        Sums to 1.0.
+        Higher score -> higher allocation. All pods guaranteed >= min_pct
+        and <= max_pct (when max_pct < 1). Sums to 1.0.
         """
         if not pod_scores:
             return dict(self._allocations)
@@ -115,7 +116,7 @@ class CapitalAllocator:
             total = sum(weights.values()) or 1.0
             normed = {p: weights[p] / total for p in pods}
             # Check if any pod falls below the floor
-            clamped = {p: max(min_pct, normed[p]) for p in pods}
+            clamped = {p: max(min_pct, min(max_pct, normed[p])) for p in pods}
             clamped_total = sum(clamped.values())
             result = {p: round(v / clamped_total, 4) for p, v in clamped.items()}
             # If the floor constraint is already satisfied, we're done

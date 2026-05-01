@@ -103,6 +103,56 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 - Always validate entries on load (`e && e.ts && Array.isArray(e.signals)`)
 - Prune stale entries on each update cycle
 
+### Capital allocation displays must not use NAV as allocation
+- Assigned capital and current NAV answer different questions. A pod can lose money and still have the same mandate allocation.
+- Governance allocation tiles should use mandate weights against starting/allocated capital; show current NAV as secondary performance context.
+- If no complete mandate weights are available, fall back to each pod's starting capital share, not the current NAV share.
+
+### Closed trade APIs should expose display dates
+- UI tables should not have to infer entry/exit dates by slicing timestamps everywhere.
+- Closed-trade API rows should include `entry_date` and `exit_date` aliases, while keeping `entry_time` and `exit_time` for detail views and calculations.
+
+### Performance UI must label closed P&L vs NAV P&L
+- Closed-trade outcomes and pod returns are different ledgers. Closed outcomes exclude open/unrealized P&L; pod returns include current open positions through NAV.
+- Dashboard labels should say "Closed P&L" when using closed trades, and show NAV P&L separately when users need to reconcile to Pod Returns.
+- Prefer the complete closed-trades API for dashboard outcome stats over a partial/restored in-memory tracker.
+
+### Risk dashboards need display fallbacks for missing enriched payloads
+- If a WebSocket summary is missing enriched risk reports, the dashboard should still render a transparent fallback from available open positions.
+- Fallbacks are for visibility only; rule-based backend risk enforcement remains the authority.
+
+### LLM calls are core product behavior
+- Do not default the local trading session into rule-based mode just to avoid quota/rate-limit noise.
+- PM/CIO/CEO LLM reasoning is central to the product; use API keys by default when present.
+- Keep explicit opt-out switches for tests/debugging, but make disabling LLM calls an intentional choice, not the default.
+
+### Every entered trade needs an entry thesis
+- Do not rely on a generic `reasoning` field alone for open-position display. Execution metadata should carry an explicit `entry_thesis` into `PortfolioAccountant`.
+- Preserve `reasoning` for audit/closed-trade history, but use `entry_thesis` as the canonical dashboard field.
+- For older state, open-position APIs should fall back to stored metadata `reasoning` so positions are not displayed with blank theses.
+
+### Wide operational tables need bounded two-axis scrolling
+- Tables with many columns, such as Closed Positions, should not rely on page-level scrolling alone.
+- Use a dedicated wrapper with `overflow: auto`, a bounded max height, and a table `min-width` so horizontal and vertical scrolling are both available without stretching the whole dashboard.
+
+### Dashboard capital labels must match the primary number
+- If a card headline shows current NAV, label it as NAV and keep mandate allocation as secondary context.
+- If a card headline shows mandate allocation, do not put it under a generic capital heading that users will compare to operational NAV.
+- For trading dashboards, prefer showing the live economic value first and the allocation policy underneath.
+
+### Pod resets must cover local state, history, and broker hydration
+- A pod reset is not complete if only `memory.json` is changed; broker positions will hydrate back into the pod on restart.
+- Back up `memory.json`, `memory.md`, and `state.db` before deleting per-pod state.
+- Clear per-pod trades, closed-trade state, outcome trackers, signal scores, enrichment, and NAV history together, then add a fresh reset NAV row so charts do not undercount firm NAV.
+- Closing broker positions must use positive order quantities even when the broker reports short positions with negative signed `qty`.
+
+### PM entry theses must be tradeable, not just narrative
+- A thesis is weak if it only says "inflation/geopolitics are bullish" without a trigger, driver decomposition, invalidation, and instrument fit.
+- For gold and precious-metals trades, explicitly check real-yield direction, USD trend, Fed reaction function, positioning/flows, central-bank demand, and geopolitical risk as a conditional catalyst.
+- Never let an LLM assert "negative real rates" unless the real-yield data in the prompt is actually below zero. If the data is missing or mixed, the PM should say that instead of inventing certainty.
+- Geopolitical risk belongs in the thesis, but only as a catalyst/risk-premium argument with second-order effects; it can be bullish or bearish depending on the dominant market response in real yields and the dollar.
+- Open-position detail must preserve the reasoning attached to each fill/expansion so the user can audit why size was added, not only why the first entry happened.
+
 ---
 
 ## Architecture
@@ -139,3 +189,9 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 - `_parse_scores` must handle: markdown fences, JSON with surrounding text, truncated arrays, dict wrappers
 - Set `max_tokens` high enough for the expected output (25 items × ~60 chars each = 1500+ chars; use 2000)
 - Always have a keyword fallback path when LLM parsing fails
+
+### Risk concentration must be factor-aware, not fixed-bucket
+- Do not treat "gold" and "gold miners" as independent risk buckets with separate full limits; miner ETFs often carry strong gold beta and can amplify the same factor loss.
+- Commodities risk should reason in dynamic exposure themes/factors such as gold beta, oil supply shock, natural gas, industrial metals, rates-sensitive metals, and geopolitical energy risk, not deterministic per-asset quotas.
+- LLM/research agents may discover new tradeable instruments from news, but rule-based risk must normalize them into factors/clusters and enforce capital, gross exposure, and correlation limits before execution.
+- A pod with `$1000` allocated cannot carry more than `$1000` gross exposure unless realized profit increased pod NAV; negative cash from hydration or execution must trigger reduce-only behavior for new buys.

@@ -1161,3 +1161,143 @@ Product-readiness audit:
 - Recommended next implementation pass: add a system health panel with Alpaca/FRED/Polymarket/LLM status, replace start/stop alerts with an inline operational banner, and add endpoint tests for the remaining dashboard data APIs.
 
 ---
+
+# Current Sprint: Position Detail Thesis Auditability
+
+**Goal:** Make open-position detail usable for trade review: no clipped thesis text, every fill/expansion has its own visible reasoning, and future PM decisions produce tradeable, data-consistent entry theses.
+
+- [x] Document the requested position-detail and PM-thesis fixes
+- [x] Inspect current position modal, fill metadata, and PM thesis generation
+- [x] Make fill timeline entries collapsible with full per-fill thesis/reasoning
+- [x] Remove UI history caps and make long thesis/reasoning blocks scrollable
+- [x] Backfill all buy fills for hydrated current positions, not just the earliest buy
+- [x] Strengthen PM thesis instructions and token budget for complete tradeable theses
+- [x] Add focused tests for fill-detail metadata and thesis quality guardrails
+- [x] Run focused verification
+
+**Review:** Position detail now renders each fill/expansion as a collapsible entry with its own full thesis/reasoning, long thesis blocks scroll instead of being clipped, and PM reasoning history no longer caps at 10 visible entries. The backend now exposes all historical BUY fills for a current holding, including recovered thesis/reasoning metadata where available. PM prompts and thesis verification now require tradeable sections covering drivers, entry trigger, invalidation, risk, instrument fit, and asset-specific checks such as real yields, breakevens, Fed reaction, USD, positioning/flows, central-bank demand, and geopolitical risk as a conditional catalyst rather than a standalone reason. Verification passed with JS syntax checks, Python compile, focused unit tests, web-service tests, dashboard integration tests, and direct served-asset checks from the running dashboard.
+
+---
+
+# Current Sprint: Factor-Aware Commodities Risk Controls
+
+Goal: prevent the commodities pod from stacking multiple instruments that share the same economic driver, while preserving the ability for researchers to discover new opportunities from news and market context.
+
+Checklist:
+- [x] Add a factor exposure model that can represent dynamic themes such as gold beta, oil supply shock, natural gas, industrial metals, soft commodities, rates sensitivity, and broad risk-off hedges.
+- [x] Let researchers/LLM enrichment propose or classify newly discovered tickers into factors, but require deterministic validation and fallback classification before any symbol becomes tradeable.
+- [x] Compute effective factor exposure from current positions plus proposed orders, including correlated instruments like GLD, GDX, GDXJ, SLV, and miners under shared precious-metals stress exposure.
+- [x] Enforce commodities pod risk rules before execution: no new buys when gross exposure exceeds pod NAV, no new buys when cash is negative, resize or reject trades that breach factor concentration limits, and always allow risk-reducing sells.
+- [x] Add CRO-level aggregation so shared factors are visible across pods, not only inside commodities.
+- [x] Add PM/risk context so the PM sees current factor exposure and "reduce-only" states before proposing trades, while rule-based risk remains the final authority.
+- [x] Add dashboard visibility for factor exposure, breaches, rejected/resized orders, and reduce-only status.
+- [x] Add tests proving correlated gold/gold-miner exposure is blocked, sells are allowed, newly discovered symbols require classification, and pod gross exposure cannot exceed realized NAV.
+
+Review:
+- Added `src/core/factor_exposure.py` with static and LLM-validated dynamic factor profiles, effective exposure weights, factor limits, gross exposure checks, and PM-readable formatting.
+- Commodities researcher now asks LLM universe reviews for factor classifications on newly discovered symbols and stores validated profiles in pod namespace.
+- Commodities risk now blocks unclassified buys, blocks all risk-increasing trades in reduce-only mode, caps sells to avoid flipping exposure, enforces gross exposure <= current pod NAV, and rejects/resizes trades that would breach shared factor limits such as gold beta or precious metals.
+- PodRuntime injects commodity factor exposure and risk mode into PM sizing context and PodSummary risk metrics.
+- CRO now alerts on pod-level factor breaches and firm-wide factor concentration.
+- Dashboard Risk tab now includes a Commodity Factor Exposure table sourced from live pod summaries.
+- Verification: focused factor/risk tests passed, web service tests passed, dashboard integration tests passed, MVP4 trading-cycle tests passed, and full pytest output reported `539 passed, 2 skipped` before the shell wrapper timed out after the long run.
+
+---
+
+# Current Sprint: Governance Allocation Display + Closed Trade Dates
+
+Goal: make the dashboard distinguish assigned capital from current NAV, and make closed-position timing visible without relying on timestamp slicing in the browser.
+
+Checklist:
+- [x] Confirm governance Capital Allocations was mixing current NAV dollars with allocation percentages.
+- [x] Change allocation tiles to show mandate/start-capital allocation dollars and percentages.
+- [x] Add current NAV as secondary context on each allocation tile so losses/profits remain visible without being mislabeled as allocation.
+- [x] Add explicit `entry_date` and `exit_date` fields to closed-trade API rows.
+- [x] Update closed-trade and closed-position table rendering to use date aliases with timestamp fallback.
+- [x] Run focused verification.
+
+Review:
+- Governance allocation tiles now show allocation dollars and allocation percent from complete mandate weights when present, otherwise from starting-capital shares. For four `$1000` starting pods with no complete mandate override, the tiles show `$1000 / 25%` each, with current NAV shown separately.
+- Closed-trade API rows now include `entry_date` and `exit_date`; closed trade and closed position tables render those columns from aliases with timestamp fallback.
+- Verification passed: `node --check web/dist/dashboard.js`, Python compile for `src/mission_control/session_manager.py`, `tests/unit/mission_control/test_closed_trades_api.py`, `tests/integration/test_web_service.py`, and `tests/integration/test_web_dashboard_e2e.py`.
+
+---
+
+# Current Sprint: Performance/Risk Dashboard Reconciliation
+
+Goal: make Performance numbers reconcile with the right ledger and keep Commodity Factor Exposure visible even when the backend factor report is absent from the WebSocket payload.
+
+Checklist:
+- [x] Trace Performance tab sources: Pod Returns uses current NAV including open/unrealized P&L; Trade Outcomes used the partial in-memory outcome tracker.
+- [x] Trace Risk tab sources: Commodity Factor Exposure expected `factor_exposures`, but the live WebSocket snapshot did not include that report.
+- [x] Change Performance outcome cards to compute closed-trade stats from `/api/trades/closed`, the same complete source used by the closed-trades table.
+- [x] Rename the section to Closed Trade Outcomes and show NAV P&L beside Closed P&L so users can reconcile it with Pod Returns.
+- [x] Add a dashboard fallback that maps open commodity positions into risk factors when backend factor exposure is missing.
+- [x] Run focused verification.
+
+Review:
+- Performance closed-trade stats now build from `/api/trades/closed`, so counts and closed P&L use the same complete source as the execution closed-trades table.
+- Closed P&L is explicitly separate from NAV P&L, which includes open positions and reconciles with Pod Returns.
+- Risk Commodity Factor Exposure now prefers backend `factor_exposures`, but falls back to mapping open commodity positions such as GLD, GDX, GDXJ, and SLV into shared factors if the WebSocket payload is missing the report.
+- Verification passed: `node --check web/dist/dashboard.js`, served `dashboard.js` contains the new fallback code, `tests/integration/test_web_dashboard_e2e.py`, and `tests/integration/test_web_service.py`.
+
+---
+
+# Current Sprint: LLM Runtime Default
+
+Goal: make LLM-backed PM/CIO/CEO decisions the default runtime behavior again.
+
+Checklist:
+- [x] Correct the product assumption: LLM calls are core behavior, not an optional local demo feature.
+- [x] Change `run.py` so `MISSION_CONTROL_USE_LLM` defaults to enabled.
+- [x] Keep `MISSION_CONTROL_USE_LLM=false` as an explicit tests/debugging opt-out only.
+- [x] Verify runtime environment behavior.
+
+Review:
+- Verified behavior: with `.env` keys present and `MISSION_CONTROL_USE_LLM` unset, runtime would not disable LLM calls and both OpenRouter/OpenAI keys remain available.
+- Verification passed: `python -m py_compile run.py src/core/llm.py` and an environment check confirming `would_disable_llm=False`.
+
+---
+
+# Current Sprint: Closed Positions Table Scrolling
+
+**Goal:** The Closed Positions table should scroll horizontally and vertically inside its own panel.
+
+- [x] Put the Closed Positions table inside a two-axis scroll wrapper
+- [x] Give the table a minimum width so horizontal scrolling is available on narrow panels
+- [x] Bound the table height so long closed-position histories scroll vertically without pushing the tab layout
+
+**Review:** Added `tbl-wrap-biaxial` and `closed-pos-scroll` styling for the Closed Positions tab only. The header remains in the tab while the table body area can scroll independently in both axes.
+
+---
+
+# Current Sprint: Entry Thesis Reliability
+
+**Goal:** Every newly entered trade must carry a non-empty entry thesis from the PM decision into the accountant, APIs, and dashboard.
+
+- [x] Trace PM proposal -> execution metadata -> accountant -> positions API
+- [x] Make entry thesis an explicit fill/accountant field, while preserving existing reasoning audit fields
+- [x] Add resilient fallbacks from stored reasoning for older positions with missing `entry_thesis`
+- [x] Add focused tests for thesis persistence and API visibility
+- [x] Run targeted verification and document the result
+
+**Review:** Fixed the PM thesis handoff so active execution templates pass `entry_thesis` to the accountant/session log. The accountant now stores explicit thesis metadata, falls back to PM reasoning for old state, and exposes the same fallback through open-position and closed-trade APIs. Verified with syntax checks plus focused portfolio/runtime/API/web-service tests.
+
+---
+
+# Current Sprint: Governance NAV Display + Commodities Fresh Start
+
+**Goal:** Make Governance capital cards match the operational NAV view, and prepare a commodities-only reset after the factor-correlation risk fix.
+
+- [x] Inspect current Governance rendering and confirm the card headline is mandate allocation while NAV is only secondary text
+- [x] Inspect commodities persisted state and quantify the legacy damage/history to reset
+- [x] Change Governance cards so current NAV is the headline and allocation is context
+- [x] Prepare a commodities-only reset that backs up state, clears local commodities holdings/trade history, and resets NAV/cash to `$1000`
+- [x] Confirm whether to also close the related Alpaca paper commodities positions before running the destructive reset
+- [x] Verify dashboard/static checks after the UI patch
+
+**Notes:** Local memory currently shows commodities NAV around `$857.50`, realized P&L around `-$138`, open GLD/SLV dust plus a near-zero GDXJ artifact, and 44 commodities trade records. A true fresh start will not stick across restarts if Alpaca still contains commodity positions that the session hydrates back into the pod.
+
+**Review:** Governance now labels the section as Capital Status and uses current NAV as the primary card value, with mandate allocation shown below as context. The commodities reset was applied with backups in `data/backups/`: local commodities NAV/cash is `$1000`, local commodities positions/trades/closed trades/outcomes/signal history were removed, legacy commodities NAV-history rows were deleted, and a fresh `$1000` reset NAV row was inserted. The Alpaca paper close initially exposed a `close_position` quantity-sign bug for short/negative holdings; fixed `AlpacaAdapter.close_position()` to send positive quantities, then verified GLD/SLV/GDXJ have no open Alpaca target positions. Verification passed: `node --check web/dist/dashboard.js`, `py_compile` for the reset script and adapter, memory/state checks, Alpaca dry-run verification, and startup logs showing commodities reconciled at `$1000` cash / `$0` invested.
+
+---

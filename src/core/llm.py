@@ -27,6 +27,27 @@ FREE_MODELS = [
 OPENAI_FALLBACK_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 _last_success_model: str | None = None
+_openrouter_exhausted = False
+_openrouter_reset: float = 0.0
+_openai_exhausted = False
+_openai_reset: float = 0.0
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _cooldown_seconds(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
 
 
 def _get_openrouter_client():
@@ -62,18 +83,16 @@ def get_llm_client():
         model = os.getenv("OPENROUTER_MODEL", "google/gemma-3-27b-it:free")
         return or_client, model
     oai_client = _get_openai_client()
-    if oai_client:
+    if oai_client and not _openai_exhausted:
         return oai_client, OPENAI_FALLBACK_MODEL
     import openai
     return openai.OpenAI(api_key="missing", max_retries=0), "gpt-4o-mini"
 
 
 def has_llm_key() -> bool:
+    if not _env_bool("MISSION_CONTROL_USE_LLM", default=True):
+        return False
     return bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"))
-
-
-_openrouter_exhausted = False
-_openrouter_reset: float = 0.0
 
 
 def llm_chat(messages: list[dict], max_tokens: int = 300) -> str:
@@ -82,11 +101,17 @@ def llm_chat(messages: list[dict], max_tokens: int = 300) -> str:
     Returns the raw response text. Raises on total failure.
     """
     global _last_success_model, _openrouter_exhausted, _openrouter_reset
+    global _openai_exhausted, _openai_reset
     import openai
 
-    # Reset OpenRouter exhaustion after cooldown
+    if not _env_bool("MISSION_CONTROL_USE_LLM", default=True):
+        raise RuntimeError("LLM calls are disabled by MISSION_CONTROL_USE_LLM=false")
+
+    # Reset provider cooldowns after their window expires.
     if _openrouter_exhausted and time.time() >= _openrouter_reset:
         _openrouter_exhausted = False
+    if _openai_exhausted and time.time() >= _openai_reset:
+        _openai_exhausted = False
 
     or_client = _get_openrouter_client()
     oai_client = _get_openai_client()
@@ -121,9 +146,11 @@ def llm_chat(messages: list[dict], max_tokens: int = 300) -> str:
                     break
                 rate_limit_count += 1
                 if rate_limit_count >= 3:
-                    logger.warning("[llm] 3+ OpenRouter models rate-limited, trying OpenAI")
+                    _openrouter_exhausted = True
+                    _openrouter_reset = time.time() + _cooldown_seconds("OPENROUTER_COOLDOWN_SECONDS", 900)
+                    logger.warning("[llm] 3+ OpenRouter models rate-limited; cooling down and trying OpenAI")
                     break
-                time.sleep(0.2)
+                time.sleep(0.05)
             except Exception as exc:
                 logger.debug("[llm] OpenRouter/%s failed: %s", model, exc)
 
@@ -137,9 +164,16 @@ def llm_chat(messages: list[dict], max_tokens: int = 300) -> str:
             if text:
                 logger.info("[llm] Success via OpenAI/%s", OPENAI_FALLBACK_MODEL)
                 return text
+        except openai.RateLimitError as exc:
+            _openai_exhausted = True
+            _openai_reset = time.time() + _cooldown_seconds("OPENAI_COOLDOWN_SECONDS", 3600)
+            logger.error("[llm] OpenAI quota/rate-limit hit; cooling down: %s", exc)
+            raise RuntimeError(f"OpenAI fallback failed: {exc}") from exc
         except Exception as exc:
             logger.error("[llm] OpenAI fallback failed: %s", exc)
             raise RuntimeError(f"OpenAI fallback failed: {exc}") from exc
+    if oai_client and _openai_exhausted:
+        logger.warning("[llm] OpenAI temporarily disabled after quota/rate-limit failure")
 
     raise RuntimeError("No LLM provider available — set OPENROUTER_API_KEY or OPENAI_API_KEY")
 

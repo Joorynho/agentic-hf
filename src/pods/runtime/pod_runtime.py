@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from datetime import datetime
 from typing import Optional
@@ -7,6 +8,7 @@ from typing import Optional
 from src.core.bus.collaboration_runner import CollaborationRunner
 from src.core.bus.event_bus import EventBus
 from src.core.concentration import check_concentration
+from src.core.factor_exposure import compute_factor_report, format_factor_report
 from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import PodStatus
 from src.agents.thesis_verifier import ThesisVerifier
@@ -125,15 +127,29 @@ class PodRuntime:
                 })
             total_notional = sum(p["notional"] for p in pos_summary)
             gross_lev = total_notional / accountant.nav if accountant.nav > 0 else 0
+            max_leverage = 1.0 if self._pod_id == "commodities" else 2.0
             ctx["sizing_context"] = {
                 "pod_nav": round(accountant.nav, 2),
                 "available_cash": round(accountant._cash, 2),
                 "current_leverage": round(gross_lev, 2),
                 "max_position_pct": 0.20,
-                "max_leverage": 2.0,
+                "max_leverage": max_leverage,
                 "position_limit_notional": round(accountant.nav * 0.20, 2),
                 "positions_summary": pos_summary,
             }
+            if self._pod_id == "commodities":
+                factor_report = compute_factor_report(
+                    accountant.current_positions,
+                    accountant.nav,
+                    dynamic_profiles=self._ns.get("factor_profiles"),
+                    cash=accountant.cash,
+                )
+                factor_text = format_factor_report(factor_report)
+                self._ns.set("factor_exposure_report", factor_report)
+                self._ns.set("factor_exposure_text", factor_text)
+                ctx["sizing_context"]["risk_mode"] = factor_report.get("risk_mode", "normal")
+                ctx["sizing_context"]["factor_exposure_report"] = factor_report
+                ctx["sizing_context"]["factor_exposure_text"] = factor_text
 
         # Store performance metrics in namespace for PM/CIO access
         if accountant and hasattr(accountant, "performance_summary"):
@@ -294,24 +310,11 @@ class PodRuntime:
                 {},
             )
 
-            # Extract per-trade reasoning (human-readable thesis)
-            trade_reasoning = matching_trade.get("reasoning", "")
-            if not trade_reasoning:
-                trade_reasoning = last_pm.get("reasoning", "")
-            # Strip outer JSON wrapper if it leaked through
-            if trade_reasoning.startswith('{"trades":') or trade_reasoning.startswith("{'trades':"):
-                try:
-                    import json as _json
-                    proposal = _json.loads(trade_reasoning)
-                    for t in proposal.get("trades", []):
-                        if t.get("symbol") == order.symbol:
-                            trade_reasoning = t.get("reasoning", trade_reasoning)
-                            break
-                except Exception:
-                    pass
+            trade_reasoning = self._entry_thesis_for_order(order, matching_trade, last_pm)
 
             # Set per-order metadata so exec trader can attach it to fills
             self._ns.set("pm_trade_metadata", {
+                "entry_thesis": trade_reasoning[:500],
                 "reasoning": trade_reasoning[:500],
                 "conviction": order.conviction,
                 "strategy_tag": order.strategy_tag,
@@ -369,6 +372,8 @@ class PodRuntime:
             exec_ctx["mandate"] = self._ns.get("governance_mandate")
             exec_ctx["risk_halt"] = self._ns.get("governance_risk_halt", False)
             exec_ctx["risk_halt_reason"] = self._ns.get("governance_risk_halt_reason")
+            exec_ctx["drawdown_halt"] = self._ns.get("drawdown_halt", False)
+            exec_ctx["drawdown_sizing_mult"] = float(self._ns.get("drawdown_sizing_mult", 1.0))
             await self._exec_trader.run_cycle(exec_ctx)  # type: ignore[union-attr]
             executed_count += 1
 
@@ -511,11 +516,29 @@ class PodRuntime:
                                 "qty": order.quantity, "status": "REJECTED_BY_RISK"})
                 continue
 
+            review_thesis = (
+                f"Position review order: {approved.side.value.upper()} {approved.symbol} "
+                f"from daily CIO/PM review."
+            )
+            self._ns.set("pm_trade_metadata", {
+                "entry_thesis": review_thesis,
+                "reasoning": review_thesis,
+                "conviction": approved.conviction,
+                "strategy_tag": approved.strategy_tag,
+                "signal_snapshot": {},
+                "stop_loss_pct": None,
+                "take_profit_pct": None,
+                "exit_when": "",
+                "max_hold_days": 0,
+            })
+
             ctx = {
                 "approved_order": approved,
                 "mandate": self._ns.get("governance_mandate"),
                 "risk_halt": self._ns.get("governance_risk_halt", False),
                 "risk_halt_reason": self._ns.get("governance_risk_halt_reason"),
+                "drawdown_halt": self._ns.get("drawdown_halt", False),
+                "drawdown_sizing_mult": float(self._ns.get("drawdown_sizing_mult", 1.0)),
             }
             try:
                 await self._exec_trader.run_cycle(ctx)
@@ -527,6 +550,78 @@ class PodRuntime:
                 results.append({"symbol": order.symbol, "side": order.side.value,
                                 "qty": order.quantity, "status": f"EXEC_ERROR: {e}"})
         return results
+
+    def _entry_thesis_for_order(self, order: Order, matching_trade: dict, last_pm: dict) -> str:
+        """Extract a non-empty per-order PM thesis for position metadata."""
+        candidates = [
+            matching_trade.get("entry_thesis") if isinstance(matching_trade, dict) else "",
+            matching_trade.get("thesis") if isinstance(matching_trade, dict) else "",
+            matching_trade.get("reasoning") if isinstance(matching_trade, dict) else "",
+        ]
+
+        last_reasoning = last_pm.get("reasoning", "") if isinstance(last_pm, dict) else ""
+        parsed_reasoning = self._reasoning_from_pm_payload(order.symbol, last_reasoning)
+        if parsed_reasoning:
+            candidates.append(parsed_reasoning)
+        else:
+            raw_text = str(last_reasoning or "").strip()
+            if raw_text and not (
+                raw_text.startswith("{")
+                or raw_text.startswith("[")
+                or raw_text.startswith("```")
+            ):
+                candidates.append(raw_text)
+
+        for candidate in candidates:
+            text = str(candidate or "").strip()
+            if text:
+                return text
+
+        action_summary = str(last_pm.get("action_summary", "") if isinstance(last_pm, dict) else "").strip()
+        if action_summary:
+            return f"{order.side.value.upper()} {order.symbol}: {action_summary}"
+        return (
+            f"{order.side.value.upper()} {order.symbol}: PM decision metadata did not include "
+            "a specific thesis; review the PM prompt/response logs for this cycle."
+        )
+
+    @staticmethod
+    def _reasoning_from_pm_payload(symbol: str, payload: object) -> str:
+        """Unwrap a raw PM JSON payload and return the reasoning for symbol, if present."""
+        if isinstance(payload, dict):
+            trades = payload.get("trades", [])
+        elif isinstance(payload, str):
+            text = payload.strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                if text.lower().startswith("json"):
+                    text = text[4:].strip()
+            if not (text.startswith("{") or text.startswith("[")):
+                return ""
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                return ""
+            trades = parsed.get("trades", []) if isinstance(parsed, dict) else parsed
+        else:
+            return ""
+
+        if isinstance(trades, dict):
+            trades = [trades]
+        if not isinstance(trades, list):
+            return ""
+
+        for trade in trades:
+            if not isinstance(trade, dict):
+                continue
+            if str(trade.get("symbol", "")).upper() == symbol.upper():
+                return str(
+                    trade.get("entry_thesis")
+                    or trade.get("thesis")
+                    or trade.get("reasoning")
+                    or ""
+                ).strip()
+        return ""
 
     async def get_summary(self) -> PodSummary:
         """Generate PodSummary with real trading data from PortfolioAccountant.
@@ -600,17 +695,41 @@ class PodRuntime:
         # Calculate drawdown from HWM
         drawdown = accountant.drawdown_from_hwm()
 
-        # Build exposure buckets (simplified: all US equities for MVP4)
+        factor_report = {}
+        if self._pod_id == "commodities":
+            try:
+                factor_report = compute_factor_report(
+                    accountant.current_positions,
+                    accountant.nav,
+                    dynamic_profiles=self._ns.get("factor_profiles"),
+                    cash=accountant.cash,
+                )
+                self._ns.set("factor_exposure_report", factor_report)
+                self._ns.set("factor_exposure_text", format_factor_report(factor_report))
+            except Exception:
+                factor_report = self._ns.get("factor_exposure_report") or {}
+
+        # Build exposure buckets
         exposure_buckets = []
         if total_notional > 0 and accountant.nav > 0:
-            exposure_pct = total_notional / accountant.nav
-            exposure_buckets.append(
-                PodExposureBucket(
-                    asset_class="US_EQUITIES",
-                    direction="long" if long_notional >= 0 else "short",
-                    notional_pct_nav=exposure_pct,
+            if self._pod_id == "commodities" and factor_report.get("factors"):
+                for factor, row in (factor_report.get("factors") or {}).items():
+                    exposure_buckets.append(
+                        PodExposureBucket(
+                            asset_class=factor,
+                            direction="long",
+                            notional_pct_nav=float(row.get("pct_nav", 0.0) or 0.0),
+                        )
+                    )
+            else:
+                exposure_pct = total_notional / accountant.nav
+                exposure_buckets.append(
+                    PodExposureBucket(
+                        asset_class="US_EQUITIES",
+                        direction="long" if long_notional >= 0 else "short",
+                        notional_pct_nav=exposure_pct,
+                    )
                 )
-            )
 
         # Cash and invested breakdown
         invested = total_notional
@@ -632,6 +751,9 @@ class PodRuntime:
             net_leverage=net_leverage,
             var_95_1d=var_95,
             es_95_1d=var_95 * 1.25,  # Expected shortfall approximation
+            risk_mode=factor_report.get("risk_mode", "normal") if factor_report else "normal",
+            factor_exposures=factor_report,
+            factor_breaches=list(factor_report.get("breaches", [])) if factor_report else [],
         )
 
         # Determine pod status

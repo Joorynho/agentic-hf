@@ -1019,6 +1019,12 @@ button { font-family: inherit; cursor: pointer; }
   border-radius: 4px;
   overflow: hidden;
 }
+.tbl-wrap-biaxial {
+  overflow: scroll;
+  max-width: 100%;
+  min-height: 0;
+  scrollbar-gutter: stable both-edges;
+}
 .tbl-wrap-scroll {
   overflow-x: auto;
   overflow-y: hidden;
@@ -1121,11 +1127,14 @@ button { font-family: inherit; cursor: pointer; }
 /* ============================================================
    ALLOCATION GRID
 ============================================================ */
-.alloc-grid { display:grid; grid-template-columns:repeat(5,1fr); gap:6px; }
+.alloc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(112px,1fr)); gap:6px; }
 .alloc-tile { background:var(--bg-surface); border:1px solid var(--border-dim); border-radius:4px; padding:10px 6px; text-align:center; }
 .alloc-pod  { font-size:9px; font-weight:600; letter-spacing:.1em; text-transform:uppercase; color:var(--text-muted); }
 .alloc-val  { font-family:var(--font-mono); font-size:15px; font-weight:500; color:var(--text-primary); margin-top:4px; font-variant-numeric:tabular-nums; }
-.alloc-pct  { font-family:var(--font-mono); font-size:11px; color:var(--accent); margin-top:2px; }
+.alloc-val.pos { color:var(--green); }
+.alloc-val.neg { color:var(--red); }
+.alloc-pct  { font-family:var(--font-mono); font-size:9px; color:var(--accent); margin-top:2px; text-transform:uppercase; letter-spacing:.08em; }
+.alloc-sub  { font-family:var(--font-mono); font-size:9px; color:var(--text-dim); margin-top:3px; }
 
 /* ============================================================
    TOOLTIP REASONING
@@ -1774,28 +1783,47 @@ button { font-family: inherit; cursor: pointer; }
 .pos-exit-meta { font-size:10px; color:var(--text-muted,#6a82a0); margin-top:4px; }
 
 /* Fill timeline */
-.pos-fills { display:flex; flex-direction:column; gap:6px; max-height:200px; overflow-y:auto; }
+.pos-fills { display:flex; flex-direction:column; gap:8px; max-height:360px; overflow-y:auto; padding-right:4px; }
 .fill-entry {
-  display:flex; flex-wrap:wrap; align-items:flex-start; gap:6px;
-  padding:6px 8px; border-radius:4px; font-size:12px;
+  display:block;
+  border-radius:4px; font-size:12px;
   background:var(--bg-surface,#0e1a28);
   border-left:3px solid transparent;
+  overflow:hidden;
 }
 .fill-entry.fill-buy  { border-left-color:var(--green,#00d68f); }
 .fill-entry.fill-sell { border-left-color:var(--red,#e84040); }
+.fill-entry[open] { background:rgba(35,50,84,0.72); }
+.fill-summary {
+  display:flex; align-items:center; gap:8px;
+  padding:7px 9px; cursor:pointer; list-style:none;
+}
+.fill-summary::-webkit-details-marker { display:none; }
 .fill-icon {
   font-family:var(--font-mono); font-weight:700; font-size:14px; width:16px; text-align:center;
 }
 .fill-buy .fill-icon  { color:var(--green,#00d68f); }
 .fill-sell .fill-icon  { color:var(--red,#e84040); }
-.fill-info { flex:1; font-family:var(--font-mono); color:var(--text-primary,#f0f4fa); }
+.fill-info { flex:1; font-family:var(--font-mono); color:var(--text-primary,#f0f4fa); min-width:0; }
 .fill-side { font-weight:600; }
 .fill-buy .fill-side  { color:var(--green,#00d68f); }
 .fill-sell .fill-side  { color:var(--red,#e84040); }
 .fill-qty { color:#fff; }
 .fill-px  { color:var(--text-muted,#6a82a0); }
-.fill-date { float:right; color:var(--text-muted,#6a82a0); font-size:10px; }
-.fill-reason { width:100%; font-size:10px; color:var(--text-muted,#6a82a0); margin-top:2px; line-height:1.4; max-height:120px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; }
+.fill-meta { color:var(--text-muted,#6a82a0); font-size:10px; margin-left:4px; }
+.fill-date { color:var(--text-muted,#6a82a0); font-size:10px; white-space:nowrap; }
+.fill-caret { color:var(--text-muted,#6a82a0); font-size:10px; transform:rotate(-90deg); transition:transform .15s ease; }
+.fill-entry[open] .fill-caret { transform:rotate(0deg); }
+.fill-reason {
+  width:100%; font-size:11px; color:var(--text-secondary,#c8d6e5);
+  line-height:1.5; max-height:280px; overflow-y:auto; white-space:pre-wrap;
+  word-break:break-word; padding:0 10px 10px 32px;
+}
+.fill-reason-label {
+  color:var(--accent,#00cfe8); font-size:9px; letter-spacing:.08em;
+  text-transform:uppercase; margin:2px 0 6px;
+}
+.fill-reason-empty { color:var(--text-muted,#6a82a0); font-style:italic; }
 .fill-entry.fill-synthetic { opacity:0.75; border-left-style:dashed; }
 
 /* Partial exits */
@@ -1817,7 +1845,7 @@ button { font-family: inherit; cursor: pointer; }
   background:var(--bg-surface,#0e1a28); padding:10px 12px; border-radius:4px;
   border:1px solid var(--border-dim,#2a3a50);
   white-space:pre-wrap; word-break:break-word;
-  max-height:220px;
+  max-height:360px;
   overflow-y:auto;
 }
 .closed-exit-when {
@@ -1844,23 +1872,47 @@ button { font-family: inherit; cursor: pointer; }
 .pos-empty { font-size:12px; color:var(--text-muted,#6a82a0); padding:8px; text-align:center; }
 
 /* PM Reasoning History */
-.rh-list { display:flex; flex-direction:column; gap:6px; max-height:300px; overflow-y:auto; }
-.rh-entry { padding:8px 10px; border-radius:4px; border-left:3px solid var(--border-dim,#2a3a50); background:var(--bg-surface,#0e1a28); }
-.rh-entry.rh-hold { border-left-color:var(--text-muted,#6a82a0); }
-.rh-entry.rh-buy  { border-left-color:var(--green,#00d68f); }
-.rh-entry.rh-sell  { border-left-color:var(--red,#e84040); }
-.rh-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; }
+.pmh-list { display:flex; flex-direction:column; gap:6px; max-height:420px; overflow-y:auto; padding-right:4px; }
+.pmh-entry { border-radius:4px; border-left:3px solid var(--border-dim,#2a3a50); background:var(--bg-surface,#0e1a28); overflow:hidden; }
+.pmh-entry.rh-hold { border-left-color:var(--text-muted,#6a82a0); }
+.pmh-entry.rh-buy  { border-left-color:var(--green,#00d68f); }
+.pmh-entry.rh-sell  { border-left-color:var(--red,#e84040); }
+.pmh-entry[open] { background:rgba(35,50,84,0.72); }
+.pmh-header { display:flex; gap:8px; justify-content:space-between; align-items:center; padding:8px 10px; cursor:pointer; list-style:none; }
+.pmh-header::-webkit-details-marker { display:none; }
 .rh-badge { font-size:10px; font-weight:700; padding:1px 6px; border-radius:3px; text-transform:uppercase; }
-.rh-hold .rh-badge { background:rgba(106,130,160,0.2); color:var(--text-muted,#6a82a0); }
-.rh-buy .rh-badge  { background:rgba(0,214,143,0.15); color:var(--green,#00d68f); }
-.rh-sell .rh-badge  { background:rgba(232,64,64,0.15); color:var(--red,#e84040); }
+.rh-hold .rh-badge, .pmh-entry.rh-hold .rh-badge { background:rgba(106,130,160,0.2); color:var(--text-muted,#6a82a0); }
+.rh-buy .rh-badge, .pmh-entry.rh-buy .rh-badge  { background:rgba(0,214,143,0.15); color:var(--green,#00d68f); }
+.rh-sell .rh-badge, .pmh-entry.rh-sell .rh-badge  { background:rgba(232,64,64,0.15); color:var(--red,#e84040); }
 .rh-ts { font-size:10px; color:var(--text-muted,#6a82a0); }
+.pmh-caret { color:var(--text-muted,#6a82a0); font-size:10px; transform:rotate(-90deg); transition:transform .15s ease; }
+.pmh-entry[open] .pmh-caret { transform:rotate(0deg); }
+.pmh-text { font-size:11px; line-height:1.5; color:var(--text-secondary,#c8d6e5); max-height:320px; overflow-y:auto; white-space:pre-wrap; word-break:break-word; padding:0 10px 10px; }
 .rh-text { font-size:11px; line-height:1.4; color:var(--text-secondary,#c8d6e5); }
 
 /* Closed Trades */
 .ct-pnl { font-weight:600; }
 .ct-pnl.pos { color:var(--green,#00d68f); }
 .ct-pnl.neg { color:var(--red,#e84040); }
+
+/* Closed Positions table: independent horizontal + vertical scrolling */
+#tab-closed {
+  overflow: hidden;
+}
+.closed-pos-scroll {
+  flex: 0 0 auto;
+  height: 520px;
+  min-height: 320px;
+  max-height: calc(100vh - 180px);
+}
+#closed-pos-table {
+  width: max(100%, 1280px);
+  min-width: 1280px;
+}
+#closed-pos-table th,
+#closed-pos-table td {
+  white-space: nowrap;
+}
 
 /* ── Market Regime Badge ─────────────────────────────────────────────── */
 .regime-badge {

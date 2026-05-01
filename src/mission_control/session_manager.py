@@ -748,6 +748,17 @@ class SessionManager:
         try:
             while self._session_active:
                 self._iteration += 1
+                if self._web_app:
+                    try:
+                        self._web_app.state.iteration = self._iteration
+                        listener = getattr(self._web_app.state, "listener", None)
+                        if listener is not None:
+                            await listener.manager.broadcast({
+                                "type": "session_status",
+                                "data": {"active": True, "iteration": self._iteration},
+                            })
+                    except Exception:
+                        pass
 
                 try:
                     # 1. Inject governance state to all pods (before bar processing)
@@ -1490,7 +1501,11 @@ class SessionManager:
                         "days_held": days_held,
                         "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
                         "take_profit_pct": meta.get("take_profit_pct", 0.15),
-                        "entry_thesis": meta.get("reasoning", ""),
+                        "entry_thesis": (
+                            snap.entry_thesis
+                            or meta.get("entry_thesis")
+                            or meta.get("reasoning", "")
+                        ),
                     })
                 if pod_positions:
                     pos_data[pod_id] = pod_positions
@@ -2078,10 +2093,10 @@ class SessionManager:
         """Populate entry dates/theses for hydrated positions using memory.json trades.
 
         When positions are loaded from Alpaca, the accountant knows qty and cost
-        but has no entry_date, entry_thesis, or exit conditions.  This method
-        scans the saved trade log to find the earliest BUY for each currently
-        held symbol and backfills the accountant's internal metadata so the
-        dashboard can display accurate entry dates and days-held.
+        but may have no entry_date, entry_thesis, or fill-level reasoning. This
+        method scans the saved trade log for all BUY fills on each currently
+        held symbol so the dashboard can audit both the original entry and later
+        expansions.
         """
         trades = memory.get("trades", [])
         if not trades:
@@ -2098,9 +2113,6 @@ class SessionManager:
                 continue
 
             for sym in held_symbols:
-                if acct._entry_dates.get(sym):
-                    continue
-
                 pod_buys = [
                     t for t in trades
                     if t.get("pod_id") == pod_id
@@ -2114,47 +2126,82 @@ class SessionManager:
                 pod_buys.sort(key=lambda t: t["timestamp"])
                 earliest = pod_buys[0]
                 ts = earliest["timestamp"]
-                reasoning = earliest.get("reasoning", "")
-                # Unwrap JSON-blob reasoning (older sessions stored the raw TradeProposal)
-                if reasoning and (reasoning.startswith('{"trades":') or reasoning.startswith("{'trades':")):
-                    try:
-                        proposal = json.loads(reasoning)
-                        for trade in proposal.get("trades", []):
-                            if trade.get("symbol") == sym:
-                                reasoning = trade.get("reasoning", reasoning)
-                                break
-                    except Exception:
-                        pass
+                reasoning = self._extract_trade_reasoning(
+                    earliest.get("entry_thesis") or earliest.get("reasoning") or "",
+                    sym,
+                )
 
-                acct._entry_dates[sym] = ts[:10]
-                acct._entry_theses[sym] = reasoning if reasoning else ""
+                if not acct._entry_dates.get(sym):
+                    acct._entry_dates[sym] = ts[:10]
+                if reasoning and not acct._entry_theses.get(sym):
+                    acct._entry_theses[sym] = reasoning
                 if sym not in acct._entry_metadata:
                     acct._entry_metadata[sym] = {
                         "entry_price": acct._cost_basis.get(sym, 0),
                         "entry_time": ts,
-                        "reasoning": reasoning if reasoning else "",
+                        "entry_thesis": reasoning,
+                        "reasoning": reasoning,
                         "conviction": earliest.get("conviction", 0.5),
                         "strategy_tag": earliest.get("strategy_tag", ""),
-                        "signal_snapshot": {},
+                        "signal_snapshot": earliest.get("signal_snapshot", {}),
                         "stop_loss_pct": 0.05,
                         "take_profit_pct": 0.15,
                         "exit_when": "",
                         "max_hold_days": 0,
                     }
-                acct._fill_log.append({
-                    "order_id": earliest.get("order_id", ""),
-                    "symbol": sym,
-                    "qty": abs(earliest.get("qty", 0)),
-                    "fill_price": earliest.get("filled_price") or earliest.get("fill_price", acct._cost_basis.get(sym, 0)),
-                    "filled_at": ts,
-                    "side": "BUY",
-                    "reasoning": reasoning if reasoning else "",
-                })
-                backfilled += 1
-                logger.info("[session_manager] Backfilled entry metadata for %s/%s: date=%s", pod_id, sym, ts[:10])
+                else:
+                    acct._entry_metadata[sym].setdefault("entry_time", ts)
+                    acct._entry_metadata[sym].setdefault("entry_thesis", reasoning)
+                    if reasoning and not acct._entry_metadata[sym].get("reasoning"):
+                        acct._entry_metadata[sym]["reasoning"] = reasoning
+
+                existing_keys = set()
+                for f in getattr(acct, "_fill_log", []):
+                    if f.get("symbol") != sym:
+                        continue
+                    f_ts = f.get("timestamp") or f.get("filled_at") or ""
+                    if hasattr(f_ts, "isoformat"):
+                        f_ts = f_ts.isoformat()
+                    existing_keys.add((str(f.get("order_id", "")), str(f_ts), float(abs(f.get("qty", 0) or 0))))
+
+                for buy in pod_buys:
+                    buy_ts = buy.get("timestamp", "")
+                    buy_qty = float(abs(buy.get("qty", 0) or 0))
+                    order_id = str(buy.get("order_id", ""))
+                    key = (order_id, str(buy_ts), buy_qty)
+                    if key in existing_keys:
+                        continue
+                    fill_reasoning = self._extract_trade_reasoning(
+                        buy.get("entry_thesis") or buy.get("reasoning") or "",
+                        sym,
+                    )
+                    acct._fill_log.append({
+                        "timestamp": buy_ts,
+                        "order_id": order_id,
+                        "symbol": sym,
+                        "qty": buy_qty,
+                        "fill_price": (
+                            buy.get("filled_price")
+                            or buy.get("fill_price")
+                            or buy.get("price")
+                            or acct._cost_basis.get(sym, 0)
+                        ),
+                        "side": "BUY",
+                        "entry_thesis": fill_reasoning,
+                        "reasoning": fill_reasoning,
+                        "conviction": buy.get("conviction", 0),
+                        "strategy_tag": buy.get("strategy_tag", ""),
+                        "signal_snapshot": buy.get("signal_snapshot", {}),
+                    })
+                    existing_keys.add(key)
+                    backfilled += 1
+                logger.info(
+                    "[session_manager] Backfilled %d buy fill(s) for %s/%s: entry=%s",
+                    len(pod_buys), pod_id, sym, ts[:10],
+                )
 
         if backfilled:
-            logger.info("[session_manager] Backfilled entry metadata for %d positions from memory", backfilled)
+            logger.info("[session_manager] Backfilled %d fill records from memory", backfilled)
 
     async def stop_session(self) -> dict:
         """Stop event loop and gracefully shut down all pods.
@@ -2358,6 +2405,13 @@ class SessionManager:
 
     def get_all_closed_trades(self) -> list[dict]:
         """Collect closed trades from all pod accountants, sorted by exit time descending."""
+        def _date_only(ts) -> str:
+            if not ts:
+                return ""
+            if isinstance(ts, datetime):
+                return ts.date().isoformat()
+            return str(ts).split("T", 1)[0][:10]
+
         all_trades = []
         for pod_id, rt in self._pod_runtimes.items():
             acct = rt._ns.get("accountant")
@@ -2384,7 +2438,10 @@ class SessionManager:
                     "realized_pnl": round(ct.get("realized_pnl", 0), 4),
                     "entry_time": entry_time,
                     "exit_time": exit_time,
+                    "entry_date": _date_only(entry_time),
+                    "exit_date": _date_only(exit_time),
                     "holding_days": holding_days,
+                    "entry_thesis": ct.get("entry_thesis") or ct.get("entry_reasoning") or "",
                     "entry_reasoning": ct.get("entry_reasoning") or "",
                     "exit_reasoning": ct.get("exit_reasoning") or "",
                     "conviction": ct.get("conviction", 0),
@@ -2423,7 +2480,10 @@ class SessionManager:
                         "realized_pnl": round(ct.get("realized_pnl", 0), 4),
                         "entry_time": entry_time,
                         "exit_time": exit_time,
+                        "entry_date": _date_only(entry_time),
+                        "exit_date": _date_only(exit_time),
                         "holding_days": holding_days,
+                        "entry_thesis": ct.get("entry_thesis") or ct.get("entry_reasoning") or "",
                         "entry_reasoning": ct.get("entry_reasoning") or "",
                         "exit_reasoning": ct.get("exit_reasoning") or "",
                         "conviction": ct.get("conviction", 0),
@@ -2462,7 +2522,7 @@ class SessionManager:
                     if b_ts <= exit_time:
                         entry_price = b.get("fill_price") or b.get("filled_price") or 0
                         entry_time = b.get("timestamp", "")
-                        entry_reasoning_raw = b.get("reasoning", "")
+                        entry_reasoning_raw = b.get("entry_thesis") or b.get("reasoning", "")
 
                 realized_pnl = qty * (exit_price - entry_price) if entry_price > 0 else 0.0
                 holding_days = 0
@@ -2497,7 +2557,10 @@ class SessionManager:
                     "realized_pnl": round(realized_pnl, 4),
                     "entry_time": entry_time,
                     "exit_time": exit_time,
+                    "entry_date": _date_only(entry_time),
+                    "exit_date": _date_only(exit_time),
                     "holding_days": holding_days,
+                    "entry_thesis": _unwrap(entry_reasoning_raw, symbol),
                     "entry_reasoning": _unwrap(entry_reasoning_raw, symbol),
                     "exit_reasoning": _unwrap(t.get("reasoning", ""), symbol),
                     "conviction": t.get("conviction", 0),
@@ -2528,7 +2591,11 @@ class SessionManager:
                     "unrealized_pnl": snap.unrealized_pnl,
                     "notional": snap.qty * snap.current_price,
                     "entry_date": snap.entry_date or meta.get("entry_time", ""),
-                    "entry_thesis": snap.entry_thesis or meta.get("entry_thesis", ""),
+                    "entry_thesis": (
+                        snap.entry_thesis
+                        or meta.get("entry_thesis")
+                        or meta.get("reasoning", "")
+                    ),
                 })
         return result
 
@@ -2563,31 +2630,64 @@ class SessionManager:
         for f in getattr(accountant, "_fill_log", []):
             if f.get("symbol") != symbol:
                 continue
-            ts = f.get("timestamp")
+            ts = f.get("timestamp") or f.get("filled_at")
             ts_str = ts.isoformat() if hasattr(ts, "isoformat") else str(ts) if ts else ""
             qty_val = f.get("qty", 0)
+            side = (f.get("side") or "").upper()
+            if side not in {"BUY", "SELL"}:
+                side = "BUY" if qty_val > 0 else "SELL"
+            thesis = f.get("entry_thesis") or f.get("reasoning") or ""
             fills.append({
                 "timestamp": ts_str,
+                "order_id": f.get("order_id", ""),
                 "qty": abs(qty_val),
                 "fill_price": f.get("fill_price", 0),
-                "side": "BUY" if qty_val > 0 else "SELL",
-                "reasoning": f.get("reasoning") or "",
+                "side": side,
+                "entry_thesis": self._extract_trade_reasoning(thesis, symbol),
+                "reasoning": self._extract_trade_reasoning(thesis, symbol),
+                "conviction": f.get("conviction", 0),
+                "strategy_tag": f.get("strategy_tag", ""),
+                "signal_snapshot": f.get("signal_snapshot", {}),
             })
 
         # Also include fills from restored memory
         prev = self._restored_memory or {}
+        existing_ids = {f2.get("order_id") for f2 in fills if f2.get("order_id")}
+        existing_fill_keys = {
+            (
+                f2.get("timestamp", ""),
+                f2.get("side", ""),
+                float(f2.get("qty", 0) or 0),
+                float(f2.get("fill_price", 0) or 0),
+            )
+            for f2 in fills
+        }
         for t in prev.get("trades", []):
             if t.get("symbol") != symbol or t.get("pod_id") != pod_id:
                 continue
-            existing_ids = {f2.get("order_id") for f2 in getattr(accountant, "_fill_log", []) if f2.get("order_id")}
             if t.get("order_id") and t["order_id"] in existing_ids:
                 continue
+            price = t.get("filled_price") or t.get("fill_price", 0)
+            mem_key = (
+                t.get("timestamp", ""),
+                (t.get("side") or "buy").upper(),
+                float(abs(t.get("qty", 0) or 0)),
+                float(price or 0),
+            )
+            if mem_key in existing_fill_keys:
+                continue
+            thesis = t.get("entry_thesis") or t.get("reasoning") or ""
             fills.append({
                 "timestamp": t.get("timestamp", ""),
+                "order_id": t.get("order_id", ""),
                 "qty": abs(t.get("qty", 0)),
-                "fill_price": t.get("filled_price") or t.get("fill_price", 0),
+                "fill_price": price,
                 "side": (t.get("side") or "buy").upper(),
-                "reasoning": t.get("reasoning") or "",
+                "entry_thesis": self._extract_trade_reasoning(thesis, symbol),
+                "reasoning": self._extract_trade_reasoning(thesis, symbol),
+                "conviction": t.get("conviction", 0),
+                "strategy_tag": t.get("strategy_tag", ""),
+                "signal_snapshot": t.get("signal_snapshot", {}),
             })
 
         fills.sort(key=lambda x: x.get("timestamp", ""))
@@ -2618,8 +2718,12 @@ class SessionManager:
             "current_price": snap.current_price,
             "unrealized_pnl": round(snap.unrealized_pnl, 4),
             "pnl_pct": round(snap.pnl_pct, 2),
-            "entry_date": snap.entry_date,
-            "entry_thesis": snap.entry_thesis,
+            "entry_date": snap.entry_date or meta.get("entry_time", ""),
+            "entry_thesis": (
+                snap.entry_thesis
+                or meta.get("entry_thesis")
+                or meta.get("reasoning", "")
+            ),
             "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
             "take_profit_pct": meta.get("take_profit_pct", 0.15),
             "max_hold_days": meta.get("max_hold_days", 0),
@@ -2629,6 +2733,32 @@ class SessionManager:
             "partial_exits": partial_exits,
             "reasoning_history": reasoning_history,
         }
+
+    @staticmethod
+    def _extract_trade_reasoning(reasoning: object, symbol: str) -> str:
+        """Return human-readable reasoning, unwrapping older raw TradeProposal JSON."""
+        text = str(reasoning or "").strip()
+        if not text:
+            return ""
+        if not text.startswith("{"):
+            return text
+        try:
+            proposal = json.loads(text)
+        except Exception:
+            return text
+        trades = proposal.get("trades", []) if isinstance(proposal, dict) else []
+        if not isinstance(trades, list):
+            return text
+        match = None
+        for trade in trades:
+            if isinstance(trade, dict) and (not symbol or trade.get("symbol") == symbol):
+                match = trade
+                break
+        if match is None and trades and isinstance(trades[0], dict):
+            match = trades[0]
+        if not match:
+            return text
+        return str(match.get("entry_thesis") or match.get("reasoning") or match.get("thesis") or text).strip()
 
     # Context manager support
     async def __aenter__(self):

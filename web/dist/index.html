@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 
   <!-- Stylesheet -->
-  <link rel="stylesheet" href="styles.css">
+  <link rel="stylesheet" href="styles.css?v=position-thesis-20260501">
 
   <!-- Three.js r128 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -241,7 +241,7 @@
         <div id="attribution-panel"></div>
       </div>
       <div class="sec-hdr" style="margin-top:8px">
-        <span class="sec-title">Trade Outcomes</span>
+        <span class="sec-title">Closed Trade Outcomes</span>
         <span class="sec-badge" id="outcomes-total-badge">— trades</span>
       </div>
       <div class="outcome-grid" id="outcome-grid">
@@ -269,6 +269,17 @@
               <th>Pod</th><th class="r">VaR 95%</th><th class="r">Leverage</th><th class="r">Drawdown</th><th class="r">Positions</th><th class="r">Status</th>
             </tr></thead>
             <tbody id="risk-table"><tr><td colspan="6" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+          </table>
+        </div>
+      </div>
+      <div>
+        <div class="sec-hdr"><span class="sec-title">Commodity Factor Exposure</span></div>
+        <div class="tbl-wrap">
+          <table class="dtbl">
+            <thead><tr>
+              <th>Factor</th><th>Symbols</th><th class="r">Exposure</th><th class="r">Limit</th><th class="r">Status</th>
+            </tr></thead>
+            <tbody id="factor-risk-table"><tr><td colspan="5" class="empty"><div class="empty-txt">Awaiting commodities exposure...</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -335,7 +346,7 @@
     <!-- GOVERNANCE -->
     <div class="tab-pane" id="tab-governance">
       <div>
-        <div class="sec-hdr"><span class="sec-title">Capital Allocations</span></div>
+        <div class="sec-hdr"><span class="sec-title">Capital Status</span></div>
         <div class="alloc-grid" id="alloc-grid"></div>
       </div>
       <div>
@@ -684,7 +695,7 @@
         <span class="sec-badge" id="closed-badge">0 positions</span>
         <button class="sec-btn" onclick="loadClosedPositions()" style="cursor:pointer;background:var(--card);border:1px solid var(--border);color:var(--text-dim);padding:4px 10px;border-radius:4px;font-size:10px;letter-spacing:1px;margin-left:8px">REFRESH</button>
       </div>
-      <div class="tbl-wrap">
+      <div class="tbl-wrap tbl-wrap-biaxial closed-pos-scroll">
         <table class="dtbl" id="closed-pos-table">
           <thead><tr>
             <th>Pod</th>
@@ -736,6 +747,6 @@
 <!-- JS modules: order matters (tower → motion → dashboard) -->
 <script src="tower.js"></script>
 <script src="motion.js"></script>
-<script src="dashboard.js"></script>
+<script src="dashboard.js?v=position-thesis-20260501"></script>
 </body>
 </html>
