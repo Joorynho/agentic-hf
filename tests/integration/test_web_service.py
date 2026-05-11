@@ -317,6 +317,287 @@ class TestRESTEndpoints:
         assert data["count"] >= 1
         assert data["entries"][0]["payload"]["event"] == "smoke"
 
+    def test_get_broker_reconciliation_uses_session_manager(self, client, app):
+        """Broker reconciliation endpoint exposes the SessionManager payload."""
+        sm = MagicMock()
+        sm.get_broker_reconciliation = AsyncMock(return_value={
+            "status": "OK",
+            "account": {"equity": 1000.0},
+            "positions": [],
+            "mismatches": [],
+            "open_orders": [],
+            "errors": [],
+        })
+        app.state.session_manager = sm
+
+        response = client.get("/api/broker-reconciliation")
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "OK"
+
+    def test_post_execution_reconciliation_passes_recent_orders(self, client, app):
+        """Execution reconciliation uses recent dashboard order state."""
+        sm = MagicMock()
+        sm.reconcile_execution_state = AsyncMock(return_value={
+            "checked_local_orders": 1,
+            "updates": [{"order_id": "ord-1", "status": "REJECTED"}],
+            "errors": [],
+        })
+        app.state.session_manager = sm
+        app.state.listener = MagicMock()
+        app.state.listener._app_state = {
+            "recent_orders": [{"data": {"order_id": "ord-1", "status": "PENDING"}}]
+        }
+
+        response = client.post("/api/execution-reconciliation")
+
+        assert response.status_code == 200
+        assert response.json()["checked_local_orders"] == 1
+        sm.reconcile_execution_state.assert_awaited_once()
+
+    def test_state_health_endpoint_uses_session_manager(self, client, app):
+        """State health endpoint exposes SessionManager diagnostics."""
+        sm = MagicMock()
+        sm.get_state_health = AsyncMock(return_value={
+            "status": "CHECK",
+            "warnings": ["1 NAV history row(s) repaired for chart integrity"],
+            "capital_per_pod": 1000.0,
+            "pods": [{"pod_id": "equities", "nav": 1000.0, "status": "OK"}],
+            "nav_history": {"total_rows": 2, "repaired_rows": 1},
+            "broker": {"status": "OK", "mismatch_count": 0, "errors": []},
+        })
+        app.state.session_manager = sm
+
+        response = client.get("/api/state-health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["capital_per_pod"] == 1000.0
+        assert data["nav_history"]["repaired_rows"] == 1
+        sm.get_state_health.assert_awaited_once()
+
+    def test_state_health_endpoint_falls_back_to_app_state(self, client, app):
+        """State health works before a full SessionManager is attached."""
+        app.state.capital_per_pod = 1000.0
+        app.state.pod_summaries = {
+            "equities": {
+                "timestamp": "2026-05-08T09:00:00+00:00",
+                "nav": 1001.0,
+                "cash": 500.0,
+                "invested": 501.0,
+                "positions": [{"symbol": "SPY"}],
+            }
+        }
+
+        response = client.get("/api/state-health")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "OK"
+        assert data["pods"][0]["starting_capital"] == 1000.0
+        assert data["pods"][0]["position_count"] == 1
+        assert data["data_quality"]["status"] == "UNKNOWN"
+
+    def test_data_quality_endpoint_uses_session_manager(self, client, app):
+        """Data quality endpoint exposes price freshness diagnostics."""
+        sm = MagicMock()
+        sm.get_data_quality_report.return_value = {
+            "status": "CHECK",
+            "position_count": 1,
+            "check_count": 1,
+            "positions": [{"symbol": "SOL/USD", "status": "CHECK"}],
+            "recent_failures": [],
+        }
+        app.state.session_manager = sm
+
+        response = client.get("/api/data-quality")
+
+        assert response.status_code == 200
+        assert response.json()["positions"][0]["symbol"] == "SOL/USD"
+        sm.get_data_quality_report.assert_called_once()
+
+    def test_execution_truth_endpoint_uses_session_manager(self, client, app):
+        """Execution truth endpoint exposes per-pod decision/execution status."""
+        sm = MagicMock()
+        sm.get_execution_truth.return_value = {
+            "status": "CHECK",
+            "pods": [{"pod_id": "crypto", "status": "BLOCKED", "stage": "data_quality"}],
+            "generated_at": "2026-05-08T09:00:00+00:00",
+        }
+        app.state.session_manager = sm
+        app.state.listener = MagicMock()
+        app.state.listener._app_state = {
+            "recent_orders": [{"data": {"order_id": "local-1", "status": "PENDING"}}]
+        }
+
+        response = client.get("/api/execution-truth")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["pods"][0]["status"] == "BLOCKED"
+        assert data["recent_orders"][0]["order_id"] == "local-1"
+        sm.get_execution_truth.assert_called_once()
+
+    def test_positions_endpoint_refreshes_prices_before_returning_positions(self, client, app):
+        """Open positions endpoint triggers the non-blocking live-price refresh hook."""
+        sm = MagicMock()
+        sm.refresh_live_position_prices_if_due = AsyncMock(return_value={"updated_count": 1})
+        sm.get_all_positions.return_value = [{
+            "_pod": "crypto",
+            "symbol": "ETH/USD",
+            "qty": 0.1,
+            "current_price": 2340.0,
+            "cost_basis": 2328.0,
+            "unrealized_pnl": 1.2,
+        }]
+        app.state.session_manager = sm
+
+        response = client.get("/api/positions")
+
+        assert response.status_code == 200
+        assert response.json()["positions"][0]["current_price"] == 2340.0
+        sm.refresh_live_position_prices_if_due.assert_awaited_once()
+        sm.get_all_positions.assert_called_once()
+
+    def test_positions_endpoint_returns_cached_positions_if_refresh_fails(self, client, app):
+        """A market-data timeout should not blank or block the Top Holdings table."""
+        sm = MagicMock()
+        sm.refresh_live_position_prices_if_due = AsyncMock(side_effect=TimeoutError("slow quote"))
+        sm.get_all_positions.return_value = [{
+            "_pod": "crypto",
+            "symbol": "SOL/USD",
+            "qty": 2.0,
+            "current_price": 89.5,
+            "cost_basis": 89.5,
+            "unrealized_pnl": 0.0,
+        }]
+        app.state.session_manager = sm
+
+        response = client.get("/api/positions")
+
+        assert response.status_code == 200
+        assert response.json()["positions"][0]["symbol"] == "SOL/USD"
+        sm.get_all_positions.assert_called_once()
+
+    def test_decision_audit_endpoint_combines_activity_governance_and_orders(self, client, app):
+        """Decision audit combines PM, governance, and execution events."""
+        app.state.listener = MagicMock()
+        app.state.listener._app_state = {
+            "recent_activity": [{
+                "timestamp": "2026-05-08T09:00:00+00:00",
+                "data": {
+                    "agent_role": "PM",
+                    "pod_id": "equities",
+                    "action": "trade_decision",
+                    "summary": "BUY SPY",
+                    "detail": "Thesis verified",
+                },
+            }],
+            "recent_governance": [{
+                "timestamp": "2026-05-08T09:01:00+00:00",
+                "data": {
+                    "agent": "CIO",
+                    "decision": "MANDATE_UPDATE",
+                    "reasoning": "Keep allocations stable",
+                },
+            }],
+            "recent_orders": [{
+                "timestamp": "2026-05-08T09:02:00+00:00",
+                "data": {
+                    "pod_id": "crypto",
+                    "symbol": "SOL/USD",
+                    "side": "BUY",
+                    "qty": 0.5,
+                    "status": "REJECTED",
+                    "stage": "preflight",
+                    "reason": "Asset is not tradable",
+                    "order_id": "ord-1",
+                },
+            }],
+        }
+
+        response = client.get("/api/decision-audit")
+
+        assert response.status_code == 200
+        data = response.json()
+        stages = {item["stage"] for item in data["items"]}
+        assert {"trade_decision", "governance", "preflight"}.issubset(stages)
+        rejected = [item for item in data["items"] if item.get("status") == "REJECTED"][0]
+        assert rejected["reason"] == "Asset is not tradable"
+
+    def test_research_feed_endpoint_uses_session_manager_and_listener_state(self, client, app):
+        """Research feed endpoint exposes persistent feed, health, and action audit."""
+        sm = MagicMock()
+        sm.get_research_feed_report.return_value = {
+            "status": "CHECK",
+            "items": [{"title": "Oil shock lifts gold", "action_audit": {"status": "needs_review"}}],
+            "sources": [{"source": "OilPrice", "status": "ok"}],
+            "item_count": 1,
+            "source_count": 1,
+            "source_error_count": 0,
+        }
+        app.state.session_manager = sm
+        app.state.listener = MagicMock()
+        app.state.listener._app_state = {"recent_activity": [{"data": {"pod_id": "commodities"}}]}
+
+        response = client.get("/api/research-feed?limit=25")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "CHECK"
+        assert data["items"][0]["action_audit"]["status"] == "needs_review"
+        sm.get_research_feed_report.assert_called_once_with(
+            limit=25,
+            listener_state=app.state.listener._app_state,
+        )
+
+    def test_loss_reviews_endpoint_uses_session_manager(self, client, app):
+        """Loss-review endpoint exposes active pod interventions from SessionManager."""
+        sm = MagicMock()
+        sm.get_loss_review_report.return_value = {
+            "active": {
+                "crypto": {
+                    "pod_id": "crypto",
+                    "status": "restricted",
+                    "triggered": True,
+                }
+            },
+            "history": [],
+            "count": 1,
+            "triggered_count": 1,
+        }
+        app.state.session_manager = sm
+
+        response = client.get("/api/loss-reviews")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["active"]["crypto"]["status"] == "restricted"
+        assert data["triggered_count"] == 1
+        sm.get_loss_review_report.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_update_session_state_stores_loss_reviews_for_snapshots(self, app):
+        """WebSocket snapshots include the latest dashboard loss-review state."""
+        report = {
+            "active": {"fx": {"pod_id": "fx", "status": "watch", "triggered": True}},
+            "history": [],
+            "count": 1,
+            "triggered_count": 1,
+        }
+        app.state.listener = EventBusListener(app.state.event_bus, app.state.connection_manager)
+
+        await app.state.update_session_state(
+            iteration=1,
+            capital_per_pod=1000.0,
+            pod_summaries={},
+            loss_reviews=report,
+        )
+
+        assert app.state.loss_reviews == report
+        snap = app.state.listener.get_snapshot_with_app_state(app)
+        assert snap["data"]["loss_reviews"]["active"]["fx"]["status"] == "watch"
+
 
 class TestWebSocketIntegration:
     """Test WebSocket functionality."""

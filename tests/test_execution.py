@@ -7,6 +7,7 @@ from src.execution.paper.paper_adapter import PaperAdapter
 from src.core.models.execution import Order, RiskApprovalToken, RejectedOrder
 from src.core.models.market import Bar
 from src.core.models.enums import Side, OrderType
+from src.pods.templates.execution_common import broker_rejection_reason
 
 
 @pytest.mark.asyncio
@@ -45,3 +46,13 @@ async def test_paper_adapter_rejects_expired_token():
     result = await adapter.execute(order, token, bar)
     assert isinstance(result, RejectedOrder)
     assert "expired" in result.reason.lower()
+
+
+def test_broker_rejection_reason_prefers_specific_detail_over_generic_reason():
+    result = {
+        "status": "REJECTED",
+        "reason": "Order rejected",
+        "message": "invalid crypto time_in_force",
+    }
+
+    assert broker_rejection_reason(result) == "invalid crypto time_in_force"

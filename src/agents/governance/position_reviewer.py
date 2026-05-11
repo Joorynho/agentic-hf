@@ -211,6 +211,7 @@ class PositionReviewer:
                 [{"role": "system", "content": _CIO_REVIEW_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
+                task="position_review",
             )
         except Exception as e:
             logger.warning("[position_review] CIO review LLM failed: %s", e)
@@ -250,6 +251,7 @@ class PositionReviewer:
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
+                task="position_review",
             )
         except Exception as e:
             logger.warning("[position_review] PM defend LLM call failed: %s", e)
@@ -284,6 +286,7 @@ class PositionReviewer:
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
+                task="position_review",
             )
         except Exception as e:
             logger.warning("[position_review] CIO decision LLM call failed: %s", e)
@@ -333,6 +336,7 @@ class PositionReviewer:
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=1500,
+                task="position_review",
             )
         except Exception as e:
             logger.warning("[position_review] PM counter-argument LLM call failed: %s", e)
@@ -372,6 +376,7 @@ class PositionReviewer:
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=1500,
+                task="position_review",
             )
         except Exception as e:
             logger.warning("[position_review] CIO final ruling LLM call failed: %s", e)

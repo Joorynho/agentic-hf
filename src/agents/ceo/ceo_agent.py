@@ -174,6 +174,7 @@ class CEOAgent:
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_prompt}],
             max_tokens=500,
+            task="governance",
         )
 
         if self._session_logger:
@@ -248,6 +249,7 @@ class CEOAgent:
             response_text = llm_chat(
                 [{"role": "user", "content": prompt + " Respond with valid JSON only."}],
                 max_tokens=400,
+                task="governance",
             )
 
             if self._session_logger:

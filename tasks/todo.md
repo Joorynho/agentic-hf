@@ -1162,6 +1162,140 @@ Product-readiness audit:
 
 ---
 
+# Current Task - Empty Diagnostics Dashboards
+
+Goal: Operations Health, Execution Broker, Execution Quality, and Decision Audit should always show useful local/session data quickly. Slow Alpaca or reconciliation calls must not leave the dashboard blank or stuck at UNKNOWN.
+
+- [x] Stop Operations Health from blocking on live broker/network reconciliation.
+- [x] Make broker reconciliation bounded by timeouts and return local position rows even when Alpaca is slow.
+- [x] Keep execution reconciliation from blocking the Broker tab.
+- [x] Make Execution Quality show fill coverage, including when slippage was not captured yet.
+- [x] Make Decision Audit fall back to available order/trade activity instead of showing zero events.
+- [x] Add focused regression tests and run frontend/backend checks.
+
+Review:
+- Operations Health now uses local accountant/NAV state plus cached broker status, so a slow Alpaca call cannot blank the whole panel. Broker reconciliation now runs account, position, and open-order reads with bounded timeouts and still returns local-only rows when broker data is unavailable. Execution reconciliation is also bounded from the web route and frontend fetches abort instead of hanging. Execution Quality now shows fill coverage even when slippage was not captured, and Decision Audit falls back to local order/fill/activity events when the server audit endpoint is empty or unavailable. Verified with `pytest tests\unit\test_reconciliation.py tests\integration\test_web_service.py -q`, `pytest tests\integration\test_web_dashboard_e2e.py -q`, `pytest tests\unit\test_crypto_price_refresh.py tests\unit\test_nav_store.py -q`, `node --check web\dist\dashboard.js`, and Python `py_compile`.
+
+# Reliability Sprint: State Health, Broker Truth, Decision Audit
+
+**Goal:** Make the dashboard tell the truth about capital/NAV health, broker execution blockers, and every trade decision path before adding more strategy intelligence.
+
+## Plan
+
+- [x] Add a backend state-health summary: pod starting capital, current NAV, broker/local match state, NAV history repair counts, and last valid NAV timestamps.
+- [x] Extend broker/execution diagnostics so rejected orders explain symbol support, time-in-force/order format, buying power/account state, and exact broker/preflight reason where available.
+- [x] Add a backend decision-audit endpoint that turns recent PM/risk/governance/order events into an explainable decision trail.
+- [x] Add dashboard views for System Health, Broker Truth, and Decision Audit without cluttering the existing workflow.
+- [x] Add focused tests for the new API payloads and run frontend/backend verification.
+
+## Review
+
+Added `NavStore.health_summary()` plus `SessionManager.get_state_health()` and `/api/state-health`, so the dashboard can show pod starting capital, current NAV, cash/invested, position counts, NAV history repair counts, and broker/local mismatch status. Added `/api/decision-audit`, which combines recent PM activity, governance events, and order lifecycle updates into a single decision trail. The Operations tab now has a `Health` subtab, the Execution tab now has a `Decision Audit` subtab, and the Broker panel now includes recent rejected/pending execution diagnostics with next-action hints. Verification passed: `node --check web\dist\dashboard.js`, Python compile for the edited backend modules, `pytest tests\unit\test_nav_store.py -q`, `pytest tests\integration\test_web_service.py -q`, and `pytest tests\integration\test_web_dashboard_e2e.py -q`.
+
+---
+
+# Performance NAV Seed Baseline Fix
+
+**Goal:** Stop the all-time Performance chart from showing pods as if they started at `$100` when the intended pod allocation is `$1000`.
+
+## Plan
+
+- [x] Inspect raw NAV history to confirm whether `$100` is a data issue or a chart issue.
+- [x] Repair leading all-cash `$100` seed snapshots to the inferred funded baseline before history is returned.
+- [x] Add a frontend safety pass so already-running servers do not plot bad seed rows after a refresh.
+- [x] Change the remaining `start_live_session()` product default from `$100` to `$1000`.
+- [x] Add regression tests and run focused dashboard/backend checks.
+
+## Review
+
+- Confirmed `data/state.db` had historical all-cash seed rows at `$100` for equities, FX, and crypto before the first real funded snapshots around `$1000`.
+- Added `NavStore` repair logic that rebases only leading low all-cash seed placeholders to the inferred funded baseline; true later drawdowns are still preserved.
+- Extended startup repair so those seed rows are rewritten on the next Python restart, and added a frontend fallback that repairs the plotted API history immediately after a static refresh.
+- Changed `SessionManager.start_live_session()` default and Alpaca hydration fallback from `$100` to `$1000`.
+- Verification passed: `pytest tests\unit\test_nav_store.py -q`, `pytest tests\integration\test_web_dashboard_e2e.py -q`, `pytest tests\integration\test_web_service.py -q`, `node --check web\dist\dashboard.js`, Python compile, and startup import check.
+
+---
+
+# Performance Graph Visibility Fix
+
+**Goal:** Restore visible, readable NAV and drawdown graphs in the Performance tab after the chart containers collapsed into short strips.
+
+## Plan
+
+- [x] Inspect Performance chart CSS and Chart.js render/update paths.
+- [x] Prevent chart containers from shrinking inside the scrollable dashboard column.
+- [x] Force NAV/drawdown charts to resize after tab activation, period changes, and benchmark/firm toggles.
+- [x] Cache-bust the static assets so refreshes pick up the layout fix.
+- [x] Run frontend syntax and dashboard integration checks.
+
+## Review
+
+- Fixed `.chart-wrap` so it has a real minimum height and does not flex-shrink inside the Performance tab.
+- Gave the NAV and drawdown charts explicit Performance-tab heights, with a smaller fallback for short viewports.
+- Added a chart resize/refresh helper so Chart.js recalculates canvas size after the Performance tab becomes visible or a chart option changes.
+- Cache-busted `styles.css`, `tower.js`, `motion.js`, and `dashboard.js`.
+- Verification passed: `node --check web\dist\dashboard.js` and `pytest tests\integration\test_web_dashboard_e2e.py -q`.
+
+---
+
+# Current Sprint: Holding Detail Expandability + Frozen NAV Charts
+
+**Goal:** Make holding detail drilldowns readable for long fill/PM reasoning histories, and prevent Performance NAV/drawdown charts from collapsing to zero when the backend/server stops or sends empty NAV snapshots.
+
+- [x] Trace current holding detail modal rendering and chart history update paths
+- [x] Make fill timeline and PM reasoning entries clearly expandable/collapsible with readable full text
+- [x] Keep the modal usable when opening another holding while a previous API request is still returning
+- [x] Preserve last valid pod/firm NAV values instead of writing zero chart points during inactive/disconnected states
+- [x] Run focused frontend checks and update review notes
+
+**Review:** The open-holding modal now uses a wider, stable layout with full-row collapsed cards, readable scrollable text areas inside each expanded fill/PM reasoning item, and explicit Expand all / Collapse all controls for the fill timeline and PM reasoning history. Modal API responses are token-guarded, so a late response from one holding cannot overwrite another holding after the user clicks elsewhere; Escape also closes the modal. NAV history ingestion and live pod-summary merging now preserve the last positive pod/firm NAV snapshot when inactive/disconnected/empty updates report zero, so Performance and Drawdown charts pause at the last valid values instead of collapsing to a zero baseline. Verification passed: `node --check web\dist\dashboard.js`, `pytest tests\integration\test_web_dashboard_e2e.py -q`, and `pytest tests\integration\test_web_service.py -q`. Browser session reloaded the live dashboard and confirmed the updated cache-busted assets loaded, but the in-app browser click bridge could not reliably dispatch a click into the holdings table for a final modal screenshot.
+
+---
+
+# Current Sprint: Broker Preflight Layer
+
+**Goal:** Catch non-executable broker orders before they hit Alpaca, explain the exact reason in logs/dashboard, and feed a clean failure stage back through the execution contract.
+
+- [x] Add Alpaca asset capability lookup with an in-memory cache
+- [x] Validate tradability, symbol support, crypto time-in-force, quantity, buying power, and short/fractional constraints before submit
+- [x] Return structured preflight rejection payloads with `stage=preflight`
+- [x] Surface rejection stage and reason in the Execution trade log
+- [x] Add focused tests for unsupported assets, non-tradable assets, crypto TIF, buying power, and stage propagation
+- [x] Run focused verification
+
+**Review:** Added an Alpaca broker-preflight layer that looks up and caches asset capabilities before order submission, rejects unsupported/non-tradable/inactive symbols early, blocks invalid quantity/fractional/short constraints, and checks buying power when the execution path has an estimated price. Rejections now return structured payloads with `stage=preflight`, `reason`, `rejection_detail`, and `reason_code`; later broker status and submit failures keep their own stages. Execution traders preserve the stage through `OrderResult`, WebSocket order updates, and recent execution feedback, and PM prompts now include recent broker/preflight failures so they can adapt instead of repeatedly proposing dead orders. The dashboard Execution table now includes Stage plus Reason. Verification passed with `pytest tests\integration\test_alpaca_retry.py tests\integration\test_accountant_sync.py -q`, `pytest tests\integration\test_web_dashboard_e2e.py -q`, `node --check web\dist\dashboard.js`, and Python compile checks for the edited adapter, execution traders, PM agents, and execution model.
+
+---
+
+# Current Sprint: Alpaca Rejection Visibility
+
+**Goal:** Make rejected broker orders explain themselves in the execution log/dashboard, avoid presenting missing mandate allocation as 0%, and verify whether Alpaca supports crypto trading.
+
+- [x] Preserve Alpaca submit/order-status rejection messages in adapter results
+- [x] Propagate broker rejection reasons through execution traders and dashboard order updates
+- [x] Show rejection reasons in the Execution trade log
+- [x] Replace missing mandate allocation logging with unknown/unavailable wording
+- [x] Use crypto-compatible Alpaca time-in-force for crypto pairs
+- [x] Run focused verification
+
+**Review:** Alpaca adapter rejections now carry the broker/error text through `reason`, `rejection_reason`, and `rejection_detail`; submitted orders that later move to rejected/canceled/expired also return the broker status and reason instead of timing out as generic pending. Pod execution traders now preserve that reason in `OrderResult`, WebSocket order updates, and agent activity details. The Execution trade log now has a Reason column for rejected/pending order diagnostics. Missing mandate allocation now logs as unknown/unavailable rather than 0%. Crypto-looking Alpaca pairs now submit with `gtc` time-in-force, which matches Alpaca crypto order requirements. Verification passed with adapter/accountant integration tests, dashboard integration tests, JS syntax check, and Python compile of the edited execution modules.
+
+---
+
+# Current Sprint: Performance Chart Controls
+
+**Goal:** Let the first Performance chart show/hide firm NAV and filter the displayed period to all time, 6M, 3M, 30D, 7D, or 24H.
+
+- [x] Replace the minute-based chart buttons with product-facing period controls
+- [x] Add a firm NAV visibility toggle that updates the chart and expanded modal
+- [x] Keep drawdown and CSV export behavior compatible with the selected history state
+- [x] Load enough NAV history on startup for longer period selections
+- [x] Run focused dashboard verification
+
+**Review:** The first Performance NAV chart now has period controls for ALL, 6M, 3M, 30D, 7D, and 24H plus a Firm NAV checkbox that also refreshes the expanded chart modal. The chart, drawdown chart, and NAV CSV export all respect the selected period. Startup now requests a larger NAV history window, downsampling protects chart performance, and the stored NAV history API now includes per-pod NAV values so longer windows can show pod lines after the app restarts. The history query now uses an indexed timestamp lookup rather than loading the full table before trimming, and unit coverage locks that each selected timestamp keeps all pod NAVs. Verification passed with JS syntax checks, Python compile, focused NavStore unit tests, and the focused web dashboard/service integration tests.
+
+---
+
 # Current Sprint: Position Detail Thesis Auditability
 
 **Goal:** Make open-position detail usable for trade review: no clipped thesis text, every fill/expansion has its own visible reasoning, and future PM decisions produce tradeable, data-consistent entry theses.
@@ -1176,6 +1310,36 @@ Product-readiness audit:
 - [x] Run focused verification
 
 **Review:** Position detail now renders each fill/expansion as a collapsible entry with its own full thesis/reasoning, long thesis blocks scroll instead of being clipped, and PM reasoning history no longer caps at 10 visible entries. The backend now exposes all historical BUY fills for a current holding, including recovered thesis/reasoning metadata where available. PM prompts and thesis verification now require tradeable sections covering drivers, entry trigger, invalidation, risk, instrument fit, and asset-specific checks such as real yields, breakevens, Fed reaction, USD, positioning/flows, central-bank demand, and geopolitical risk as a conditional catalyst rather than a standalone reason. Verification passed with JS syntax checks, Python compile, focused unit tests, web-service tests, dashboard integration tests, and direct served-asset checks from the running dashboard.
+
+---
+
+# Current Sprint: Thesis Quality Gate + Lifecycle Monitor
+
+**Goal:** Treat every entry thesis as a live contract: reject weak new BUY theses before execution, continuously review open-position theses against current macro/news/regime conditions, and block expansions unless the PM explicitly revalidates or rewrites the thesis.
+
+- [x] Add a reusable thesis lifecycle reviewer with health statuses (`valid`, `watch`, `challenged`, `broken`, `needs_pm_rewrite`)
+- [x] Store entry-time macro/thesis context with fills and open-position metadata
+- [x] Run lifecycle review before PM decisions and inject thesis health into PM prompts
+- [x] Convert thesis verification into a hard BUY gate after revision attempts fail
+- [x] Block adds to existing positions when thesis health is challenged/broken unless the PM provides a fresh expansion thesis
+- [x] Expose thesis health/monitoring context in position detail and open-position APIs
+- [x] Add focused tests for lifecycle review, hard gate behavior, and API/dashboard visibility
+- [x] Run focused verification
+
+**Review:** Added `src/core/thesis_lifecycle.py` to score open-position theses against stored entry assumptions, current macro regime, price action, time-bound max-hold limits, and precious-metals-specific real-yield/USD monitors. `PodRuntime` now reviews open theses before PM decisions, injects lifecycle health into PM prompts, stores lifecycle state on accountant metadata, blocks BUYs when the thesis verifier still fails after revision attempts, and blocks adds to existing positions unless the PM writes a fresh expansion thesis. Execution metadata now stores entry macro regime and thesis review context with fills. Position APIs and the detail modal expose thesis health, issues, monitor points, and add-block status. Verification passed: Python compile checks, `node --check web/dist/dashboard.js`, focused unit tests for thesis lifecycle/verifier/runtime/accountant APIs, and dashboard/web integration tests.
+
+---
+
+# Current Sprint: Cross-Asset Thesis Lifecycle Coverage
+
+**Goal:** Make thesis lifecycle review apply across all four active pods, not just the GLD/precious-metals failure that triggered the work.
+
+- [x] Add asset-class thesis monitor profiles for equities, FX, crypto, and commodity sub-themes
+- [x] Keep GLD as a regression example, but add tests for all four pods
+- [x] Ensure missing asset-class monitors creates a review/watch signal instead of silently passing
+- [x] Run focused lifecycle/runtime verification
+
+**Review:** GLD is now only the regression example for the original false real-rate failure. The lifecycle reviewer now classifies open theses by pod/theme and adds monitors for equities, FX, crypto, and commodity sub-themes including energy, industrial metals, agriculture, broad commodities, and precious metals. The PM thesis standard now lists the required asset-class disciplines for all active pods. The thesis verifier now treats missing asset-class coverage as a hard failure for new active trades, so a vague FX/crypto/equity/commodity trade cannot pass just because it has THESIS/ENTRY/RISK labels. Verification passed with Python compile checks and focused lifecycle/verifier/runtime unit tests.
 
 ---
 
@@ -1201,6 +1365,19 @@ Review:
 - CRO now alerts on pod-level factor breaches and firm-wide factor concentration.
 - Dashboard Risk tab now includes a Commodity Factor Exposure table sourced from live pod summaries.
 - Verification: focused factor/risk tests passed, web service tests passed, dashboard integration tests passed, MVP4 trading-cycle tests passed, and full pytest output reported `539 passed, 2 skipped` before the shell wrapper timed out after the long run.
+
+---
+
+# Current Sprint: UI P&L Percent Normalization
+
+**Goal:** Whenever the dashboard shows a dollar P&L, also show the percentage return relative to the relevant notional/capital base when that base is available.
+
+- [x] Add shared frontend helpers for P&L percent formatting against position notional, entry notional, or pod capital
+- [x] Update open-position, closed-trade, performance, attribution, risk/report, and detail-modal P&L displays
+- [x] Keep existing color/sign behavior and avoid showing misleading percentages when the denominator is missing or zero
+- [x] Run dashboard syntax/integration verification
+
+**Review:** Added shared dashboard helpers so dollar P&L can render as `$ P&L (return %)`. Open positions use entry notional, closed trades/closed positions use entry notional, pod/firm daily P&L uses current NAV, and cumulative NAV P&L uses starting/allocated capital. Updated the main dashboard tables/cards, position and closed-position modals, outcome stats, attribution, review holdings snapshot, and the 3D tooltip. Cache-busted `dashboard.js` and `motion.js`. Verification passed: `node --check web/dist/dashboard.js`, `node --check web/dist/motion.js`, `tests/integration/test_web_dashboard_e2e.py`, and `tests/integration/test_web_service.py`.
 
 ---
 
@@ -1299,5 +1476,253 @@ Review:
 **Notes:** Local memory currently shows commodities NAV around `$857.50`, realized P&L around `-$138`, open GLD/SLV dust plus a near-zero GDXJ artifact, and 44 commodities trade records. A true fresh start will not stick across restarts if Alpaca still contains commodity positions that the session hydrates back into the pod.
 
 **Review:** Governance now labels the section as Capital Status and uses current NAV as the primary card value, with mandate allocation shown below as context. The commodities reset was applied with backups in `data/backups/`: local commodities NAV/cash is `$1000`, local commodities positions/trades/closed trades/outcomes/signal history were removed, legacy commodities NAV-history rows were deleted, and a fresh `$1000` reset NAV row was inserted. The Alpaca paper close initially exposed a `close_position` quantity-sign bug for short/negative holdings; fixed `AlpacaAdapter.close_position()` to send positive quantities, then verified GLD/SLV/GDXJ have no open Alpaca target positions. Verification passed: `node --check web/dist/dashboard.js`, `py_compile` for the reset script and adapter, memory/state checks, Alpaca dry-run verification, and startup logs showing commodities reconciled at `$1000` cash / `$0` invested.
+
+---
+# 2026-05-07 Sprint - Performance Chart + Crypto Rejections + Trade Log Cleanup
+
+## Goal
+Fix three live dashboard defects: performance charts going blank, crypto orders still showing only generic rejections, and the rejected trade-log view redundantly showing the closed-trades table.
+
+## Plan
+- [x] Make the performance chart resilient when `/api/nav-history` returns firm-only history with no per-pod series.
+- [x] Keep drawdown/performance charts readable instead of plotting zero-value pod lines.
+- [x] Remove the closed-trades panel from the execution trade-log rejected sub-filter; closed trades remain in the dedicated Closed tab.
+- [x] Verify crypto order rejection payloads preserve broker stage/reason and add tests around the critical path.
+- [x] Run focused frontend/backend tests.
+
+## Review
+- The Performance chart now skips unavailable pod series instead of plotting them at `$0`, automatically falls back to a firm-NAV line when the backend only has firm-level history, and freezes outage snapshots that collapse from normal firm NAV to the `$400` placeholder, including explicit placeholder pod NAVs such as `$100` per pod. The drawdown chart also falls back to available history instead of staying empty. The Execution trade log no longer embeds the duplicate Closed Trades table, so the Rejected filter only shows order lifecycle rows. Crypto rejection diagnostics now prefer specific broker/API messages over generic `Order rejected`; I confirmed Alpaca returns `invalid crypto time_in_force` for the old crypto order format and the checked-in adapter uses crypto `gtc` time-in-force. Verification passed: `node --check web\dist\dashboard.js`, `pytest tests\test_execution.py tests\integration\test_alpaca_retry.py -q`, `pytest tests\integration\test_web_dashboard_e2e.py -q`, `pytest tests\integration\test_web_service.py -q`, and a startup import check for `SessionManager` plus `AlpacaAdapter`.
+# Performance Benchmark Toggle Fix
+
+**Goal:** Keep pod NAV performance readable by preventing the S&P 500 benchmark from forcing the chart onto the firm/index scale when the user is looking at pod-level NAV.
+
+## Plan
+
+- [x] Confirm how the S&P 500 benchmark is added to the first performance chart.
+- [x] Add a dedicated S&P 500 visibility toggle, default off.
+- [x] Rebase the benchmark to the visible chart basis when enabled so it does not distort pod NAV lines.
+- [x] Update cache-busting and run frontend checks plus relevant dashboard tests.
+
+## Review
+
+- Fixed the benchmark scaling bug: S&P 500 was always rendered and was using firm NAV scale even when Firm NAV was hidden.
+- Added a separate `S&P 500` checkbox. It defaults off.
+- When enabled, S&P 500 is shown as `S&P 500 (rebased)` and uses firm scale only if Firm NAV is visible; otherwise it uses the visible pod-level scale.
+- Verified with `node --check web/dist/dashboard.js` and `pytest tests/integration/test_web_dashboard_e2e.py -q`.
+
+---
+
+# NAV, Broker Reconciliation, And Execution State Hardening
+
+**Goal:** Make performance charts truthful after restarts, make broker/order failures diagnosable without guesswork, and reconcile stale execution state against Alpaca instead of leaving the dashboard in an ambiguous pending/rejected state.
+
+## Plan
+
+- [x] Map the current NAV write/read path, execution event path, and Alpaca read capabilities.
+- [x] Add a server-side NAV quality gate so collapsed placeholder snapshots are not persisted as real losses.
+- [x] Add a NAV history repair/read guard so existing bad restart rows are flattened or skipped for charts.
+- [x] Add a broker reconciliation API/payload showing Alpaca account, broker positions, local positions, and differences.
+- [x] Add a dashboard reconciliation panel so broker/local mismatches and rejection details are visible in plain English.
+- [x] Add execution state reconciliation for stale pending orders using broker status where possible.
+- [x] Preserve specific Alpaca rejection reasons in reconciled order rows.
+- [x] Add focused regression tests for NAV collapse filtering, broker reconciliation shape, and order status reconciliation.
+- [x] Run relevant backend and frontend checks.
+
+## Review
+
+- Implemented `NavStore` collapse detection, write-time freezing, read-time flattening, and explicit repair for existing restart artifacts.
+- Added `SessionManager.get_broker_reconciliation()` plus REST endpoints for broker reconciliation and execution reconciliation.
+- Added an Execution > Broker subtab that shows Alpaca account state, local-vs-broker position mismatches, open broker orders, and order reconciliation updates.
+- Added tests for NAV placeholder freezing/repair, broker quantity mismatches, stale pending order updates, stale broker order cancellation, and the new web endpoints.
+- Verified with `pytest tests/unit/test_nav_store.py tests/unit/test_reconciliation.py -q`, `pytest tests/integration/test_web_service.py -q`, `pytest tests/integration/test_web_dashboard_e2e.py -q`, and `node --check web/dist/dashboard.js`.
+
+---
+# Current Task - Crypto Position Price Staleness
+
+Goal: Crypto fills should not appear as live holdings with frozen entry prices. Held crypto positions must refresh from a reliable quote source, broker/local symbol variants must match (`ETH/USD`, `ETHUSD`, `ETH-USD`), and stale prices should be visible in the UI/API.
+
+- [x] Trace crypto order fill, quote, and position refresh paths.
+- [x] Normalize crypto broker/feed/accountant symbols consistently.
+- [x] Add quote fallback for held crypto prices when Alpaca position prices are stale or keyed differently.
+- [x] Preserve last known mark-to-market prices on partial updates.
+- [x] Expose quote source/staleness on open positions.
+- [x] Add focused tests for crypto price refresh and stale handling.
+- [x] Run syntax/unit/integration validation.
+
+Review:
+- Added crypto alias matching for `ETH/USD`, `ETHUSD`, `ETH-USD`, and base tickers so broker positions reconcile with local accountant positions.
+- Added Yahoo Finance crypto fallback through `PriceService`, using normalized dashed symbols like `ETH-USD`.
+- Changed `PortfolioAccountant.mark_to_market()` to preserve last prices for symbols absent from a partial refresh.
+- Added quote source/staleness fields to open-position payloads and dashboard cells.
+- Verified with focused crypto price tests, reconciliation tests, portfolio accountant tests, web service integration tests, JS syntax check, and Python compile check.
+
+---
+
+# Current Task - Crypto Holdings Live Mark Follow-Up
+
+Goal: fix the remaining live issue where filled crypto holdings show `current_price == cost_basis` and `$0.00` P&L after ETH/SOL orders fill.
+
+- [x] Confirm whether the positions API is serving stale crypto marks or the browser is only formatting them incorrectly.
+- [x] Add a broker-native Alpaca crypto market-data quote path for open crypto holdings.
+- [x] Make position price refresh independent from broker position reconciliation so a slow Alpaca positions call cannot freeze crypto marks.
+- [x] Let `/api/positions` perform a short throttled refresh before returning holdings, while falling back immediately to cached local positions on timeout.
+- [x] Add regression tests for broker-position failure plus positions endpoint refresh.
+- [x] Expose separate entry and current notionals, and make the UI display current notional from `qty × current_price`.
+- [x] Run focused backend verification and document the result.
+
+Review:
+- Confirmed the UI was not the root cause: the positions API itself was returning ETH/SOL `current_price == cost_basis`.
+- Added Alpaca crypto snapshot/trade quote support using slash symbols such as `ETH/USD` and `SOL/USD`; a live Alpaca check returned real snapshot prices for both.
+- Changed live position refresh so crypto quote fetching still runs even if broker position reconciliation is slow or unavailable.
+- Added a throttled `/api/positions` refresh hook that returns cached local positions if the refresh times out, keeping Top Holdings responsive.
+- Added `entry_notional`, `current_notional`, and `notional_basis` to position payloads. The Top Holdings table now prioritizes current notional rather than trusting a stale `notional` field.
+- Verification passed: crypto price refresh unit tests, Alpaca retry/market-data tests, web service integration tests, reconciliation tests, and Python compile checks.
+
+---
+
+# Current Task - Execution Truth Layer
+
+Goal: connect the already-existing PM decisions, gates, broker preflight, order updates, fills, and reconciliation into one explainable view per pod.
+
+- [x] Audit existing execution/reconciliation/decision-audit coverage before adding new code.
+- [x] Add runtime block records for thesis, lifecycle, data-quality, concentration, and risk rejections.
+- [x] Preserve stable local order IDs alongside broker order IDs in execution events.
+- [x] Add a backend execution-truth summary endpoint.
+- [x] Surface execution truth in the Execution > Decision Audit tab.
+- [x] Add focused tests for blocked trades, ID preservation, and endpoint shape.
+- [x] Run verification and document results.
+
+Review:
+- Added `last_trade_block` / `trade_blocks` runtime records for universe, thesis, lifecycle, data-quality, concentration, and risk gates.
+- Execution events now carry `local_order_id` and `broker_order_id` separately; reconciliation skips local-only pre-submit pending rows until a broker ID exists.
+- Added `/api/execution-truth` and embedded the same payload in `/api/decision-audit`.
+- Decision Audit now shows an Execution Truth table before the raw event trail.
+- Verified with targeted pytest, dashboard JS syntax check, and Python compile check.
+
+---
+
+# Current Task - Research Feed Clarity
+
+Goal: keep the LLM scoring cap as a cost/control guard, but make the dashboard feed feel live and stop implying the whole feed is limited to 25 sources.
+
+- [x] Confirm whether the `25` limit is a display/source cap or a scoring-window cap.
+- [x] Rename misleading feed counters and add display/source/freshness metadata.
+- [x] Sort and dedupe feed items by actual publish/refresh time so new items surface immediately.
+- [x] Make feed cards visually distinguish fresh/sentiment/source state without changing the research loop.
+- [x] Run frontend verification and document results.
+
+Review:
+- The News Feed no longer labels the `25` cap as sources. It now shows total headlines, unique sources, and a separate `LLM Window` of 25 items per scoring cycle.
+- Feed items are normalized, timestamp-sorted, deduped, and capped to the latest 100 displayed items while retaining up to 200 in the browser cache.
+- The feed subbar now shows fresh item count and the top source mix, and fresh cards get a visible `NEW` treatment.
+- Card badges now say `sentiment` or `raw`, avoiding an inaccurate claim that the dashboard can identify LLM-scored versus keyword-scored feed payloads.
+- Static asset cache keys were bumped to `research-feed-20260508` so a browser refresh picks up the changed JS/CSS.
+- Verification passed with `node --check web\dist\dashboard.js`.
+
+---
+
+# Current Task - Data Freshness Guardrails
+
+Goal: prevent the dashboard, PM agents, risk checks, and execution path from treating stale/missing market data as reliable live state.
+
+- [x] Map the current price freshness fields, order execution path, and diagnostics endpoints.
+- [x] Add a reusable position data-quality report that flags stale prices, missing quote source, missing notionals, and unresolved broker/local mismatches.
+- [x] Add a pre-trade data-quality gate so new BUY orders are blocked when the symbol has no fresh live price or current exposure data.
+- [x] Surface the data-quality report in the dashboard health/diagnostics view.
+- [x] Add a startup/live smoke-check endpoint or payload using the same diagnostics so failures are visible immediately.
+- [x] Add focused tests for stale-price blocking and diagnostics shape.
+- [x] Run backend/frontend verification and document the result.
+
+Review:
+- Added a pod-runtime data gate that blocks new BUY orders when the proposed symbol lacks a fresh positive price, quote source, or timestamp, while allowing SELL orders to reduce risk even when data is stale.
+- Added `SessionManager.get_data_quality_report()` plus `/api/data-quality`, and included the same report inside `/api/state-health` so startup/health panels show market-data problems immediately.
+- Updated Operations > Health to show market-data quality rows and recent data-gate blocks.
+- Verification: `python -m pytest tests\unit\test_pod_runtime_entry_thesis.py tests\unit\test_reconciliation.py tests\integration\test_web_service.py -q` passed with 54 tests; `node --check web\dist\dashboard.js` passed; `python -m py_compile src\pods\runtime\pod_runtime.py src\mission_control\session_manager.py src\web\server.py` passed.
+# Current Task - Research Feed v2
+
+Goal: make the news/research feed durable and auditable so we can see source health, item relevance, affected pods/factors/tickers, and whether important items were acted on or ignored.
+
+- [x] Map current research ingestion, dashboard feed, and state storage paths.
+- [x] Add a DuckDB-backed research feed store with source-health tracking.
+- [x] Normalize, dedupe, route, and persist RSS/news feed items centrally.
+- [x] Expose a backend research-feed endpoint with source health, routing, and action-audit fields.
+- [x] Add a dashboard view that shows the feed/system health without cluttering the existing News Feed.
+- [x] Add focused tests and run frontend/backend verification.
+
+---
+
+## Review - 2026-05-08
+
+- Added `ResearchFeedStore` for durable feed items, source health, routing metadata, and dedupe.
+- Expanded the direct news feed list from 25 to 35 configured sources while keeping the LLM scoring window at 25 items per cycle for cost/latency control.
+- Added `/api/research-feed`, including held-symbol matching, affected-pod routing, and action-audit status.
+- Added Research > Feed Audit UI with source-health and routed-item panels.
+- Verification passed: `python -m py_compile src\core\research_feed.py src\data\services\research_ingestion.py src\data\adapters\x_adapter.py src\mission_control\session_manager.py src\web\server.py`; `node --check web\dist\dashboard.js`; `python -m pytest tests\unit\test_research_feed_store.py tests\integration\test_web_service.py -q` with 45 passed. Pytest reported a non-blocking `.pytest_cache` permission warning.
+
+---
+
+# Current Task - Performance Attribution Clarity
+
+Goal: make daily losses explainable from the dashboard by using one consistent NAV baseline and splitting P&L into realized closed-trade impact versus open-position impact.
+
+- [x] Trace the current dashboard P&L calculations and available API data.
+- [x] Replace stale pod-summary daily P&L displays with NAV-history based daily changes.
+- [x] Correct firm cumulative P&L to use current firm NAV versus allocated starting capital.
+- [x] Add realized-today and open unrealized P&L columns to Pod Returns.
+- [x] Add top contributor attribution so losses can be traced to symbols and pods.
+- [x] Run focused frontend/API verification and document the result.
+
+Review:
+- Operations and Performance now use the same NAV-history baseline for "today": latest valid NAV minus the first valid NAV snapshot for the current UTC day.
+- Firm cumulative P&L now uses current firm NAV minus allocated starting capital, instead of the realized-only `firm_inception_pnl` counter.
+- Pod Returns now shows `Today P&L`, `Realized Today`, and `Open P&L`, each with a percentage where the relevant notional/capital base is available.
+- Pod Attribution now shows today's pod-level contribution plus top symbol contributors from open positions and today's closed trades.
+- Cache keys were bumped to `perf-attribution-20260508`.
+- Verification passed: `node --check web\dist\dashboard.js`; `python -m pytest tests\integration\test_web_dashboard_e2e.py -q` with 28 passed and one non-blocking `.pytest_cache` permission warning; live API sanity check showed firm today at about `-$5.65` with crypto open P&L the main current drag.
+
+# Current Task - Task-Adaptive LLM Routing
+
+Goal: replace the old single fallback model (`gpt-4o-mini`) with task-aware routing. The default should be GPT-5 mini, while higher-stakes reasoning paths can use stronger models through a central, configurable policy.
+
+## Implementation Checklist
+
+- [x] Add a central LLM task router in `src/core/llm.py`.
+- [x] Default direct OpenAI calls to `gpt-5-mini` and prefer OpenAI when an OpenAI key is available.
+- [x] Add stronger model tiers for PM decisions, thesis verification, governance, and position/loss reviews.
+- [x] Keep OpenRouter as a fallback/provider option and preserve environment overrides.
+- [x] Mark current LLM call sites with the right task labels.
+- [x] Add focused tests proving default, strong, and task-specific model selection.
+- [x] Run targeted verification and document results here.
+
+## Review Notes
+
+- Implemented task-aware routing in `src/core/llm.py`: default OpenAI calls now use `gpt-5-mini`, stronger reasoning tasks use `gpt-5`, and position/loss review tasks use `gpt-5.2` with automatic fallback to lower tiers if a model is unavailable.
+- LLM call sites now pass task labels for PM decisions/revisions, thesis verification, theme scanning, sentiment scoring, research, CEO/CIO governance, allocation, and position review.
+- Kept OpenRouter support as fallback/provider option. Runtime overrides are available through `LLM_PROVIDER_ORDER`, `OPENAI_MODEL_DEFAULT`, `OPENAI_MODEL_STRONG`, `OPENAI_MODEL_FRONTIER`, and task-specific variables like `OPENAI_MODEL_PM_DECISION`.
+- Verification: `py_compile` passed for modified Python files; `tests/unit/test_llm_controls.py` passed (7 tests); `tests/unit/test_llm_controls.py tests/test_sentiment_pipeline.py tests/unit/test_theme_scanner.py` passed (60 tests); `tests/agents/test_ceo_cio_agents.py tests/agents/test_cro_governance.py` passed (23 tests). Pytest still reports the existing `.pytest_cache` access warning on Windows.
+
+---
+
+# Current Task: Pod Loss Review / Risk Intervention Loop
+
+**Goal:** When a pod has a meaningfully bad day or one position drives an outsized loss, the system should explain what happened, ask for a PM/CRO/CIO style review, and block new risk until the review state clears.
+
+## Implementation Checklist
+
+- [x] Add a reusable loss-review evaluator for all four pods and all asset classes.
+- [x] Trigger the evaluator after mark-to-market and before pod PM decisions, so restrictions can affect the same iteration.
+- [x] Store each pod's active review and restriction in its namespace.
+- [x] Block risk-increasing orders in `PodRuntime` when a pod is in reduce-only / paused mode, while still allowing sells or other risk-reducing orders.
+- [x] Expose active and historical loss reviews through REST/WebSocket state.
+- [x] Add a Risk tab panel showing daily loss, top contributors, PM defense prompt, CRO action, CIO decision, and current restriction.
+- [x] Add focused tests for all-pod loss detection and runtime trade blocking.
+- [x] Run targeted verification and document results here.
+
+## Review Notes
+
+- Added an asset-class-agnostic loss-review evaluator in `src/core/loss_review.py` that flags watch/restricted/paused states from daily NAV loss and single-position NAV impact. The session manager now evaluates it after mark-to-market and before PM decisions, stores the active review/restriction in each pod namespace, persists the history in memory, and broadcasts it through the web snapshot/API.
+- `PodRuntime` now honors the active loss-review restriction: reduce-only/pause mode blocks new risk-increasing orders but still allows risk reductions. PM prompts for equities, FX, crypto, and commodities now receive the active loss-review text so the LLM is explicitly asked to defend, trim, exit, or wait rather than blindly add risk.
+- The Risk tab now has a Loss Review / Risk Intervention panel with pod status, daily P&L, open/realized impact, top contributors, CRO action, CIO decision, and the PM defense prompt.
+- Verification passed: `python -m pytest tests\unit\test_loss_review.py -v`, `python -m pytest tests\unit\test_pod_runtime_entry_thesis.py -v`, `python -m pytest tests\integration\test_web_service.py -v` with 44 passing tests, `node --check web\dist\dashboard.js`, and targeted `py_compile` for the backend/runtime/PM prompt files. Pytest emitted a non-blocking `.pytest_cache` permission warning.
 
 ---

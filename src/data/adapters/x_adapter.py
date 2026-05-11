@@ -43,14 +43,20 @@ FEED_SOURCES: list[dict] = [
     {"name": "FT",             "category": "Markets",      "url": "https://news.google.com/rss/search?q=site:ft.com+economy&hl=en-US&gl=US&ceid=US:en"},
     {"name": "WSJ",            "category": "Markets",      "url": "https://news.google.com/rss/search?q=site:wsj.com+markets&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Reuters Biz",    "category": "Markets",      "url": "https://news.google.com/rss/search?q=site:reuters.com+business&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Reuters Markets","category": "Markets",      "url": "https://news.google.com/rss/search?q=site:reuters.com+markets+stocks+bonds+commodities&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Investing.com",  "category": "Markets",      "url": "https://news.google.com/rss/search?q=site:investing.com+markets+commodities+forex&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Nikkei Asia",    "category": "Markets",      "url": "https://news.google.com/rss/search?q=site:asia.nikkei.com+markets+economy&hl=en-US&gl=US&ceid=US:en"},
 
     # --- Central Banks / Macro Policy ---
     {"name": "Central Banks",  "category": "Central Bank", "url": "https://news.google.com/rss/search?q=federal+reserve+ECB+bank+of+england+rate+decision&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Macro News",     "category": "Macro",        "url": "https://news.google.com/rss/search?q=macro+economy+federal+reserve+inflation&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Fed Watch",      "category": "Central Bank", "url": "https://news.google.com/rss/search?q=fed+rate+cut+hike+FOMC+minutes+powell&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Treasury Yields", "category": "Rates",       "url": "https://news.google.com/rss/search?q=US+Treasury+yields+real+yields+TIPS+dollar&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "ETF Flows",      "category": "Markets",      "url": "https://news.google.com/rss/search?q=ETF+flows+gold+bitcoin+equity+bond+fund+flows&hl=en-US&gl=US&ceid=US:en"},
 
     # --- Geopolitics / Trade ---
     {"name": "Geopolitics",    "category": "Geopolitics",  "url": "https://news.google.com/rss/search?q=geopolitics+sanctions+trade+war+tariff&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Shipping Risk",  "category": "Geopolitics",  "url": "https://news.google.com/rss/search?q=Strait+of+Hormuz+Red+Sea+shipping+oil+disruption&hl=en-US&gl=US&ceid=US:en"},
 
     # --- FX / Currencies ---
     {"name": "FX News",        "category": "FX",           "url": "https://news.google.com/rss/search?q=forex+currency+dollar+euro+yen+exchange+rate&hl=en-US&gl=US&ceid=US:en"},
@@ -62,6 +68,7 @@ FEED_SOURCES: list[dict] = [
     {"name": "CoinTelegraph",  "category": "Crypto",       "url": "https://cointelegraph.com/rss"},
     {"name": "The Block",      "category": "Crypto",       "url": "https://www.theblock.co/rss.xml"},
     {"name": "Decrypt",        "category": "Crypto",       "url": "https://news.google.com/rss/search?q=site:decrypt.co+crypto&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Crypto Regulation", "category": "Crypto",    "url": "https://news.google.com/rss/search?q=stablecoin+defi+SEC+crypto+regulation+ETF&hl=en-US&gl=US&ceid=US:en"},
 
     # --- Commodities / Energy ---
     {"name": "Oil & Energy",   "category": "Commodities",  "url": "https://news.google.com/rss/search?q=crude+oil+OPEC+natural+gas+energy+prices&hl=en-US&gl=US&ceid=US:en"},
@@ -69,6 +76,9 @@ FEED_SOURCES: list[dict] = [
     {"name": "Agriculture",    "category": "Commodities",  "url": "https://news.google.com/rss/search?q=wheat+corn+soybean+agriculture+commodity+prices&hl=en-US&gl=US&ceid=US:en"},
     {"name": "Kitco",          "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:kitco.com+gold&hl=en-US&gl=US&ceid=US:en"},
     {"name": "OilPrice",       "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:oilprice.com&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "EIA Energy",     "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:eia.gov+oil+natural+gas+inventory+prices&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Mining.com",     "category": "Commodities",  "url": "https://news.google.com/rss/search?q=site:mining.com+gold+copper+mining+metals&hl=en-US&gl=US&ceid=US:en"},
+    {"name": "Crop Weather",   "category": "Commodities",  "url": "https://news.google.com/rss/search?q=crop+weather+wheat+corn+soybeans+grain+prices&hl=en-US&gl=US&ceid=US:en"},
 ]
 
 COOLDOWN = timedelta(minutes=5)
@@ -141,6 +151,29 @@ class XAdapter:
     def get_dashboard_headlines(self) -> list[dict]:
         """Return the latest 100 headlines for dashboard display."""
         return self._all_headlines[:DASHBOARD_LIMIT]
+
+    def get_feed_health(self) -> list[dict]:
+        """Return configured feed health for dashboard/source audit."""
+        counts: dict[str, int] = {}
+        for item in self._all_headlines:
+            source = str(item.get("username") or item.get("source") or "").strip()
+            if source:
+                counts[source] = counts.get(source, 0) + 1
+
+        rows: list[dict] = []
+        for cfg in self._feeds:
+            name = cfg["name"]
+            failures = int(self._feed_health.get(name, 0) or 0)
+            status = "ok" if failures == 0 else "stale" if failures < 3 else "error"
+            rows.append({
+                "source": name,
+                "source_type": "news",
+                "status": status,
+                "item_count": counts.get(name, 0),
+                "consecutive_failures": failures,
+                "error": "" if status == "ok" else "No recent entries returned",
+            })
+        return rows
 
     def _fetch_one_feed(self, feed_cfg: dict) -> list[dict]:
         """Fetch a single RSS feed (called in parallel from thread pool)."""

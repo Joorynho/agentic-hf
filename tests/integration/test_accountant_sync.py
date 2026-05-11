@@ -129,17 +129,23 @@ class TestAccountantRecordFill:
             "order_id": None, "symbol": "AAPL", "qty": 10, "side": "buy",
             "status": "REJECTED", "filled_qty": 0.0,
             "filled_avg_price": None, "filled_at": None,
+            "reason": "asset is not tradable",
+            "rejection_detail": "asset is not tradable",
+            "stage": "preflight",
         }
         mock_alpaca.place_order = AsyncMock(return_value=rejected)
         ns.set("last_risk_token", _make_token())
 
         order = _make_order("AAPL", Side.BUY, 10.0)
-        await trader.run_cycle({
+        result = await trader.run_cycle({
             "approved_order": order,
             "mandate": None,
             "risk_halt": False,
         })
 
+        assert result["execution_result"]["reason"] == "asset is not tradable"
+        assert result["execution_result"]["stage"] == "preflight"
+        assert ns.get("execution_feedback")[0]["stage"] == "preflight"
         assert len(accountant.current_positions) == 0
         assert accountant.nav == 100_000.0
 

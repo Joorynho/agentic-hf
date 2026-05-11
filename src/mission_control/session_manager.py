@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,7 @@ from src.backtest.accounting.portfolio import PortfolioAccountant
 from src.core.position_monitor import PositionMonitor
 from src.core.position_aging import check_aging
 from src.core.concentration import aggregate_exposure
+from src.core.loss_review import build_loss_review, format_loss_review_for_prompt
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
 from src.core.state.nav_store import NavStore
@@ -36,7 +38,12 @@ from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.data.adapters.rss_adapter import RssAdapter
 from src.data.adapters.x_adapter import XAdapter
 from src.data.services.research_ingestion import ResearchIngestionService
-from src.data.adapters.price_service import PriceService
+from src.data.adapters.price_service import (
+    PriceService,
+    canonical_crypto_symbol,
+    is_crypto_symbol,
+    symbol_aliases,
+)
 from src.data.adapters.stockprices_adapter import StockPricesAdapter
 from src.data.adapters.coinmarketcap_adapter import CoinMarketCapAdapter
 from src.data.adapters.alphavantage_adapter import AlphaVantageAdapter
@@ -212,6 +219,14 @@ class SessionManager:
         self._last_total_realized_snapshot: float = 0.0
         self._last_drawdown_tier: str = "none"
         self._cro_agent = None
+        self._last_broker_reconciliation: dict | None = None
+        self._broker_reconciliation_timeout_s: float = 2.5
+        self._last_position_price_refresh_at: float = 0.0
+        self._position_price_refresh_min_interval_s: float = 20.0
+        self._position_price_refresh_lock = asyncio.Lock()
+        self._loss_reviews: dict[str, dict] = {}
+        self._loss_review_history: list[dict] = []
+        self._loss_review_last_signature: dict[str, str] = {}
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
@@ -222,13 +237,13 @@ class SessionManager:
 
     async def start_live_session(
         self,
-        capital_per_pod: float = 100.0,
+        capital_per_pod: float = 1000.0,
         initial_symbols: list[str] | None = None,
     ) -> None:
         """Start a live trading session.
 
         Args:
-            capital_per_pod: Initial capital per pod (default $100)
+            capital_per_pod: Initial capital per pod (default $1000)
             initial_symbols: Symbols to trade (default ['AAPL', 'MSFT', 'GOOGL', 'TSLA', 'AMZN'])
         """
         if initial_symbols is None:
@@ -246,6 +261,9 @@ class SessionManager:
             self._pod_gateways = {}
             self._pod_capital = {}
             self._iteration = 0
+            self._loss_reviews = {}
+            self._loss_review_history = []
+            self._loss_review_last_signature = {}
 
         self._start_time = datetime.now()
         self._session_start = datetime.now()
@@ -257,6 +275,12 @@ class SessionManager:
                 pass
             self._nav_store = None
         self._nav_store = NavStore(str(self._MEMORY_DIR / "state.db"))
+        try:
+            repaired = self._nav_store.repair_collapsed_snapshots()
+            if repaired:
+                logger.info("[session_manager] Repaired %d collapsed NAV snapshot(s)", repaired)
+        except Exception as e:
+            logger.debug("[session_manager] NAV history repair skipped: %s", e)
         self._benchmark_adapter = BenchmarkAdapter()
         self._benchmark_returns = {}
         self._capital_per_pod = capital_per_pod
@@ -459,6 +483,7 @@ class SessionManager:
                 rss_adapter=getattr(self, "_rss_adapter", None),
                 x_adapter=getattr(self, "_x_adapter", None),
                 interval_seconds=300,
+                feed_store_path=str(self._MEMORY_DIR / "research_feed.duckdb"),
             )
             logger.info("[session_manager] ResearchIngestionService created")
 
@@ -545,6 +570,22 @@ class SessionManager:
                 if restored_gov:
                     self._governance_decisions = list(restored_gov)
                     logger.info("[session_manager] Restored %d governance decisions from memory", len(restored_gov))
+
+                restored_loss = self._restored_memory.get("loss_reviews", {}) or {}
+                if isinstance(restored_loss, dict):
+                    self._loss_reviews = dict(restored_loss.get("active", {}) or {})
+                    self._loss_review_history = list(restored_loss.get("history", []) or [])[-100:]
+                    for _pid, _review in self._loss_reviews.items():
+                        rt = self._pod_runtimes.get(_pid)
+                        if rt and isinstance(_review, dict):
+                            rt._ns.set("loss_review", _review)
+                            rt._ns.set("loss_review_restriction", _review.get("restriction", {}))
+                    if self._loss_reviews or self._loss_review_history:
+                        logger.info(
+                            "[session_manager] Restored loss reviews: %d active, %d historical",
+                            len(self._loss_reviews),
+                            len(self._loss_review_history),
+                        )
 
                 # Restore research enrichment data to pod namespaces
                 restored_enrichment = self._restored_memory.get("enrichment", {})
@@ -701,6 +742,8 @@ class SessionManager:
                     pod_dicts[pod_id]["x_tweet_count"] = len(all_feed)
                     pod_dicts[pod_id]["news_last_refresh"] = datetime.now(timezone.utc).isoformat()
                     pod_dicts[pod_id]["features"] = ns.get("features") or {}
+                    pod_dicts[pod_id]["loss_review"] = ns.get("loss_review") or {}
+                    pod_dicts[pod_id]["loss_review_restriction"] = ns.get("loss_review_restriction") or {}
 
             await self._web_app.state.update_session_state(
                 iteration=self._iteration,
@@ -712,9 +755,129 @@ class SessionManager:
                 firm_peak_nav=self._firm_peak_nav,
                 benchmark_returns=self._benchmark_returns,
                 drawdown_tier=self._last_drawdown_tier,
+                loss_reviews=self.get_loss_review_report(),
             )
         except Exception as e:
             logger.debug("[session_manager] Failed to update web state: %s", e)
+
+    def _today_baseline_nav(self, pod_id: str, fallback: float) -> float:
+        """First persisted NAV for this pod today, falling back to starting capital."""
+        fallback = float(fallback or 0.0)
+        if not self._nav_store:
+            return fallback
+        try:
+            today = datetime.now(timezone.utc).date()
+            rows = self._nav_store.read_history(pod_id=pod_id, limit=2000)
+            for row in rows:
+                ts = str(row.get("ts") or "")
+                if not ts:
+                    continue
+                try:
+                    parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    if parsed.astimezone(timezone.utc).date() == today:
+                        nav = float(row.get("nav") or 0.0)
+                        if nav > 0:
+                            return nav
+                except Exception:
+                    continue
+        except Exception as e:
+            logger.debug("[session_manager] loss review baseline failed for %s: %s", pod_id, e)
+        return fallback
+
+    async def _refresh_loss_reviews(self) -> None:
+        """Evaluate pod-level loss reviews and push restrictions into runtimes."""
+        now = datetime.now(timezone.utc)
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            if not acct:
+                continue
+            try:
+                nav = float(acct.nav)
+                starting = float(getattr(acct, "starting_capital", self._capital_per_pod) or self._capital_per_pod or nav)
+                baseline = self._today_baseline_nav(pod_id, starting)
+                review = build_loss_review(
+                    pod_id=pod_id,
+                    nav=nav,
+                    starting_capital=starting,
+                    positions=acct.current_positions.values(),
+                    closed_trades=acct.closed_trades,
+                    baseline_nav=baseline,
+                    now=now,
+                    iteration=self._iteration,
+                )
+
+                previous = self._loss_reviews.get(pod_id, {})
+                if previous.get("created_at") and previous.get("status") == review.get("status"):
+                    review["created_at"] = previous.get("created_at")
+
+                self._loss_reviews[pod_id] = review
+                runtime._ns.set("loss_review", review)
+                runtime._ns.set("loss_review_restriction", review.get("restriction", {}))
+                runtime._ns.set("loss_review_text", format_loss_review_for_prompt(review))
+
+                signature = f"{review.get('status')}|{review.get('trigger_reason')}"
+                changed = self._loss_review_last_signature.get(pod_id) != signature
+                if changed:
+                    self._loss_review_last_signature[pod_id] = signature
+
+                should_emit = review.get("triggered") and (changed or self._iteration % 5 == 0)
+                if should_emit:
+                    entry = dict(review)
+                    self._loss_review_history.insert(0, entry)
+                    self._loss_review_history = self._loss_review_history[:100]
+                    try:
+                        await self._event_bus.publish(
+                            "risk.alert",
+                            AgentMessage(
+                                timestamp=now,
+                                sender="cro",
+                                recipient="dashboard",
+                                topic="risk.alert",
+                                payload={
+                                    "pod_id": pod_id,
+                                    "message": f"{pod_id.upper()} loss review: {review.get('trigger_reason')}",
+                                    "severity": review.get("severity", "warning"),
+                                    "action": "loss_review",
+                                    "loss_review": review,
+                                },
+                            ),
+                            publisher_id="cro",
+                        )
+                        await self._event_bus.publish(
+                            "agent.activity",
+                            AgentMessage(
+                                timestamp=now,
+                                sender="cro",
+                                recipient="dashboard",
+                                topic="agent.activity",
+                                payload={
+                                    "agent_id": "cro",
+                                    "agent_role": "CRO",
+                                    "pod_id": pod_id,
+                                    "action": "loss_review",
+                                    "summary": f"{pod_id.upper()} loss review: {review.get('status', 'watch').upper()}",
+                                    "detail": review.get("pm_defense_prompt", ""),
+                                },
+                            ),
+                            publisher_id="cro",
+                        )
+                    except Exception as e:
+                        logger.debug("[session_manager] loss review alert failed for %s: %s", pod_id, e)
+            except Exception as e:
+                logger.debug("[session_manager] loss review failed for %s: %s", pod_id, e)
+
+    def get_loss_review_report(self) -> dict:
+        """Return active and historical pod loss reviews for the dashboard."""
+        active = dict(self._loss_reviews)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "active": active,
+            "history": list(self._loss_review_history[:100]),
+            "count": len(active),
+            "triggered_count": sum(1 for r in active.values() if r.get("triggered")),
+        }
 
     async def run_event_loop(
         self,
@@ -830,6 +993,7 @@ class SessionManager:
                             continue
 
                         tick_prices = {}
+                        tick_sources = {}
                         latest_bar = None
                         bars_count = 0
                         for symbol in bars:
@@ -837,6 +1001,7 @@ class SessionManager:
                                 try:
                                     await gateway.push_bar(bar)
                                     tick_prices[bar.symbol] = bar.close
+                                    tick_sources[bar.symbol] = f"bar:{bar.source}"
                                     latest_bar = bar
                                     bars_count += 1
                                 except Exception as e:
@@ -845,7 +1010,8 @@ class SessionManager:
                         if tick_prices:
                             accountant = runtime._ns.get("accountant")
                             if accountant:
-                                accountant.mark_to_market(tick_prices)
+                                accountant.mark_to_market(tick_prices, price_sources=tick_sources)
+                            self._store_runtime_prices(runtime, tick_prices, tick_sources)
 
                         pod_latest_bars[pod_id] = latest_bar
                         logger.info("[session_manager] [iter %d] Pod %s: ingested %d bars, mark-to-market done",
@@ -853,6 +1019,9 @@ class SessionManager:
 
                     # 5b. Position monitor — check for stop-loss / take-profit / max-hold breaches
                     await self._run_position_monitor()
+
+                    # 5c. Loss review / intervention: evaluate before PMs can add new risk.
+                    await self._refresh_loss_reviews()
 
                     # 5. Build cross-pod intelligence memos and run agent cycles
                     self._inject_firm_memos()
@@ -1225,10 +1394,11 @@ class SessionManager:
                 pass
             if hasattr(self, "_research_ingestion") and self._research_ingestion:
                 await self._research_ingestion.stop()
+                self._research_ingestion.close()
             await self.stop_session()
 
     async def _run_price_ticker(self) -> None:
-        """Background task: refresh live prices every 60 seconds via Alpaca positions API.
+        """Background task: refresh live prices every 60 seconds.
 
         Runs independently of the main iteration loop so the dashboard always
         shows reasonably fresh prices and unrealized P&L.
@@ -1236,23 +1406,7 @@ class SessionManager:
         await asyncio.sleep(5)
         while self._session_active:
             try:
-                live = await self._alpaca.get_open_positions()
-                if not live:
-                    await asyncio.sleep(60)
-                    continue
-
-                updated_count = 0
-                for pod_id, rt in self._pod_runtimes.items():
-                    acct = rt._ns.get("accountant")
-                    if not acct:
-                        continue
-                    tick_prices: dict[str, float] = {}
-                    for sym, pos_data in acct._positions.items():
-                        if pos_data.get("quantity", 0) != 0 and sym in live:
-                            tick_prices[sym] = live[sym]["current_price"]
-                    if tick_prices:
-                        acct.mark_to_market(tick_prices)
-                        updated_count += len(tick_prices)
+                refresh = await self.refresh_live_position_prices_if_due(force=True)
 
                 for pod_id, gateway in self._pod_gateways.items():
                     rt = self._pod_runtimes[pod_id]
@@ -1263,13 +1417,213 @@ class SessionManager:
                         pass
 
                 logger.info("[session_manager] Price ticker: refreshed %d prices across %d symbols",
-                           updated_count, len(live))
+                           refresh["updated_count"], refresh["live_symbol_count"])
             except asyncio.CancelledError:
                 return
             except Exception as e:
                 logger.warning("[session_manager] Price ticker failed (non-fatal): %s", e)
 
             await asyncio.sleep(60)
+
+    async def refresh_live_position_prices_if_due(self, *, force: bool = False) -> dict:
+        """Refresh open-position prices, throttled for dashboard/API callers."""
+        now = time.monotonic()
+        min_interval = float(getattr(self, "_position_price_refresh_min_interval_s", 20.0) or 20.0)
+        last = float(getattr(self, "_last_position_price_refresh_at", 0.0) or 0.0)
+        if not force and last and (now - last) < min_interval:
+            return {
+                "skipped": True,
+                "reason": "recent",
+                "updated_count": 0,
+                "live_symbol_count": 0,
+                "crypto_quote_count": 0,
+            }
+
+        lock = getattr(self, "_position_price_refresh_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._position_price_refresh_lock = lock
+        if lock.locked() and not force:
+            return {
+                "skipped": True,
+                "reason": "in_progress",
+                "updated_count": 0,
+                "live_symbol_count": 0,
+                "crypto_quote_count": 0,
+            }
+
+        async with lock:
+            now = time.monotonic()
+            last = float(getattr(self, "_last_position_price_refresh_at", 0.0) or 0.0)
+            if not force and last and (now - last) < min_interval:
+                return {
+                    "skipped": True,
+                    "reason": "recent",
+                    "updated_count": 0,
+                    "live_symbol_count": 0,
+                    "crypto_quote_count": 0,
+                }
+            refresh = await self._refresh_live_position_prices()
+            self._last_position_price_refresh_at = time.monotonic()
+            return refresh
+
+    @staticmethod
+    def _dict_by_symbol_alias(rows: dict[str, dict]) -> dict[str, dict]:
+        indexed: dict[str, dict] = {}
+        for symbol, row in (rows or {}).items():
+            for alias in symbol_aliases(symbol):
+                indexed.setdefault(alias, row)
+        return indexed
+
+    @staticmethod
+    def _lookup_symbol_alias(rows_by_alias: dict[str, dict], symbol: str) -> dict | None:
+        for alias in symbol_aliases(symbol):
+            if alias in rows_by_alias:
+                return rows_by_alias[alias]
+        return None
+
+    @staticmethod
+    def _valid_price(value) -> float | None:
+        try:
+            price = float(value)
+        except Exception:
+            return None
+        return price if price > 0 else None
+
+    def _held_crypto_symbols(self) -> set[str]:
+        held_crypto_symbols: set[str] = set()
+        for rt in self._pod_runtimes.values():
+            acct = rt._ns.get("accountant")
+            if not acct:
+                continue
+            for sym, pos_data in acct._positions.items():
+                if pos_data.get("quantity", 0) != 0 and is_crypto_symbol(sym):
+                    held_crypto_symbols.add(canonical_crypto_symbol(sym))
+        return held_crypto_symbols
+
+    async def _fetch_crypto_position_quotes(self, symbols: set[str]) -> dict[str, dict]:
+        """Fetch crypto marks from broker market data first, then external quote service."""
+        if not symbols:
+            return {}
+
+        ordered = sorted(symbols)
+        quotes: dict[str, dict] = {}
+        errors: list[str] = []
+
+        alpaca_fetch = getattr(self._alpaca, "fetch_crypto_quotes", None)
+        if callable(alpaca_fetch):
+            try:
+                broker_quotes = await asyncio.wait_for(alpaca_fetch(ordered), timeout=3.5)
+                if broker_quotes:
+                    quotes.update(broker_quotes)
+            except asyncio.TimeoutError:
+                errors.append("Alpaca crypto quote fetch timed out")
+            except Exception as exc:
+                errors.append(f"Alpaca crypto quote fetch failed: {exc}")
+
+        quotes_by_alias = self._dict_by_symbol_alias(quotes)
+        missing = [
+            symbol for symbol in ordered
+            if self._lookup_symbol_alias(quotes_by_alias, symbol) is None
+        ]
+
+        price_service = getattr(self, "_price_service", None)
+        if price_service and missing:
+            try:
+                service_quotes = await asyncio.wait_for(
+                    price_service.get_quotes(missing),
+                    timeout=6.0,
+                )
+                if service_quotes:
+                    quotes.update(service_quotes)
+            except asyncio.TimeoutError:
+                errors.append("Crypto quote fallback timed out")
+            except Exception as exc:
+                errors.append(f"Crypto quote fallback failed: {exc}")
+
+        for error in errors:
+            logger.debug("[session_manager] %s", error)
+        return quotes
+
+    async def _refresh_live_position_prices(self) -> dict:
+        """Refresh accountant marks from broker positions plus crypto quote fallback."""
+        held_crypto_symbols = self._held_crypto_symbols()
+
+        live, live_error = await self._broker_diagnostic_call(
+            "Position price refresh",
+            self._alpaca.get_open_positions(),
+            {},
+        )
+        if live_error:
+            logger.debug("[session_manager] %s", live_error)
+        live_by_alias = self._dict_by_symbol_alias(live)
+
+        crypto_quotes = await self._fetch_crypto_position_quotes(held_crypto_symbols)
+        crypto_quotes_by_alias = self._dict_by_symbol_alias(crypto_quotes)
+
+        updated_count = 0
+        for rt in self._pod_runtimes.values():
+            acct = rt._ns.get("accountant")
+            if not acct:
+                continue
+            tick_prices: dict[str, float] = {}
+            price_sources: dict[str, str] = {}
+            for sym, pos_data in acct._positions.items():
+                if pos_data.get("quantity", 0) == 0:
+                    continue
+
+                broker_pos = self._lookup_symbol_alias(live_by_alias, sym)
+                broker_price = self._valid_price((broker_pos or {}).get("current_price"))
+                if broker_price is not None:
+                    tick_prices[sym] = broker_price
+                    price_sources[sym] = "alpaca"
+
+                if is_crypto_symbol(sym):
+                    quote = self._lookup_symbol_alias(crypto_quotes_by_alias, sym)
+                    quote_price = self._valid_price((quote or {}).get("price"))
+                    if quote_price is not None:
+                        tick_prices[sym] = quote_price
+                        price_sources[sym] = str(quote.get("source") or "crypto_quote")
+
+            if tick_prices:
+                acct.mark_to_market(tick_prices, price_sources=price_sources)
+                self._store_runtime_prices(rt, tick_prices, price_sources)
+                updated_count += len(tick_prices)
+
+        return {
+            "updated_count": updated_count,
+            "live_symbol_count": len(live or {}),
+            "crypto_quote_count": len(crypto_quotes or {}),
+            "errors": [live_error] if live_error else [],
+        }
+
+    def _store_runtime_prices(
+        self,
+        runtime,
+        prices: dict[str, float],
+        price_sources: dict[str, str] | None = None,
+    ) -> None:
+        """Keep the pod namespace aligned with the latest mark-to-market prices."""
+        if not runtime or not prices:
+            return
+        price_sources = price_sources or {}
+        now_iso = datetime.now(timezone.utc).isoformat()
+        last_prices = dict(runtime._ns.get("last_prices") or {})
+        last_sources = dict(runtime._ns.get("last_price_sources") or {})
+        last_updated = dict(runtime._ns.get("last_price_updated_at") or {})
+        for symbol, price in prices.items():
+            try:
+                numeric_price = float(price)
+            except (TypeError, ValueError):
+                continue
+            if numeric_price <= 0:
+                continue
+            last_prices[symbol] = numeric_price
+            last_sources[symbol] = price_sources.get(symbol) or "market"
+            last_updated[symbol] = now_iso
+        runtime._ns.set("last_prices", last_prices)
+        runtime._ns.set("last_price_sources", last_sources)
+        runtime._ns.set("last_price_updated_at", last_updated)
 
     async def _maybe_run_position_review(self) -> None:
         """Run position review if the date has changed since last review."""
@@ -1666,12 +2020,13 @@ class SessionManager:
         """
         try:
             alpaca_positions = await self._alpaca.get_open_positions()
+            alpaca_positions_by_alias = self._dict_by_symbol_alias(alpaca_positions)
             for pod_id, runtime in self._pod_runtimes.items():
                 accountant = runtime._ns.get("accountant")
                 if not accountant:
                     continue
                 for symbol, snapshot in accountant.current_positions.items():
-                    alpaca_pos = alpaca_positions.get(symbol)
+                    alpaca_pos = self._lookup_symbol_alias(alpaca_positions_by_alias, symbol)
                     if alpaca_pos is None:
                         logger.warning(
                             "[reconcile] %s has %s in accountant but NOT in Alpaca",
@@ -1686,21 +2041,693 @@ class SessionManager:
             logger.warning("[reconcile] Position reconciliation failed: %s", e)
 
         try:
-            from datetime import datetime, timezone
-            open_orders = await self._alpaca.get_all_open_orders()
-            now = datetime.now(timezone.utc)
-            for o in open_orders:
-                submitted = o.get("submitted_at")
-                if submitted and hasattr(submitted, "timestamp"):
-                    age_s = (now - submitted.replace(tzinfo=timezone.utc)).total_seconds()
-                    if age_s > 60:
-                        logger.warning(
-                            "[reconcile] Cancelling stale order %s (%s, %.0fs old)",
-                            o["order_id"], o["symbol"], age_s,
-                        )
-                        await self._alpaca.cancel_order(o["order_id"])
+            await self.reconcile_execution_state()
         except Exception as e:
             logger.debug("[reconcile] Stale order cleanup skipped: %s", e)
+
+    @staticmethod
+    def _signed_broker_qty(position: dict) -> float:
+        qty = float((position or {}).get("qty") or 0.0)
+        side = str((position or {}).get("side") or "long").lower()
+        return -abs(qty) if side == "short" else abs(qty)
+
+    @staticmethod
+    def _order_age_seconds(submitted_at, now: datetime) -> float | None:
+        if not submitted_at:
+            return None
+        try:
+            if isinstance(submitted_at, str):
+                submitted = datetime.fromisoformat(submitted_at.replace("Z", "+00:00"))
+            else:
+                submitted = submitted_at
+            if submitted.tzinfo is None:
+                submitted = submitted.replace(tzinfo=timezone.utc)
+            return (now - submitted.astimezone(timezone.utc)).total_seconds()
+        except Exception:
+            return None
+
+    def _local_positions_by_symbol(self) -> dict[str, dict]:
+        local: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            accountant = runtime._ns.get("accountant")
+            if not accountant:
+                continue
+            for symbol, snap in accountant.current_positions.items():
+                qty = float(getattr(snap, "qty", 0.0) or 0.0)
+                if abs(qty) <= 1e-9:
+                    continue
+                current_price = float(getattr(snap, "current_price", 0.0) or 0.0)
+                notional = abs(qty * current_price)
+                row = local.setdefault(
+                    symbol,
+                    {"symbol": symbol, "qty": 0.0, "notional": 0.0, "pods": []},
+                )
+                row["qty"] += qty
+                row["notional"] += notional
+                row["pods"].append({
+                    "pod_id": pod_id,
+                    "qty": qty,
+                    "current_price": current_price,
+                    "notional": notional,
+                })
+        return local
+
+    async def _broker_diagnostic_call(self, label: str, awaitable, default):
+        """Run a broker diagnostic read without letting the dashboard hang."""
+        timeout_s = max(0.1, float(getattr(self, "_broker_reconciliation_timeout_s", 2.5) or 2.5))
+        try:
+            return await asyncio.wait_for(awaitable, timeout=timeout_s), None
+        except asyncio.TimeoutError:
+            return default, f"{label} timed out after {timeout_s:.1f}s"
+        except Exception as exc:
+            return default, f"{label} failed: {exc}"
+
+    async def get_broker_reconciliation(self) -> dict:
+        """Return a local-vs-Alpaca reconciliation payload for the dashboard."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        errors: list[str] = []
+
+        (account, account_error), (broker_positions, position_error), (open_orders, order_error) = await asyncio.gather(
+            self._broker_diagnostic_call("Account fetch", self._alpaca.fetch_account(), {}),
+            self._broker_diagnostic_call("Position fetch", self._alpaca.get_open_positions(), {}),
+            self._broker_diagnostic_call("Open order fetch", self._alpaca.get_all_open_orders(), []),
+        )
+        errors.extend(e for e in (account_error, position_error, order_error) if e)
+
+        local_positions = self._local_positions_by_symbol()
+        local_by_alias = self._dict_by_symbol_alias(local_positions)
+        broker_rows: dict[str, dict] = {}
+        for broker_symbol, broker in (broker_positions or {}).items():
+            local_match = self._lookup_symbol_alias(local_by_alias, broker_symbol)
+            display_symbol = (
+                local_match.get("symbol")
+                if local_match
+                else canonical_crypto_symbol(broker_symbol) if is_crypto_symbol(broker_symbol) else broker_symbol
+            )
+            row = dict(broker)
+            row["_broker_symbol"] = broker_symbol
+            broker_rows[display_symbol] = row
+
+        rows: list[dict] = []
+        mismatches: list[dict] = []
+        for symbol in sorted(set(local_positions) | set(broker_rows)):
+            local = local_positions.get(
+                symbol,
+                {"symbol": symbol, "qty": 0.0, "notional": 0.0, "pods": []},
+            )
+            broker = broker_rows.get(symbol, {})
+            local_qty = float(local.get("qty") or 0.0)
+            broker_qty = self._signed_broker_qty(broker) if broker else 0.0
+            delta = broker_qty - local_qty
+            status = "OK"
+            if broker and symbol not in local_positions:
+                status = "BROKER_ONLY"
+            elif symbol in local_positions and not broker:
+                status = "LOCAL_ONLY"
+            elif abs(delta) > 0.01:
+                status = "QTY_MISMATCH"
+
+            row = {
+                "symbol": symbol,
+                "status": status,
+                "local_qty": round(local_qty, 6),
+                "broker_qty": round(broker_qty, 6),
+                "qty_delta": round(delta, 6),
+                "local_notional": round(float(local.get("notional") or 0.0), 4),
+                "broker_price": broker.get("current_price"),
+                "broker_unrealized_pl": broker.get("unrealized_pl"),
+                "broker_symbol": broker.get("_broker_symbol", symbol),
+                "pods": local.get("pods", []),
+            }
+            rows.append(row)
+            if status != "OK":
+                mismatches.append(row)
+
+        payload = {
+            "generated_at": generated_at,
+            "account": account or {},
+            "positions": rows,
+            "mismatches": mismatches,
+            "open_orders": open_orders or [],
+            "errors": errors,
+            "status": "OK" if not mismatches and not errors else "CHECK",
+            "source": "live_broker" if not errors else "partial_broker",
+        }
+        self._last_broker_reconciliation = payload
+        return payload
+
+    @staticmethod
+    def _position_price_age_seconds(price_updated_at: str | None) -> float | None:
+        if not price_updated_at:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(price_updated_at).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts.astimezone(timezone.utc)).total_seconds()
+        except Exception:
+            return None
+
+    def get_data_quality_report(self) -> dict:
+        """Return market-data freshness and notional integrity diagnostics."""
+        rows: list[dict] = []
+        failures: list[dict] = []
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            if not acct:
+                continue
+            for symbol, snap in acct.current_positions.items():
+                qty = float(getattr(snap, "qty", 0.0) or 0.0)
+                current_price = float(getattr(snap, "current_price", 0.0) or 0.0)
+                cost_basis = float(getattr(snap, "cost_basis", 0.0) or 0.0)
+                current_notional = abs(float(getattr(snap, "current_notional", qty * current_price) or 0.0))
+                entry_notional = abs(float(getattr(snap, "entry_notional", qty * cost_basis) or 0.0))
+                price_source = str(getattr(snap, "price_source", "") or "")
+                price_updated_at = str(getattr(snap, "price_updated_at", "") or "")
+                price_age_s = self._position_price_age_seconds(price_updated_at)
+                issues: list[str] = []
+                if current_price <= 0:
+                    issues.append("missing current price")
+                if not price_source:
+                    issues.append("missing price source")
+                if not price_updated_at:
+                    issues.append("missing price timestamp")
+                if bool(getattr(snap, "price_stale", False)):
+                    issues.append("stale price")
+                if current_notional <= 0:
+                    issues.append("missing current notional")
+                if entry_notional <= 0:
+                    issues.append("missing entry notional")
+                rows.append({
+                    "pod_id": pod_id,
+                    "symbol": symbol,
+                    "status": "OK" if not issues else "CHECK",
+                    "issues": issues,
+                    "qty": round(qty, 8),
+                    "cost_basis": round(cost_basis, 8),
+                    "current_price": round(current_price, 8),
+                    "entry_notional": round(entry_notional, 4),
+                    "current_notional": round(current_notional, 4),
+                    "price_source": price_source,
+                    "price_updated_at": price_updated_at,
+                    "price_age_seconds": round(price_age_s, 1) if price_age_s is not None else None,
+                    "price_stale": bool(getattr(snap, "price_stale", False)),
+                })
+
+            for failure in list(runtime._ns.get("data_quality_failures") or [])[:20]:
+                if isinstance(failure, dict):
+                    item = dict(failure)
+                    item.setdefault("pod_id", pod_id)
+                    failures.append(item)
+
+        broker = self._last_broker_reconciliation or {}
+        mismatch_count = len(broker.get("mismatches", []) or []) if broker else None
+        stale_count = sum(1 for row in rows if row.get("price_stale"))
+        missing_source_count = sum(1 for row in rows if not row.get("price_source"))
+        missing_notional_count = sum(1 for row in rows if row.get("current_notional", 0) <= 0)
+        check_count = sum(1 for row in rows if row.get("status") != "OK")
+        status = "OK" if check_count == 0 and not failures else "CHECK"
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+            "position_count": len(rows),
+            "check_count": check_count,
+            "stale_price_count": stale_count,
+            "missing_source_count": missing_source_count,
+            "missing_notional_count": missing_notional_count,
+            "blocked_trade_count": len(failures),
+            "broker_mismatch_count": mismatch_count,
+            "positions": rows,
+            "recent_failures": failures[:20],
+        }
+
+    def _held_symbols_by_pod(self) -> dict[str, list[str]]:
+        held: dict[str, list[str]] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            symbols = []
+            if acct:
+                symbols = [str(symbol).upper() for symbol in acct.current_positions.keys()]
+            held[pod_id] = symbols
+        return held
+
+    def _research_action_events(self, listener_state: dict | None = None) -> list[dict]:
+        listener_state = listener_state or {}
+        events: list[dict] = []
+
+        for bucket in ("recent_activity", "recent_orders", "recent_trades", "recent_governance"):
+            for msg in listener_state.get(bucket, []) or []:
+                data = msg.get("data", {}) if isinstance(msg, dict) else {}
+                if not isinstance(data, dict):
+                    continue
+                text = " ".join(str(data.get(k, "")) for k in (
+                    "summary", "detail", "reason", "reasoning", "decision", "symbol", "side", "action"
+                ))
+                events.append({
+                    "ts": msg.get("timestamp") or data.get("timestamp") or data.get("submitted_at"),
+                    "kind": bucket,
+                    "pod_id": str(data.get("pod_id") or ("firm" if bucket == "recent_governance" else "")).lower(),
+                    "symbol": str(data.get("symbol") or "").upper(),
+                    "action": str(data.get("action") or data.get("side") or data.get("decision") or bucket),
+                    "status": str(data.get("status") or "INFO").upper(),
+                    "text": text,
+                })
+
+        if not events and self._audit_log:
+            try:
+                for msg in self._audit_log.recent_messages(limit=200):
+                    payload = msg.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    text = " ".join(str(payload.get(k, "")) for k in (
+                        "summary", "detail", "reason", "reasoning", "decision", "symbol", "side", "action"
+                    ))
+                    events.append({
+                        "ts": msg.get("timestamp"),
+                        "kind": msg.get("topic", "audit"),
+                        "pod_id": str(payload.get("pod_id") or "").lower(),
+                        "symbol": str(payload.get("symbol") or "").upper(),
+                        "action": str(payload.get("action") or payload.get("side") or payload.get("decision") or msg.get("topic", "")),
+                        "status": str(payload.get("status") or "INFO").upper(),
+                        "text": text,
+                    })
+            except Exception:
+                pass
+        return events
+
+    def _research_action_audit(self, item: dict, events: list[dict]) -> dict:
+        asset_classes = {str(v).lower() for v in item.get("asset_classes", [])}
+        tickers = {str(v).upper() for v in item.get("tickers", [])}
+        factors = {str(v).lower() for v in item.get("factors", [])}
+        text_needles = tickers | {f.upper() for f in factors}
+
+        matched = []
+        for event in events:
+            pod = event.get("pod_id", "")
+            symbol = event.get("symbol", "")
+            event_text = str(event.get("text", "")).upper()
+            pod_match = pod in asset_classes or (pod == "firm" and bool(asset_classes))
+            symbol_match = bool(symbol and symbol in tickers)
+            text_match = any(needle and needle in event_text for needle in text_needles)
+            if pod_match or symbol_match or text_match:
+                matched.append({
+                    "ts": event.get("ts"),
+                    "kind": event.get("kind"),
+                    "pod_id": pod,
+                    "symbol": symbol,
+                    "action": event.get("action"),
+                    "status": event.get("status"),
+                })
+            if len(matched) >= 5:
+                break
+
+        urgency = float(item.get("urgency") or 0.0)
+        if matched:
+            status = "acted"
+            next_action = "Recent agent/order activity references the same pod, factor, or symbol."
+        elif urgency >= 0.65:
+            status = "needs_review"
+            next_action = "High-urgency item has no matching recent agent action."
+        else:
+            status = "monitor"
+            next_action = "Monitor unless it becomes position-relevant or urgency rises."
+
+        return {
+            "status": status,
+            "matched_events": matched,
+            "next_action": next_action,
+        }
+
+    def get_research_feed_report(self, limit: int = 100, listener_state: dict | None = None) -> dict:
+        """Return persistent research feed, source health, routing, and action audit."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        if not hasattr(self, "_research_ingestion") or not self._research_ingestion:
+            return {
+                "generated_at": generated_at,
+                "items": [],
+                "sources": [],
+                "item_count": 0,
+                "source_count": 0,
+                "held_symbols_by_pod": self._held_symbols_by_pod(),
+                "status": "NO_INGESTION",
+                "last_fetch_time": None,
+            }
+
+        report = self._research_ingestion.get_research_feed_summary(limit=limit)
+        held_by_pod = self._held_symbols_by_pod()
+        held_all = {sym for symbols in held_by_pod.values() for sym in symbols}
+        events = self._research_action_events(listener_state)
+
+        for item in report.get("items", []):
+            tickers = {str(v).upper() for v in item.get("tickers", [])}
+            item["held_symbols"] = sorted(tickers & held_all)
+            item["affected_pods"] = [
+                pod_id for pod_id in POD_IDS
+                if pod_id in {str(v).lower() for v in item.get("asset_classes", [])}
+            ]
+            if not item["affected_pods"] and "macro" in {str(v).lower() for v in item.get("asset_classes", [])}:
+                item["affected_pods"] = list(POD_IDS)
+            item["action_audit"] = self._research_action_audit(item, events)
+
+        source_errors = sum(1 for source in report.get("sources", []) if source.get("status") not in {"ok", "cached", "success"})
+        status = "OK" if source_errors == 0 else "CHECK"
+        return {
+            **report,
+            "generated_at": generated_at,
+            "held_symbols_by_pod": held_by_pod,
+            "status": status,
+            "source_error_count": source_errors,
+            "last_fetch_time": self._research_ingestion.last_fetch_time.isoformat() if self._research_ingestion.last_fetch_time else None,
+        }
+
+    async def get_state_health(self) -> dict:
+        """Return state-integrity diagnostics for the dashboard."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        data_quality = self.get_data_quality_report()
+        nav_history = self._nav_store.health_summary() if self._nav_store else {
+            "total_rows": 0,
+            "repaired_rows": 0,
+            "quality_counts": {},
+            "first_ts": None,
+            "last_ts": None,
+            "latest_by_pod": {},
+        }
+        broker_status = {
+            "status": "UNKNOWN",
+            "mismatch_count": None,
+            "open_order_count": None,
+            "errors": [],
+        }
+        broker = self._last_broker_reconciliation or {}
+        if broker:
+            broker_status = {
+                "status": broker.get("status", "UNKNOWN"),
+                "mismatch_count": len(broker.get("mismatches", []) or []),
+                "open_order_count": len(broker.get("open_orders", []) or []),
+                "errors": broker.get("errors", []) or [],
+                "cached_at": broker.get("generated_at"),
+            }
+
+        pods: list[dict] = []
+        latest_nav = nav_history.get("latest_by_pod", {}) or {}
+        for pod_id in POD_IDS:
+            runtime = self._pod_runtimes.get(pod_id)
+            acct = runtime._ns.get("accountant") if runtime else None
+            state = acct.to_state_dict() if acct else {}
+            nav = float(state.get("nav") or 0.0)
+            starting_capital = float(state.get("starting_capital") or self._pod_capital.get(pod_id) or self._capital_per_pod or 0.0)
+            cash = float(state.get("cash") or 0.0)
+            invested = float(state.get("invested") or max(0.0, nav - cash))
+            positions = state.get("positions", []) or []
+            nav_row = latest_nav.get(pod_id, {})
+            issues: list[str] = []
+            if starting_capital <= 0:
+                issues.append("Missing starting capital")
+            if nav <= 0 and self._session_active:
+                issues.append("Missing live NAV")
+            if nav_row and nav_row.get("quality") not in (None, "ok"):
+                issues.append(f"Latest NAV row was {nav_row.get('quality')}")
+            status = "OK" if not issues else "CHECK"
+            pods.append({
+                "pod_id": pod_id,
+                "status": status,
+                "issues": issues,
+                "starting_capital": round(starting_capital, 4),
+                "allocated_capital": round(float(self._pod_capital.get(pod_id) or self._capital_per_pod or starting_capital), 4),
+                "nav": round(nav, 4),
+                "cash": round(cash, 4),
+                "invested": round(invested, 4),
+                "position_count": len(positions),
+                "last_nav_ts": nav_row.get("ts"),
+                "last_nav_quality": nav_row.get("quality", "unknown"),
+            })
+
+        overall_status = "OK"
+        warnings: list[str] = []
+        if nav_history.get("repaired_rows", 0):
+            overall_status = "CHECK"
+            warnings.append(f"{nav_history.get('repaired_rows')} NAV history row(s) repaired for chart integrity")
+        if broker_status.get("status") == "CHECK":
+            overall_status = "CHECK"
+            warnings.append("Broker/local reconciliation needs review")
+        if data_quality.get("status") == "CHECK":
+            overall_status = "CHECK"
+            warnings.append("Market data quality needs review")
+        for pod in pods:
+            if pod["status"] != "OK":
+                overall_status = "CHECK"
+                warnings.extend([f"{pod['pod_id']}: {issue}" for issue in pod["issues"]])
+
+        return {
+            "generated_at": generated_at,
+            "status": overall_status,
+            "warnings": warnings,
+            "session_active": self._session_active,
+            "iteration": self._iteration,
+            "capital_per_pod": round(float(self._capital_per_pod or 0.0), 4),
+            "pods": pods,
+            "nav_history": nav_history,
+            "broker": broker_status,
+            "data_quality": data_quality,
+        }
+
+    def get_execution_truth(self) -> dict:
+        """Summarize the latest PM-to-execution outcome per pod."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        pods: list[dict] = []
+
+        for pod_id in POD_IDS:
+            runtime = self._pod_runtimes.get(pod_id)
+            if runtime is None:
+                pods.append({
+                    "pod_id": pod_id,
+                    "status": "NOT_STARTED",
+                    "stage": "session",
+                    "reason": "Pod runtime has not started",
+                    "pm_summary": "",
+                    "active_trade_count": 0,
+                    "active_symbols": [],
+                    "thesis_gate": {},
+                    "data_gate": {},
+                    "last_block": {},
+                    "last_order_result": {},
+                    "execution_feedback": [],
+                })
+                continue
+
+            ns = runtime._ns
+            pm_decision = ns.get("last_pm_decision") or {}
+            if not isinstance(pm_decision, dict):
+                pm_decision = {}
+            trades = pm_decision.get("trades", []) if isinstance(pm_decision, dict) else []
+            active_trades = [
+                trade for trade in trades
+                if isinstance(trade, dict)
+                and str(trade.get("action", "HOLD")).upper() != "HOLD"
+            ]
+            active_symbols = [
+                str(trade.get("symbol", "")).upper()
+                for trade in active_trades
+                if trade.get("symbol")
+            ]
+            latest_block = ns.get("last_trade_block") or {}
+            order_result = ns.get("last_order_result") or {}
+            feedback = list(ns.get("execution_feedback") or [])
+            thesis_gate = ns.get("thesis_gate_result") or {}
+            data_gate = ns.get("last_data_quality_check") or {}
+
+            if not active_trades:
+                status = "NO_ACTIVE_TRADE"
+                stage = "pm"
+                reason = pm_decision.get("action_summary") or "PM did not propose a BUY/SELL trade"
+            elif latest_block and (
+                not active_symbols
+                or str(latest_block.get("symbol", "")).upper() in active_symbols
+            ):
+                status = "BLOCKED"
+                stage = str(latest_block.get("stage") or "runtime_gate")
+                reason = str(latest_block.get("reason") or "Runtime gate blocked trade")
+            elif order_result:
+                status = str(order_result.get("status") or "SUBMITTED").upper()
+                stage = str(order_result.get("stage") or "execution")
+                reason = str(
+                    order_result.get("reason")
+                    or order_result.get("rejection_detail")
+                    or order_result.get("rejection_reason")
+                    or ""
+                )
+            else:
+                status = "PROPOSED"
+                stage = "pm"
+                reason = "PM proposed a trade; no runtime block or broker result recorded yet"
+
+            pods.append({
+                "pod_id": pod_id,
+                "status": status,
+                "stage": stage,
+                "reason": reason,
+                "pm_summary": pm_decision.get("action_summary", "") if isinstance(pm_decision, dict) else "",
+                "active_trade_count": len(active_trades),
+                "active_symbols": active_symbols,
+                "thesis_gate": thesis_gate,
+                "data_gate": data_gate,
+                "last_block": latest_block,
+                "last_order_result": order_result,
+                "execution_feedback": feedback[:3],
+            })
+
+        status = "OK"
+        if any(row["status"] in {"BLOCKED", "REJECTED"} for row in pods):
+            status = "CHECK"
+        elif any(row["status"] in {"PENDING", "PROPOSED"} for row in pods):
+            status = "PENDING"
+
+        return {
+            "generated_at": generated_at,
+            "status": status,
+            "pods": pods,
+        }
+
+    async def _publish_reconciled_order_update(self, payload: dict) -> None:
+        msg = AgentMessage(
+            timestamp=datetime.now(timezone.utc),
+            sender="execution.reconciler",
+            recipient="dashboard",
+            topic="execution.order_update",
+            payload=payload,
+        )
+        await self._event_bus.publish(
+            "execution.order_update",
+            msg,
+            publisher_id="execution.reconciler",
+        )
+
+    async def reconcile_execution_state(
+        self,
+        local_orders: list[dict] | None = None,
+        cancel_stale_after_s: float = 60.0,
+    ) -> dict:
+        """Reconcile stale local order state against Alpaca."""
+        now = datetime.now(timezone.utc)
+        local_orders = local_orders or []
+        checked = 0
+        updates: list[dict] = []
+        errors: list[str] = []
+
+        for wrapper in local_orders:
+            order = wrapper.get("data", wrapper) if isinstance(wrapper, dict) else {}
+            if not isinstance(order, dict):
+                continue
+            local_order_id = order.get("local_order_id")
+            broker_order_id = order.get("broker_order_id") or order.get("order_id")
+            if local_order_id and not order.get("broker_order_id") and broker_order_id == local_order_id:
+                continue
+            order_id = broker_order_id
+            status = str(order.get("status") or "").upper()
+            if not order_id or status not in {"PENDING", "PARTIAL"}:
+                continue
+            if not hasattr(self._alpaca, "get_order_status"):
+                continue
+            checked += 1
+            try:
+                broker = await self._alpaca.get_order_status(order_id)
+            except Exception as exc:
+                errors.append(f"{order_id}: {exc}")
+                continue
+
+            broker_status = str(broker.get("status") or "").upper()
+            if broker_status in {"FILLED", "PARTIALLY_FILLED", "PARTIAL"}:
+                fill_qty = float(broker.get("filled_qty") or 0.0)
+                original_qty = float(order.get("qty") or order.get("quantity") or 0.0)
+                ui_status = "FILLED" if original_qty <= 0 or fill_qty >= original_qty - 1e-9 else "PARTIAL"
+                update = {
+                    "pod_id": order.get("pod_id", "unknown"),
+                    "symbol": broker.get("symbol") or order.get("symbol", ""),
+                    "side": broker.get("side") or order.get("side", ""),
+                    "qty": fill_qty or original_qty,
+                    "fill_price": broker.get("filled_avg_price") or order.get("fill_price") or 0.0,
+                    "status": ui_status,
+                    "order_id": order_id,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": order_id,
+                    "stage": "broker_reconcile",
+                    "reason": "Broker status reconciled after dashboard pending state",
+                }
+            elif broker_status in {"REJECTED", "CANCELED", "CANCELLED", "EXPIRED"}:
+                update = {
+                    "pod_id": order.get("pod_id", "unknown"),
+                    "symbol": broker.get("symbol") or order.get("symbol", ""),
+                    "side": broker.get("side") or order.get("side", ""),
+                    "qty": float(order.get("qty") or order.get("quantity") or 0.0),
+                    "fill_price": broker.get("filled_avg_price") or 0.0,
+                    "status": "REJECTED",
+                    "order_id": order_id,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": order_id,
+                    "stage": "broker_reconcile",
+                    "reason": broker.get("reason") or f"Alpaca order status: {broker_status.lower()}",
+                }
+            else:
+                continue
+
+            updates.append(update)
+            try:
+                await self._publish_reconciled_order_update(update)
+            except Exception as exc:
+                errors.append(f"publish {order_id}: {exc}")
+
+        try:
+            open_orders = await self._alpaca.get_all_open_orders()
+        except Exception as exc:
+            open_orders = []
+            errors.append(f"Open order reconciliation failed: {exc}")
+
+        canceled: list[dict] = []
+        for order in open_orders:
+            age_s = self._order_age_seconds(order.get("submitted_at"), now)
+            if age_s is None or age_s <= cancel_stale_after_s:
+                continue
+            order_id = order.get("order_id")
+            if not order_id:
+                continue
+            logger.warning(
+                "[reconcile] Cancelling stale order %s (%s, %.0fs old)",
+                order_id,
+                order.get("symbol"),
+                age_s,
+            )
+            ok = await self._alpaca.cancel_order(order_id)
+            update = {
+                "pod_id": order.get("pod_id", "unknown"),
+                "symbol": order.get("symbol", ""),
+                "side": order.get("side", ""),
+                "qty": float(order.get("qty") or 0.0),
+                "fill_price": 0.0,
+                "status": "REJECTED",
+                "order_id": order_id,
+                "broker_order_id": order_id,
+                "stage": "broker_reconcile",
+                "reason": (
+                    f"Stale open broker order canceled after {age_s:.0f}s without fill"
+                    if ok else
+                    f"Stale open broker order is older than {age_s:.0f}s; cancellation failed"
+                ),
+            }
+            canceled.append(update)
+            updates.append(update)
+            try:
+                await self._publish_reconciled_order_update(update)
+            except Exception as exc:
+                errors.append(f"publish {order_id}: {exc}")
+
+        return {
+            "checked_local_orders": checked,
+            "broker_open_orders": open_orders,
+            "updates": updates,
+            "canceled_stale_orders": canceled,
+            "errors": errors,
+            "generated_at": now.isoformat(),
+        }
 
     # ── Session memory persistence ────────────────────────────────────────
 
@@ -1721,6 +2748,7 @@ class SessionManager:
             out[pod_id] = {
                 "total_fills": len(fills),
                 "fills_with_slippage_data": len(with_slip),
+                "fills_missing_slippage_data": max(0, len(fills) - len(with_slip)),
                 "avg_slippage_bps": round(sum(slip_vals) / len(slip_vals), 2) if slip_vals else None,
                 "max_slippage_bps": max(slip_vals) if slip_vals else None,
             }
@@ -1948,6 +2976,10 @@ class SessionManager:
                 "signal_scores": signal_scores_state,
                 "closed_trades_state": closed_trades_state,
                 "discovered_universe": discovered_universe,
+                "loss_reviews": {
+                    "active": self._loss_reviews,
+                    "history": self._loss_review_history[:100],
+                },
             }
 
             self._MEMORY_JSON.write_text(
@@ -2016,8 +3048,8 @@ class SessionManager:
             positions = await self._alpaca.get_open_positions()
             if not positions:
                 logger.info("[session_manager] Alpaca: no open positions to hydrate")
-                # Still run reconcile so pods keep allocated capital (crypto=100, etc.)
-                cap = self._capital_per_pod or 100.0
+                # Still run reconcile so pods keep allocated capital.
+                cap = self._capital_per_pod or 1000.0
                 for pod_id, rt in self._pod_runtimes.items():
                     acct = rt._ns.get("accountant")
                     if acct:
@@ -2029,10 +3061,15 @@ class SessionManager:
                         len(positions), account.get("equity", 0))
 
             pod_universes: dict[str, set[str]] = {}
+            pod_universe_aliases: dict[str, set[str]] = {}
             for pod_id in self._pod_runtimes:
                 ns = self._pod_runtimes[pod_id]._ns
                 universe = ns.get("universe") or POD_UNIVERSES.get(pod_id, [])
                 pod_universes[pod_id] = set(universe)
+                aliases: set[str] = set()
+                for universe_symbol in universe:
+                    aliases.update(symbol_aliases(universe_symbol))
+                pod_universe_aliases[pod_id] = aliases
 
             # Fetch earliest buy dates from Alpaca order history
             earliest_dates: dict[str, str] = {}
@@ -2043,9 +3080,15 @@ class SessionManager:
 
             for symbol, pos_data in positions.items():
                 target_pod = None
+                display_symbol = canonical_crypto_symbol(symbol) if is_crypto_symbol(symbol) else symbol
+                broker_aliases = symbol_aliases(symbol)
                 for pod_id, universe in pod_universes.items():
-                    if symbol in universe:
+                    if broker_aliases & pod_universe_aliases.get(pod_id, set()):
                         target_pod = pod_id
+                        for universe_symbol in universe:
+                            if broker_aliases & symbol_aliases(universe_symbol):
+                                display_symbol = universe_symbol
+                                break
                         break
                 if target_pod is None:
                     for pod_id in self._pod_runtimes:
@@ -2056,32 +3099,34 @@ class SessionManager:
                     acct = self._pod_runtimes[target_pod]._ns.get("accountant")
                     if acct:
                         acct.load_positions([{
-                            "symbol": symbol,
+                            "symbol": display_symbol,
                             "qty": pos_data["qty"],
                             "avg_entry": pos_data["entry_price"],
                             "current_price": pos_data["current_price"],
+                            "price_source": "alpaca",
                         }])
 
                         # Set entry date from Alpaca order history (backfill from memory may override)
-                        if symbol in earliest_dates and not acct._entry_dates.get(symbol):
-                            raw_ts = earliest_dates[symbol]
+                        earliest_key = next((a for a in symbol_aliases(display_symbol) if a in earliest_dates), symbol)
+                        if earliest_key in earliest_dates and not acct._entry_dates.get(display_symbol):
+                            raw_ts = earliest_dates[earliest_key]
                             date_str = raw_ts[:10] if len(raw_ts) >= 10 else raw_ts
-                            acct._entry_dates[symbol] = date_str
-                            logger.debug("[session_manager] Set entry date for %s from order history: %s", symbol, date_str)
+                            acct._entry_dates[display_symbol] = date_str
+                            logger.debug("[session_manager] Set entry date for %s from order history: %s", display_symbol, date_str)
 
                         # Ensure held symbols are in the pod universe so bars are fetched
                         ns = self._pod_runtimes[target_pod]._ns
                         current_universe = ns.get("universe") or list(POD_UNIVERSES.get(target_pod, []))
-                        if symbol not in current_universe:
-                            current_universe.append(symbol)
+                        if display_symbol not in current_universe:
+                            current_universe.append(display_symbol)
                             ns.set("universe", current_universe)
-                            logger.info("[session_manager] Added %s to %s universe (held position)", symbol, target_pod)
+                            logger.info("[session_manager] Added %s to %s universe (held position)", display_symbol, target_pod)
                         logger.info("[session_manager] Hydrated %s: %s %.2f @ $%.2f -> pod %s",
-                                    symbol, "LONG" if pos_data["qty"] > 0 else "SHORT",
+                                    display_symbol, "LONG" if pos_data["qty"] > 0 else "SHORT",
                                     abs(pos_data["qty"]), pos_data["entry_price"], target_pod)
 
             # Reconcile starting_capital so NAV = invested + cash (fixes invested >> NAV mismatch)
-            cap = self._capital_per_pod or 100.0
+            cap = self._capital_per_pod or 1000.0
             for pod_id, rt in self._pod_runtimes.items():
                 acct = rt._ns.get("accountant")
                 if acct:
@@ -2582,6 +3627,8 @@ class SessionManager:
                 if snap.qty == 0:
                     continue
                 meta = accountant._entry_metadata.get(symbol, {})
+                current_notional = snap.qty * snap.current_price
+                entry_notional = snap.qty * snap.cost_basis
                 result.append({
                     "_pod": pod_id,
                     "symbol": symbol,
@@ -2589,13 +3636,22 @@ class SessionManager:
                     "current_price": snap.current_price,
                     "cost_basis": snap.cost_basis,
                     "unrealized_pnl": snap.unrealized_pnl,
-                    "notional": snap.qty * snap.current_price,
+                    "notional": current_notional,
+                    "current_notional": current_notional,
+                    "entry_notional": entry_notional,
+                    "notional_basis": "current_price",
                     "entry_date": snap.entry_date or meta.get("entry_time", ""),
                     "entry_thesis": (
                         snap.entry_thesis
                         or meta.get("entry_thesis")
                         or meta.get("reasoning", "")
                     ),
+                    "thesis_status": snap.thesis_status or meta.get("thesis_status", "unknown"),
+                    "thesis_issues": snap.thesis_issues or meta.get("thesis_issues", []),
+                    "thesis_review": snap.thesis_review or meta.get("thesis_review", {}),
+                    "price_source": snap.price_source,
+                    "price_updated_at": snap.price_updated_at,
+                    "price_stale": snap.price_stale,
                 })
         return result
 
@@ -2648,6 +3704,8 @@ class SessionManager:
                 "conviction": f.get("conviction", 0),
                 "strategy_tag": f.get("strategy_tag", ""),
                 "signal_snapshot": f.get("signal_snapshot", {}),
+                "entry_macro_regime": f.get("entry_macro_regime", ""),
+                "thesis_review": f.get("thesis_review", {}),
             })
 
         # Also include fills from restored memory
@@ -2688,6 +3746,8 @@ class SessionManager:
                 "conviction": t.get("conviction", 0),
                 "strategy_tag": t.get("strategy_tag", ""),
                 "signal_snapshot": t.get("signal_snapshot", {}),
+                "entry_macro_regime": t.get("entry_macro_regime", ""),
+                "thesis_review": t.get("thesis_review", {}),
             })
 
         fills.sort(key=lambda x: x.get("timestamp", ""))
@@ -2718,6 +3778,10 @@ class SessionManager:
             "current_price": snap.current_price,
             "unrealized_pnl": round(snap.unrealized_pnl, 4),
             "pnl_pct": round(snap.pnl_pct, 2),
+            "notional": snap.qty * snap.current_price,
+            "current_notional": snap.qty * snap.current_price,
+            "entry_notional": snap.qty * snap.cost_basis,
+            "notional_basis": "current_price",
             "entry_date": snap.entry_date or meta.get("entry_time", ""),
             "entry_thesis": (
                 snap.entry_thesis
@@ -2729,6 +3793,13 @@ class SessionManager:
             "max_hold_days": meta.get("max_hold_days", 0),
             "conviction": meta.get("conviction", 0),
             "days_held": days_held,
+            "thesis_status": snap.thesis_status or meta.get("thesis_status", "unknown"),
+            "thesis_issues": snap.thesis_issues or meta.get("thesis_issues", []),
+            "thesis_review": snap.thesis_review or meta.get("thesis_review", {}),
+            "price_source": snap.price_source,
+            "price_updated_at": snap.price_updated_at,
+            "price_stale": snap.price_stale,
+            "entry_macro_regime": meta.get("entry_macro_regime", ""),
             "fills": fills,
             "partial_exits": partial_exits,
             "reasoning_history": reasoning_history,

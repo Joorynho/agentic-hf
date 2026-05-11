@@ -60,7 +60,7 @@ class GammaPMAgent(BasePodAgent):
                 "Choose one: BUY SPY, BUY TLT, BUY GLD, or HOLD. Reply with JSON only: "
                 '{"action": "BUY"|"HOLD", "symbol": "SPY"|"TLT"|"GLD"|"UUP"|"EEM", "rationale": "..."}'
             )
-            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=200)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=200, task="pm_decision")
             decision = extract_json(raw)
             if decision.get("action") == "HOLD":
                 return {}

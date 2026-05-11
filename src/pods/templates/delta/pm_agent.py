@@ -68,7 +68,7 @@ class DeltaPMAgent(BasePodAgent):
                 f"Event-driven PM. Composite signal: {composite:.3f}. Price: {bar.close}. "
                 "Reply with JSON only: {\"action\": \"BUY\"|\"HOLD\", \"symbol\": \"AAPL\", \"rationale\": \"...\"}"
             )
-            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=150)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=150, task="pm_decision")
             decision = extract_json(raw)
             if decision.get("action") == "HOLD":
                 return {}

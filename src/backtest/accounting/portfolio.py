@@ -18,6 +18,8 @@ class PortfolioAccountant:
         self._positions: dict[str, dict] = {}
         self._cost_basis: dict[str, float] = {}
         self._last_price: dict[str, float] = {}
+        self._last_price_source: dict[str, str] = {}
+        self._last_price_updated_at: dict[str, datetime] = {}
         self._hwm = initial_nav
         self._nav_history: list[float] = [initial_nav]
         self._realized_pnl = 0.0
@@ -72,6 +74,8 @@ class PortfolioAccountant:
         max_hold_days: int = 0,
         expected_price: float | None = None,
         entry_thesis: str = "",
+        entry_macro_regime: str = "",
+        thesis_review: dict | None = None,
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -122,6 +126,10 @@ class PortfolioAccountant:
                 "take_profit_pct": take_profit_pct if take_profit_pct is not None else 0.15,
                 "exit_when": exit_when,
                 "max_hold_days": max_hold_days,
+                "entry_macro_regime": entry_macro_regime,
+                "thesis_status": (thesis_review or {}).get("status", "valid"),
+                "thesis_issues": list((thesis_review or {}).get("issues", [])),
+                "thesis_review": thesis_review or {},
             }
 
         # Calculate realized PnL for any position reduction
@@ -204,6 +212,8 @@ class PortfolioAccountant:
                 "strategy_tag": strategy_tag,
                 "signal_snapshot": signal_snapshot or {},
                 "conviction": conviction,
+                "entry_macro_regime": entry_macro_regime,
+                "thesis_review": thesis_review or {},
             }
         )
 
@@ -251,9 +261,18 @@ class PortfolioAccountant:
         """Get the most recent market price for a symbol from bar data."""
         return self._last_price.get(symbol, default)
 
-    def _update_last_price(self, symbol: str, price: float) -> None:
+    def _update_last_price(self, symbol: str, price: float, source: str = "market") -> None:
         """Update market price for symbol (called during bar push)."""
         self._last_price[symbol] = price
+        self._last_price_source[symbol] = source or "market"
+        self._last_price_updated_at[symbol] = datetime.now(timezone.utc)
+
+    def _is_price_stale(self, symbol: str) -> bool:
+        updated_at = self._last_price_updated_at.get(symbol)
+        if not updated_at:
+            return True
+        stale_after_s = 180 if "/" in symbol else 900
+        return (datetime.now(timezone.utc) - updated_at).total_seconds() > stale_after_s
 
     @property
     def current_positions(self) -> dict[str, PositionSnapshot]:
@@ -289,6 +308,16 @@ class PortfolioAccountant:
                     take_profit_pct=meta.get("take_profit_pct", 0.15),
                     max_hold_days=meta.get("max_hold_days", 0),
                     conviction=meta.get("conviction", 0.0),
+                    thesis_status=meta.get("thesis_status", "unknown"),
+                    thesis_issues=list(meta.get("thesis_issues", [])),
+                    thesis_review=meta.get("thesis_review", {}),
+                    price_source=self._last_price_source.get(symbol, ""),
+                    price_updated_at=(
+                        self._last_price_updated_at[symbol].isoformat()
+                        if symbol in self._last_price_updated_at
+                        else ""
+                    ),
+                    price_stale=self._is_price_stale(symbol),
                 )
         return positions
 
@@ -329,13 +358,14 @@ class PortfolioAccountant:
         """PnL from closed positions."""
         return self._realized_pnl
 
-    def mark_to_market(self, prices: dict[str, float]) -> float:
+    def mark_to_market(self, prices: dict[str, float], price_sources: dict[str, str] | None = None) -> float:
+        price_sources = price_sources or {}
         for sym, price in prices.items():
-            self._update_last_price(sym, price)
+            self._update_last_price(sym, price, price_sources.get(sym, "market"))
 
         total_market_value = 0.0
         for sym, pos in self._positions.items():
-            price = prices.get(sym, pos["avg_cost"])
+            price = prices.get(sym, self._last_price.get(sym, pos["avg_cost"]))
             pos["market_value"] = pos["quantity"] * price
             pos["unrealised_pnl"] = pos["quantity"] * (price - pos["avg_cost"])
             total_market_value += pos["market_value"]
@@ -426,6 +456,13 @@ class PortfolioAccountant:
                     "qty": pos["quantity"],
                     "avg_entry": self._cost_basis.get(sym, pos["avg_cost"]),
                     "current_price": self._last_price.get(sym, pos["avg_cost"]),
+                    "price_source": self._last_price_source.get(sym, ""),
+                    "price_updated_at": (
+                        self._last_price_updated_at[sym].isoformat()
+                        if sym in self._last_price_updated_at
+                        else ""
+                    ),
+                    "price_stale": self._is_price_stale(sym),
                 })
         entry_metadata_ser: dict[str, dict] = {}
         for sym, meta in self._entry_metadata.items():
@@ -498,7 +535,7 @@ class PortfolioAccountant:
                 "unrealised_pnl": qty * (current_price - avg_entry),
             }
             self._cost_basis[sym] = avg_entry
-            self._last_price[sym] = current_price
+            self._update_last_price(sym, current_price, str(p.get("price_source") or "broker"))
             # Deduct cost basis from cash (position was funded from capital)
             self._cash -= abs(qty) * avg_entry
         if positions:

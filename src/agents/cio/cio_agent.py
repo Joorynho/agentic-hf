@@ -236,6 +236,7 @@ class CIOAgent:
             [{"role": "system", "content": system_prompt},
              {"role": "user", "content": user_prompt}],
             max_tokens=600,
+            task="governance",
         )
 
         if self._session_logger:
@@ -332,6 +333,7 @@ class CIOAgent:
             response_text = llm_chat(
                 [{"role": "user", "content": prompt + " Respond with valid JSON only."}],
                 max_tokens=300,
+                task="allocation",
             )
 
             if self._session_logger:

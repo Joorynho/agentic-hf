@@ -119,6 +119,10 @@ class TestReadFirmHistory:
         assert r["cash"] == pytest.approx(60_000.0)
         assert r["invested"] == pytest.approx(90_000.0)
         assert r["realized"] == pytest.approx(1_500.0)
+        assert r["pods"] == pytest.approx({
+            "equities": 100_000.0,
+            "fx": 50_000.0,
+        })
 
     def test_multiple_timestamps_sorted_ascending(self, store):
         _write(store, "equities", nav=100.0, ts="2026-01-02T00:00:00")
@@ -143,6 +147,24 @@ class TestReadFirmHistory:
         assert rows[1]["ts"] == "2026-01-09T00:00:00"
         assert rows[2]["ts"] == "2026-01-10T00:00:00"
 
+    def test_limit_keeps_all_pods_for_selected_timestamps(self, store):
+        for i in range(5):
+            ts = f"2026-01-{i+1:02d}T00:00:00"
+            _write(store, "equities", nav=float(100 + i), ts=ts)
+            _write(store, "fx", nav=float(200 + i), ts=ts)
+
+        rows = store.read_firm_history(limit=2)
+
+        assert [r["ts"] for r in rows] == ["2026-01-04T00:00:00", "2026-01-05T00:00:00"]
+        assert rows[0]["pods"] == pytest.approx({
+            "equities": 103.0,
+            "fx": 203.0,
+        })
+        assert rows[1]["pods"] == pytest.approx({
+            "equities": 104.0,
+            "fx": 204.0,
+        })
+
     def test_empty_db_returns_empty_list(self, store):
         assert store.read_firm_history() == []
 
@@ -156,6 +178,196 @@ class TestReadFirmHistory:
         assert len(rows) == 2
         assert rows[0]["nav"] == pytest.approx(100.0)
         assert rows[1]["nav"] == pytest.approx(200.0)
+
+
+class TestCollapsedPlaceholderGuard:
+    def test_read_history_rebases_leading_low_seed_placeholders(self, store):
+        _write(
+            store,
+            "equities",
+            nav=100.0,
+            cash=100.0,
+            invested=0.0,
+            realized=0.0,
+            ts="2026-04-16T09:37:00",
+        )
+        _write(
+            store,
+            "equities",
+            nav=994.5725,
+            cash=272.0541,
+            invested=722.5184,
+            realized=0.0,
+            ts="2026-04-16T09:57:00",
+        )
+
+        rows = store.read_history("equities")
+
+        assert [r["nav"] for r in rows] == pytest.approx([1000.0, 994.5725])
+        assert rows[0]["cash"] == pytest.approx(1000.0)
+        assert rows[0]["invested"] == pytest.approx(0.0)
+
+    def test_read_firm_history_rebases_seed_rows_before_aggregation(self, store):
+        early = "2026-04-16T09:37:00"
+        real = "2026-04-16T09:57:00"
+        for pod_id in ("equities", "fx", "crypto"):
+            _write(
+                store,
+                pod_id,
+                nav=100.0,
+                cash=100.0,
+                invested=0.0,
+                realized=0.0,
+                ts=early,
+            )
+        _write(store, "equities", nav=994.5725, cash=272.0541, invested=722.5184, ts=real)
+        _write(store, "fx", nav=1000.0055, cash=979.1345, invested=20.8710, ts=real)
+        _write(store, "crypto", nav=1000.0, cash=1000.0, invested=0.0, ts=real)
+
+        rows = store.read_firm_history()
+
+        assert rows[0]["ts"] == early
+        assert rows[0]["nav"] == pytest.approx(3000.0)
+        assert rows[0]["pods"] == pytest.approx({
+            "equities": 1000.0,
+            "fx": 1000.0,
+            "crypto": 1000.0,
+        })
+
+    def test_repair_collapsed_snapshots_rewrites_leading_seed_rows(self, tmp_path):
+        db_path = str(tmp_path / "repair_seed_nav.db")
+        s = NavStore(db_path)
+        try:
+            s._conn.execute(
+                """
+                INSERT INTO nav_snapshots (pod_id, ts, nav, cash, invested, realized)
+                VALUES
+                    ('equities', '2026-04-16T09:37:00', 100, 100, 0, 0),
+                    ('equities', '2026-04-16T09:57:00', 994.5725, 272.0541, 722.5184, 0)
+                """
+            )
+            s._conn.commit()
+
+            count = s.repair_collapsed_snapshots()
+            rows = s._conn.execute(
+                "SELECT nav, cash, invested FROM nav_snapshots WHERE pod_id = 'equities' ORDER BY ts ASC"
+            ).fetchall()
+
+            assert count == 1
+            assert float(rows[0]["nav"]) == pytest.approx(1000.0)
+            assert float(rows[0]["cash"]) == pytest.approx(1000.0)
+            assert float(rows[0]["invested"]) == pytest.approx(0.0)
+        finally:
+            s.close()
+
+    def test_health_summary_reports_repaired_seed_rows(self, store):
+        _write(store, "equities", nav=100.0, cash=100.0, ts="2026-04-16T09:37:00")
+        _write(store, "equities", nav=994.5725, cash=272.0541, invested=722.5184, ts="2026-04-16T09:57:00")
+
+        summary = store.health_summary()
+
+        assert summary["total_rows"] == 2
+        assert summary["repaired_rows"] == 1
+        assert summary["quality_counts"]["rebased_seed_placeholder"] == 1
+        assert summary["latest_by_pod"]["equities"]["nav"] == pytest.approx(994.5725)
+
+    def test_write_snapshot_freezes_all_cash_restart_placeholder(self, store):
+        _write(
+            store,
+            "commodities",
+            nav=1000.0,
+            cash=700.0,
+            invested=300.0,
+            ts="2026-05-07T09:00:00",
+        )
+        _write(
+            store,
+            "commodities",
+            nav=100.0,
+            cash=100.0,
+            invested=0.0,
+            realized=0.0,
+            ts="2026-05-07T09:01:00",
+        )
+
+        rows = store.read_history("commodities")
+
+        assert [r["nav"] for r in rows] == pytest.approx([1000.0, 1000.0])
+        assert rows[-1]["cash"] == pytest.approx(700.0)
+        assert rows[-1]["invested"] == pytest.approx(300.0)
+
+    def test_large_real_loss_is_not_flattened_when_invested_capital_remains(self, store):
+        _write(
+            store,
+            "commodities",
+            nav=1000.0,
+            cash=50.0,
+            invested=950.0,
+            ts="2026-05-07T09:00:00",
+        )
+        _write(
+            store,
+            "commodities",
+            nav=420.0,
+            cash=20.0,
+            invested=400.0,
+            realized=-580.0,
+            ts="2026-05-07T09:01:00",
+        )
+
+        rows = store.read_history("commodities")
+
+        assert rows[-1]["nav"] == pytest.approx(420.0)
+
+    def test_read_firm_history_flattens_existing_bad_rows(self, tmp_path):
+        db_path = str(tmp_path / "raw_bad_nav.db")
+        s = NavStore(db_path)
+        try:
+            s._conn.execute(
+                """
+                INSERT INTO nav_snapshots (pod_id, ts, nav, cash, invested, realized)
+                VALUES
+                    ('commodities', '2026-05-07T09:00:00', 1000, 700, 300, 0),
+                    ('crypto',      '2026-05-07T09:00:00', 1000, 1000, 0, 0),
+                    ('commodities', '2026-05-07T09:01:00', 100, 100, 0, 0),
+                    ('crypto',      '2026-05-07T09:01:00', 1000, 1000, 0, 0)
+                """
+            )
+            s._conn.commit()
+
+            rows = s.read_firm_history()
+
+            assert rows[0]["nav"] == pytest.approx(2000.0)
+            assert rows[1]["nav"] == pytest.approx(2000.0)
+            assert rows[1]["pods"]["commodities"] == pytest.approx(1000.0)
+        finally:
+            s.close()
+
+    def test_repair_collapsed_snapshots_rewrites_existing_rows(self, tmp_path):
+        db_path = str(tmp_path / "repair_bad_nav.db")
+        s = NavStore(db_path)
+        try:
+            s._conn.execute(
+                """
+                INSERT INTO nav_snapshots (pod_id, ts, nav, cash, invested, realized)
+                VALUES
+                    ('fx', '2026-05-07T09:00:00', 996, 160, 836, 0),
+                    ('fx', '2026-05-07T09:01:00', 100, 100, 0, 0)
+                """
+            )
+            s._conn.commit()
+
+            count = s.repair_collapsed_snapshots()
+            rows = s._conn.execute(
+                "SELECT nav, cash, invested FROM nav_snapshots WHERE pod_id = 'fx' ORDER BY ts ASC"
+            ).fetchall()
+
+            assert count == 1
+            assert float(rows[-1]["nav"]) == pytest.approx(996.0)
+            assert float(rows[-1]["cash"]) == pytest.approx(160.0)
+            assert float(rows[-1]["invested"]) == pytest.approx(836.0)
+        finally:
+            s.close()
 
 
 class TestClose:

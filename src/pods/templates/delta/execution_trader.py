@@ -9,6 +9,7 @@ from src.core.models.execution import Order, RiskApprovalToken, OrderResult
 from src.core.models.messages import AgentMessage
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.pods.base.agent import BasePodAgent
+from src.pods.templates.execution_common import broker_rejection_reason, mandate_allocation_label, store_execution_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -166,7 +167,9 @@ class DeltaExecutionTrader(BasePodAgent):
                 side=order.side.value,
                 order_type="limit" if order.order_type.value == "limit" else "market",
                 limit_price=order.limit_price,
+                estimated_price=self.recall("last_prices", {}).get(order.symbol),
             )
+            rejection_reason = broker_rejection_reason(result_dict)
 
             result = OrderResult(
                 order_id=result_dict.get("order_id"),
@@ -176,7 +179,8 @@ class DeltaExecutionTrader(BasePodAgent):
                 status=result_dict.get("status", "REJECTED"),
                 fill_price=result_dict.get("filled_avg_price"),
                 fill_qty=result_dict.get("filled_qty", 0.0),
-                reason=None if result_dict.get("status") != "REJECTED" else "Order rejected",
+                reason=rejection_reason,
+                stage=result_dict.get("stage"),
                 filled_at=result_dict.get("filled_at"),
             )
 
@@ -193,6 +197,7 @@ class DeltaExecutionTrader(BasePodAgent):
                 )
 
             self.store("last_order_result", result.model_dump(mode="json"))
+            store_execution_feedback(self._ns, order, result)
 
             # Sync fill with PortfolioAccountant + publish to EventBus
             if result.status in ("FILLED", "PARTIAL"):
@@ -250,11 +255,11 @@ class DeltaExecutionTrader(BasePodAgent):
 
             # Log mandate application if available
             if self._session_logger and mandate:
-                allocation_pct = mandate.pod_allocations.get(self._pod_id, 0.0)
+                allocation_label = mandate_allocation_label(mandate, self._pod_id)
                 self._session_logger.log_reasoning(
                     f"execution:{self._pod_id}",
                     "mandate_applied",
-                    f"Order {order.symbol} {order.quantity}: Allocation {allocation_pct*100:.0f}%, "
+                    f"Order {order.symbol} {order.quantity}: {allocation_label or 'Allocation unavailable'}, "
                     f"Result: {result.status}",
                 )
 

@@ -75,6 +75,7 @@ class OrderResult(BaseModel):
     fill_price: float | None
     fill_qty: float
     reason: str | None = None
+    stage: str | None = None
     filled_at: datetime | None = None
 
 
@@ -113,11 +114,27 @@ class PositionSnapshot(BaseModel):
     take_profit_pct: float = 0.15
     max_hold_days: int = 0
     conviction: float = 0.0
+    thesis_status: str = "unknown"
+    thesis_issues: list[str] = Field(default_factory=list)
+    thesis_review: dict = Field(default_factory=dict)
+    price_source: str = ""
+    price_updated_at: str = ""
+    price_stale: bool = False
 
     @property
     def notional(self) -> float:
         """Notional value of position at current price."""
         return self.qty * self.current_price
+
+    @property
+    def current_notional(self) -> float:
+        """Current market value of the position."""
+        return self.qty * self.current_price
+
+    @property
+    def entry_notional(self) -> float:
+        """Original cost-basis value of the current open quantity."""
+        return self.qty * self.cost_basis
 
     @property
     def pnl_pct(self) -> float:
@@ -160,3 +177,9 @@ class PodPosition(BaseModel):
     take_profit_pct: float = 0.15
     max_hold_days: int = 0
     conviction: float = 0.0
+    thesis_status: str = "unknown"
+    thesis_issues: list[str] = Field(default_factory=list)
+    thesis_review: dict = Field(default_factory=dict)
+    price_source: str = ""
+    price_updated_at: str = ""
+    price_stale: bool = False

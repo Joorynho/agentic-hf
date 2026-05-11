@@ -10,6 +10,7 @@ from src.core.models.execution import Order, RiskApprovalToken, OrderResult
 from src.core.models.messages import AgentMessage
 from src.execution.paper.alpaca_adapter import AlpacaAdapter
 from src.pods.base.agent import BasePodAgent
+from src.pods.templates.execution_common import broker_rejection_reason, mandate_allocation_label, store_execution_feedback
 
 logger = logging.getLogger(__name__)
 
@@ -235,7 +236,10 @@ class CommoditiesExecutionTrader(BasePodAgent):
                 side=order.side.value,  # Convert Side enum to string
                 order_type="limit" if order.order_type.value == "limit" else "market",
                 limit_price=order.limit_price,
+                estimated_price=self.recall("last_prices", {}).get(order.symbol),
             )
+
+            rejection_reason = broker_rejection_reason(result_dict)
 
             # Convert result to OrderResult model
             result = OrderResult(
@@ -246,7 +250,8 @@ class CommoditiesExecutionTrader(BasePodAgent):
                 status=result_dict.get("status", "REJECTED"),
                 fill_price=result_dict.get("filled_avg_price"),
                 fill_qty=result_dict.get("filled_qty", 0.0),
-                reason=None if result_dict.get("status") != "REJECTED" else "Order rejected",
+                reason=rejection_reason,
+                stage=result_dict.get("stage"),
                 filled_at=result_dict.get("filled_at"),
             )
 
@@ -266,11 +271,12 @@ class CommoditiesExecutionTrader(BasePodAgent):
             await self._broadcast_order_update(
                 order, status=result.status,
                 fill_price=result.fill_price, fill_qty=result.fill_qty,
-                order_id=result.order_id, reason=result.reason,
+                order_id=result.order_id, reason=result.reason, stage=result.stage,
             )
 
             # Store result in namespace for ops agent
             self.store("last_order_result", result.model_dump(mode="json"))
+            store_execution_feedback(self._ns, order, result)
 
             # Sync fill with PortfolioAccountant + publish to EventBus
             if result.status in ("FILLED", "PARTIAL"):
@@ -296,6 +302,8 @@ class CommoditiesExecutionTrader(BasePodAgent):
                         exit_when=pm_meta.get("exit_when", ""),
                         max_hold_days=pm_meta.get("max_hold_days", 0),
                         expected_price=expected_price,
+                        entry_macro_regime=pm_meta.get("entry_macro_regime", ""),
+                        thesis_review=pm_meta.get("thesis_review"),
                     )
 
                 try:
@@ -307,6 +315,8 @@ class CommoditiesExecutionTrader(BasePodAgent):
                         payload={
                             "pod_id": self._pod_id,
                             "order_id": result.order_id,
+                            "local_order_id": str(order.id),
+                            "broker_order_id": result.order_id,
                             "symbol": order.symbol,
                             "side": order.side.value,
                             "qty": result.fill_qty,
@@ -346,11 +356,11 @@ class CommoditiesExecutionTrader(BasePodAgent):
 
             # Log mandate application if available
             if self._session_logger and mandate:
-                allocation_pct = mandate.pod_allocations.get(self._pod_id, 0.0)
+                allocation_label = mandate_allocation_label(mandate, self._pod_id)
                 self._session_logger.log_reasoning(
                     f"execution:{self._pod_id}",
                     "mandate_applied",
-                    f"Order {order.symbol} {order.quantity}: Allocation {allocation_pct*100:.0f}%, "
+                    f"Order {order.symbol} {order.quantity}: {allocation_label or 'Allocation unavailable'}, "
                     f"Result: {result.status}",
                 )
 
@@ -358,6 +368,11 @@ class CommoditiesExecutionTrader(BasePodAgent):
             try:
                 action = "order_executed" if result.status in ("FILLED", "PARTIAL") else "order_rejected"
                 summary = f"{order.side.value.upper()} {order.quantity:.0f} {order.symbol} → {result.status}"
+                detail = (
+                    f"{(result.stage or 'rejection').replace('_', ' ').title()}: {result.reason}"
+                    if result.status == "REJECTED" and result.reason
+                    else f"Price: ${result.fill_price or 0:.2f}"
+                )
                 act_msg = AgentMessage(
                     timestamp=datetime.now(timezone.utc),
                     sender=f"pod.{self._pod_id}.exec",
@@ -369,7 +384,7 @@ class CommoditiesExecutionTrader(BasePodAgent):
                         "pod_id": self._pod_id,
                         "action": action,
                         "summary": summary[:500],
-                        "detail": f"Price: ${result.fill_price or 0:.2f}",
+                        "detail": detail[:500],
                     },
                 )
                 await self._bus.publish("agent.activity", act_msg, publisher_id=f"pod.{self._pod_id}")
@@ -389,9 +404,12 @@ class CommoditiesExecutionTrader(BasePodAgent):
         self, order: Order, status: str,
         fill_price: float | None = None, fill_qty: float = 0.0,
         order_id: str | None = None, reason: str | None = None,
+        stage: str | None = None,
     ) -> None:
         """Publish order lifecycle event to EventBus for dashboard visibility."""
         try:
+            local_order_id = str(order.id)
+            broker_order_id = order_id if order_id and order_id != local_order_id else None
             msg = AgentMessage(
                 timestamp=datetime.now(timezone.utc),
                 sender=f"pod.{self._pod_id}.exec",
@@ -399,7 +417,9 @@ class CommoditiesExecutionTrader(BasePodAgent):
                 topic="execution.order_update",
                 payload={
                     "pod_id": self._pod_id,
-                    "order_id": order_id or str(order.id),
+                    "order_id": broker_order_id or local_order_id,
+                    "local_order_id": local_order_id,
+                    "broker_order_id": broker_order_id,
                     "symbol": order.symbol,
                     "side": order.side.value,
                     "qty": order.quantity,
@@ -407,6 +427,7 @@ class CommoditiesExecutionTrader(BasePodAgent):
                     "fill_price": fill_price,
                     "fill_qty": fill_qty,
                     "reason": reason,
+                    "stage": stage,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 },
             )

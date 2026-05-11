@@ -182,6 +182,8 @@ var COMMODITY_FACTOR_PROFILES = {
   BATT:{battery_metals:0.85, equity_beta:0.50}
 };
 
+var lossReviewState = { active: {}, history: [], triggered_count: 0 };
+
 /** Return "TICKER (Full Name)" or just "TICKER" if unknown */
 function tickerDisplay(symbol) {
   if (!symbol) return '';
@@ -242,6 +244,12 @@ function saveSignalHistory() {
 }
 
 var signalHistory = loadSignalHistory();
+const NEWS_SCORE_WINDOW = 25;
+const NEWS_DISPLAY_LIMIT = 100;
+const NEWS_CACHE_LIMIT = 200;
+const NEWS_FRESH_MS = 15 * 60 * 1000;
+var researchFeedAudit = null;
+var researchFeedAuditLoading = false;
 
 // ─── 2b. Session Status ──────────────────────────────────────────────────
 var sessionActive = false;
@@ -357,12 +365,15 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
       fetchPositionsFromApi();
       fetchCorrelationAndRender();
       renderFactorRiskTable();
+      fetchLossReviews();
     }
     if (btn.dataset.tab === 'performance') {
       fetchClosedTrades(true);
+      fetchPositionsFromApi();
+      refreshPerformanceCharts();
       fetch('/api/benchmarks').then(function(r) { return r.json(); }).then(function(d) {
         benchmarkReturns = (d && d.benchmarks) ? d.benchmarks : {};
-        updateNavChart();
+        refreshPerformanceCharts();
       }).catch(function() {});
     }
     if (btn.dataset.tab === 'operations' && typeof renderOpsOverview === 'function') renderOpsOverview();
@@ -375,9 +386,15 @@ function setExecSubTab(name) {
   });
   var tl = document.getElementById('exec-subtab-tradelog');
   var q = document.getElementById('exec-subtab-quality');
+  var br = document.getElementById('exec-subtab-broker');
+  var au = document.getElementById('exec-subtab-audit');
   if (tl) tl.style.display = name === 'tradelog' ? 'block' : 'none';
   if (q) q.style.display = name === 'quality' ? 'block' : 'none';
+  if (br) br.style.display = name === 'broker' ? 'block' : 'none';
+  if (au) au.style.display = name === 'audit' ? 'block' : 'none';
   if (name === 'quality' && typeof renderExecutionQuality === 'function') renderExecutionQuality();
+  if (name === 'broker' && typeof renderBrokerReconciliation === 'function') renderBrokerReconciliation();
+  if (name === 'audit' && typeof renderDecisionAudit === 'function') renderDecisionAudit();
 }
 
 function setOpsSubTab(name) {
@@ -386,27 +403,36 @@ function setOpsSubTab(name) {
   });
   var s = document.getElementById('ops-subtab-summary');
   var o = document.getElementById('ops-subtab-overview');
+  var h = document.getElementById('ops-subtab-health');
   if (s) s.style.display = name === 'summary' ? 'block' : 'none';
   if (o) o.style.display = name === 'overview' ? 'block' : 'none';
+  if (h) h.style.display = name === 'health' ? 'block' : 'none';
   if (name === 'overview' && typeof renderOpsOverview === 'function') renderOpsOverview();
+  if (name === 'health' && typeof renderStateHealth === 'function') renderStateHealth();
 }
 
 function renderExecutionQuality() {
   var el = document.getElementById('exec-quality-panel');
   if (!el) return;
   el.innerHTML = '<div class="empty"><div class="empty-txt">Loading…</div></div>';
-  fetch('/api/execution-quality').then(function(r) { return r.json(); }).then(function(data) {
-    var pods = Object.keys(data || {}).sort();
-    if (pods.length === 0) {
+  fetchJsonWithTimeout('/api/execution-quality', {}, 3500).then(function(data) {
+    var podIds = Object.keys(data || {}).sort();
+    if (podIds.length === 0) podIds = Object.keys(pods || {}).sort();
+    if (podIds.length === 0) podIds = ['commodities', 'crypto', 'equities', 'fx'];
+    if (podIds.length === 0) {
       el.innerHTML = '<div class="empty"><div class="empty-txt">No execution data</div></div>';
       return;
     }
     var html = '<div class="kpi-row">';
-    pods.forEach(function(pid) {
+    podIds.forEach(function(pid) {
       var s = data[pid] || {};
       var nf = s.fills_with_slippage_data || 0;
+      var totalFills = s.total_fills || executionFillCountForPod(pid);
+      var missing = s.fills_missing_slippage_data != null ? s.fills_missing_slippage_data : Math.max(0, totalFills - nf);
       html += '<div class="kpi"><div class="kpi-lbl">' + pid.toUpperCase() + '</div>';
-      if (nf === 0) {
+      if (nf === 0 && totalFills > 0) {
+        html += '<div class="kpi-val">' + totalFills + '</div><div class="kpi-sub">' + missing + ' fill' + (missing === 1 ? '' : 's') + ' missing slippage capture</div>';
+      } else if (nf === 0) {
         html += '<div class="kpi-val">—</div><div class="kpi-sub">No slippage data yet</div>';
       } else {
         html += '<div class="kpi-val">' + (s.avg_slippage_bps != null ? s.avg_slippage_bps + ' bps' : '—') + '</div>';
@@ -417,7 +443,659 @@ function renderExecutionQuality() {
     html += '</div>';
     el.innerHTML = html;
   }).catch(function() {
-    el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load execution quality</div></div>';
+    var podIds = Object.keys(pods || {}).sort();
+    if (podIds.length === 0) podIds = ['commodities', 'crypto', 'equities', 'fx'];
+    var html = '<div class="kpi-row">';
+    podIds.forEach(function(pid) {
+      var fills = executionFillCountForPod(pid);
+      html += '<div class="kpi"><div class="kpi-lbl">' + pid.toUpperCase() + '</div>' +
+        '<div class="kpi-val">' + (fills || '—') + '</div>' +
+        '<div class="kpi-sub">' + (fills ? 'local fills; slippage endpoint unavailable' : 'No local fills yet') + '</div></div>';
+    });
+    html += '</div>';
+    el.innerHTML = html;
+  });
+}
+
+function applyExecutionReconciliation(data) {
+  var updates = (data && data.updates) || [];
+  updates.forEach(function(u) {
+    if (!u || !u.order_id) return;
+    var key = u.local_order_id || u.order_id;
+    var existing = Object.assign({}, orderBook[key] || {}, orderBook[u.order_id] || {});
+    orderBook[key] = Object.assign(existing, u);
+    if (key !== u.order_id && orderBook[u.order_id]) delete orderBook[u.order_id];
+  });
+  if (updates.length) updateExecTable();
+}
+
+function reconcileExecutionOrders() {
+  return fetchJsonWithTimeout('/api/execution-reconciliation', { method: 'POST' }, 4500)
+    .then(function(data) {
+      applyExecutionReconciliation(data);
+      return data || {};
+    });
+}
+
+function moneyOrDash(v) {
+  var n = Number(v);
+  return Number.isFinite(n) ? '$' + n.toFixed(2) : '—';
+}
+
+function countText(count, singular, plural) {
+  var n = Number(count || 0);
+  return n + ' ' + (n === 1 ? singular : (plural || singular + 's'));
+}
+
+function fetchJsonWithTimeout(url, options, timeoutMs) {
+  var ms = timeoutMs || 4000;
+  if (typeof AbortController === 'undefined') {
+    return fetch(url, options || {}).then(function(r) {
+      if (!r.ok) throw new Error(url + ' returned HTTP ' + r.status);
+      return r.json();
+    });
+  }
+  var controller = new AbortController();
+  var opts = Object.assign({}, options || {}, { signal: controller.signal });
+  var timer = setTimeout(function() { controller.abort(); }, ms);
+  return fetch(url, opts).then(function(r) {
+    if (!r.ok) throw new Error(url + ' returned HTTP ' + r.status);
+    return r.json();
+  }).finally(function() {
+    clearTimeout(timer);
+  });
+}
+
+function executionFillCountForPod(pid) {
+  var key = String(pid || '').toLowerCase();
+  var count = 0;
+  (executedTrades || []).forEach(function(t) {
+    if (String(t.podId || t.pod_id || '').toLowerCase() === key &&
+        String(t.status || '').toUpperCase() === 'FILLED') count += 1;
+  });
+  Object.keys(orderBook || {}).forEach(function(oid) {
+    var o = orderBook[oid] || {};
+    if (String(o.pod_id || o.podId || '').toLowerCase() === key &&
+        String(o.status || '').toUpperCase() === 'FILLED') count += 1;
+  });
+  return count;
+}
+
+function orderDiagnosticAction(item) {
+  var reason = String(item.reason || '').toLowerCase();
+  var stage = String(item.stage || '').toLowerCase();
+  var symbol = String(item.symbol || '');
+  if (reason.indexOf('time_in_force') >= 0 || reason.indexOf('time in force') >= 0) {
+    return 'Fix order format: crypto should use GTC/IOC, equities normally DAY/GTC.';
+  }
+  if (reason.indexOf('buying power') >= 0 || reason.indexOf('insufficient') >= 0) {
+    return 'Reduce size or free capital before retrying.';
+  }
+  if (reason.indexOf('not tradable') >= 0 || reason.indexOf('inactive') >= 0 || reason.indexOf('unsupported') >= 0) {
+    return 'Remove or replace the symbol in the pod universe.';
+  }
+  if (symbol.indexOf('/') >= 0 && (!item.reason || reason === 'order rejected')) {
+    return 'Crypto rejection is still generic; check Alpaca crypto/account permissions and restart if server code was updated.';
+  }
+  if (stage.indexOf('preflight') >= 0) {
+    return 'Blocked before broker submit; PM/risk should adapt to the preflight reason.';
+  }
+  if (item.status === 'PENDING') {
+    return 'Pending at broker/local layer; reconcile if stale.';
+  }
+  return reason ? 'Use this reason in the next PM/risk decision.' : 'No specific broker reason captured yet.';
+}
+
+function recentExecutionDiagnostics(limit) {
+  var rows = Object.keys(orderBook || {}).map(function(k) {
+    return orderBook[k] || {};
+  }).concat(executedTrades || []);
+  var seen = {};
+  var out = [];
+  rows.forEach(function(item) {
+    var key = item.order_id || item.orderId || [item.pod_id || item.podId, item.symbol, item.status, item.reason].join('|');
+    if (seen[key]) return;
+    seen[key] = true;
+    var status = String(item.status || '').toUpperCase();
+    if (status !== 'REJECTED' && status !== 'PENDING' && status !== 'PARTIAL') return;
+    out.push({
+      ts: item.ts || item.timestamp || item.submitted_at || '',
+      pod_id: item.pod_id || item.podId || '',
+      symbol: item.symbol || '',
+      side: item.side || '',
+      qty: item.qty || item.quantity || 0,
+      status: status,
+      stage: item.stage || '',
+      reason: executionReasonForDisplay({
+        status: status,
+        symbol: item.symbol || '',
+        reason: item.reason || item.rejection_reason || item.rejection_detail || '',
+        stage: item.stage || '',
+      }),
+      order_id: item.order_id || item.orderId || '',
+    });
+  });
+  return out.slice(0, limit || 12);
+}
+
+function fallbackPodHealthRows() {
+  return Object.keys(pods || {}).sort().map(function(pid) {
+    var d = pods[pid] || {};
+    var nav = getPodNav(d);
+    var cash = getPodCash(d);
+    var invested = getPodInvested(d);
+    var startCap = getPodStartCap(d) || nav || 0;
+    var positions = getPodPositions(d);
+    return {
+      pod_id: pid,
+      status: nav > 0 || startCap > 0 ? 'OK' : 'CHECK',
+      issues: nav > 0 || startCap > 0 ? [] : ['Missing live NAV'],
+      starting_capital: startCap,
+      allocated_capital: startCap,
+      nav: nav || startCap,
+      cash: cash,
+      invested: invested,
+      position_count: positions.length,
+      last_nav_ts: d.timestamp || d.updated_at || null,
+      last_nav_quality: 'dashboard_snapshot',
+    };
+  });
+}
+
+function normalizeStateHealthData(data, reason) {
+  data = data || {};
+  var warnings = (data.warnings || []).slice();
+  if ((!data.pods || !data.pods.length) && Object.keys(pods || {}).length) {
+    data.pods = fallbackPodHealthRows();
+    warnings.push(reason || 'Health endpoint returned no pod rows; showing latest dashboard snapshot');
+  }
+  if (data.capital_per_pod == null || Number(data.capital_per_pod) <= 0) {
+    var ids = Object.keys(pods || {});
+    var totalStart = ids.reduce(function(sum, pid) {
+      return sum + (getPodStartCap(pods[pid]) || 0);
+    }, 0);
+    data.capital_per_pod = ids.length && totalStart > 0 ? totalStart / ids.length : data.capital_per_pod;
+  }
+  data.nav_history = data.nav_history || {};
+  if (!data.nav_history.total_rows && navHistory && navHistory.length) {
+    data.nav_history.total_rows = navHistory.length;
+    var last = navHistory[navHistory.length - 1] || {};
+    data.nav_history.last_ts = last.ts ? new Date(last.ts).toISOString() : null;
+  }
+  data.broker = data.broker || { status: 'UNKNOWN', mismatch_count: null, errors: [] };
+  data.warnings = warnings;
+  if (!data.status) data.status = warnings.length ? 'CHECK' : 'OK';
+  return data;
+}
+
+function renderStateHealthFallback(el, reason) {
+  var data = normalizeStateHealthData({}, reason);
+  var podsData = data.pods || [];
+  if (!podsData.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load state health</div><div class="empty-hint">' + escapeHtml(reason || '') + '</div></div>';
+    return;
+  }
+  var html = '<div class="broker-panel">' +
+    '<div class="sec-hdr"><span class="sec-title">System Health</span><span class="badge b-pending">LOCAL SNAPSHOT</span>' +
+    '<button class="export-btn" onclick="renderStateHealth()">Refresh</button></div>' +
+    '<div class="broker-errors"><div>' + escapeHtml(reason || 'Health endpoint unavailable; showing latest dashboard snapshot') + '</div></div>' +
+    '<div class="sec-hdr"><span class="sec-title">Pod State Integrity</span><span class="sec-badge">' + podsData.length + ' pods</span></div>' +
+    '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr><th>Pod</th><th>Status</th><th class="r">Start Cap</th><th class="r">NAV</th><th class="r">Cash</th><th class="r">Invested</th><th class="r">Positions</th></tr></thead><tbody>';
+  html += podsData.map(function(p) {
+    return '<tr><td style="font-weight:600">' + escapeHtml(String(p.pod_id || '').toUpperCase()) + '</td>' +
+      '<td><span class="badge ' + (p.status === 'OK' ? 'b-active' : 'b-pending') + '">' + escapeHtml(p.status || '') + '</span></td>' +
+      '<td class="r">' + moneyOrDash(p.starting_capital) + '</td>' +
+      '<td class="r">' + moneyOrDash(p.nav) + '</td>' +
+      '<td class="r">' + moneyOrDash(p.cash) + '</td>' +
+      '<td class="r">' + moneyOrDash(p.invested) + '</td>' +
+      '<td class="r">' + (p.position_count || 0) + '</td></tr>';
+  }).join('');
+  html += '</tbody></table></div></div>';
+  el.innerHTML = html;
+}
+
+function renderStateHealth() {
+  var el = document.getElementById('state-health-panel');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><div class="empty-txt">Checking state health…</div></div>';
+  fetchJsonWithTimeout('/api/state-health', {}, 3500).then(function(data) {
+    data = normalizeStateHealthData(data);
+    var podsData = data.pods || [];
+    var nav = data.nav_history || {};
+    var broker = data.broker || {};
+    var dq = data.data_quality || {};
+    var statusCls = data.status === 'OK' ? 'b-active' : 'b-pending';
+    var html = '<div class="broker-panel">';
+    html += '<div class="sec-hdr"><span class="sec-title">System Health</span>' +
+      '<span class="badge ' + statusCls + '">' + escapeHtml(data.status || 'UNKNOWN') + '</span>' +
+      '<button class="export-btn" onclick="renderStateHealth()">Refresh</button></div>';
+    html += '<div class="kpi-row">' +
+      '<div class="kpi"><div class="kpi-lbl">Pod Capital</div><div class="kpi-val">' + moneyOrDash(data.capital_per_pod) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">NAV Rows</div><div class="kpi-val">' + (nav.total_rows || 0) + '</div><div class="kpi-sub">' + countText(nav.repaired_rows || 0, 'repaired row') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Broker Match</div><div class="kpi-val">' + escapeHtml(broker.status || 'UNKNOWN') + '</div><div class="kpi-sub">' + (broker.mismatch_count == null ? 'not checked' : countText(broker.mismatch_count, 'mismatch')) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Data Quality</div><div class="kpi-val">' + escapeHtml(dq.status || 'UNKNOWN') + '</div><div class="kpi-sub">' + countText(dq.check_count || 0, 'position flagged') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Last NAV</div><div class="kpi-val" style="font-size:14px">' + escapeHtml(formatEndDate(nav.last_ts)) + '</div><div class="kpi-sub">' + escapeHtml(formatTime(nav.last_ts)) + '</div></div>' +
+      '</div>';
+    var warnings = (data.warnings || []).concat(broker.errors || []);
+    if (warnings.length) {
+      html += '<div class="broker-errors">' + warnings.map(function(w) { return '<div>' + escapeHtml(w) + '</div>'; }).join('') + '</div>';
+    }
+    var dqRows = dq.positions || [];
+    html += '<div class="sec-hdr"><span class="sec-title">Market Data Quality</span><span class="sec-badge">' + (dqRows.length || 0) + ' positions</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Pod</th><th>Symbol</th><th>Status</th><th class="r">Price</th><th>Source</th><th>Updated</th><th class="r">Current Notional</th><th>Issues</th>' +
+      '</tr></thead><tbody>';
+    if (!dqRows.length) {
+      html += '<tr><td colspan="8" class="empty"><div class="empty-txt">No open positions to check</div></td></tr>';
+    } else {
+      html += dqRows.map(function(row) {
+        var ok = row.status === 'OK';
+        return '<tr>' +
+          '<td style="font-weight:600">' + escapeHtml(String(row.pod_id || '').toUpperCase()) + '</td>' +
+          '<td class="mono">' + escapeHtml(row.symbol || '') + '</td>' +
+          '<td><span class="badge ' + (ok ? 'b-active' : 'b-pending') + '">' + escapeHtml(row.status || '') + '</span></td>' +
+          '<td class="r">' + moneyOrDash(row.current_price) + '</td>' +
+          '<td>' + escapeHtml(row.price_source || '-') + '</td>' +
+          '<td class="mono">' + escapeHtml(formatRelativeTime(row.price_updated_at)) + '</td>' +
+          '<td class="r">' + moneyOrDash(row.current_notional) + '</td>' +
+          '<td>' + ((row.issues || []).length ? escapeHtml((row.issues || []).join('; ')) : '-') + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div>';
+    var dqFailures = dq.recent_failures || [];
+    if (dqFailures.length) {
+      html += '<div class="sec-hdr"><span class="sec-title">Recent Data Gate Blocks</span><span class="sec-badge">' + dqFailures.length + ' events</span></div>';
+      html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+        '<th>Pod</th><th>Symbol</th><th>Side</th><th class="r">Price</th><th>Source</th><th>Checked</th><th>Issues</th>' +
+        '</tr></thead><tbody>' + dqFailures.map(function(f) {
+          return '<tr>' +
+            '<td style="font-weight:600">' + escapeHtml(String(f.pod_id || '').toUpperCase()) + '</td>' +
+            '<td class="mono">' + escapeHtml(f.symbol || '') + '</td>' +
+            '<td>' + escapeHtml(f.side || '') + '</td>' +
+            '<td class="r">' + moneyOrDash(f.price) + '</td>' +
+            '<td>' + escapeHtml(f.price_source || '-') + '</td>' +
+            '<td class="mono">' + escapeHtml(formatRelativeTime(f.checked_at)) + '</td>' +
+            '<td>' + escapeHtml((f.issues || []).join('; ') || '-') + '</td>' +
+            '</tr>';
+        }).join('') + '</tbody></table></div>';
+    }
+    html += '<div class="sec-hdr"><span class="sec-title">Pod State Integrity</span><span class="sec-badge">' + podsData.length + ' pods</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Pod</th><th>Status</th><th class="r">Start Cap</th><th class="r">NAV</th><th class="r">Cash</th><th class="r">Invested</th><th class="r">Positions</th><th>Last NAV</th><th>Issues</th>' +
+      '</tr></thead><tbody>';
+    if (!podsData.length) {
+      html += '<tr><td colspan="9" class="empty"><div class="empty-txt">No pod health data yet</div></td></tr>';
+    } else {
+      html += podsData.map(function(p) {
+        var ok = p.status === 'OK';
+        return '<tr>' +
+          '<td style="font-weight:600">' + escapeHtml(String(p.pod_id || '').toUpperCase()) + '</td>' +
+          '<td><span class="badge ' + (ok ? 'b-active' : 'b-pending') + '">' + escapeHtml(p.status || '') + '</span></td>' +
+          '<td class="r">' + moneyOrDash(p.starting_capital) + '</td>' +
+          '<td class="r">' + moneyOrDash(p.nav) + '</td>' +
+          '<td class="r">' + moneyOrDash(p.cash) + '</td>' +
+          '<td class="r">' + moneyOrDash(p.invested) + '</td>' +
+          '<td class="r">' + (p.position_count || 0) + '</td>' +
+          '<td class="mono">' + escapeHtml(formatRelativeTime(p.last_nav_ts)) + '</td>' +
+          '<td>' + ((p.issues || []).length ? escapeHtml((p.issues || []).join('; ')) : '—') + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div>';
+    html += '</div>';
+    el.innerHTML = html;
+  }).catch(function(err) {
+    renderStateHealthFallback(el, err && err.message ? err.message : 'Could not load state health');
+  });
+}
+
+function localBrokerPositionRows() {
+  var rowsBySymbol = {};
+  var localPositions = (_positionsFromApi && _positionsFromApi.length) ? _positionsFromApi.slice() : [];
+  if (!localPositions.length) {
+    Object.keys(pods || {}).forEach(function(pid) {
+      getPodPositions(pods[pid] || {}).forEach(function(p) {
+        localPositions.push(Object.assign({}, p, { _pod: pid }));
+      });
+    });
+  }
+  localPositions.forEach(function(p) {
+    var symbol = p.symbol || '';
+    if (!symbol) return;
+    var qty = Number(p.qty || 0);
+    var price = Number(p.current_price || p.price || 0);
+    var row = rowsBySymbol[symbol] || {
+      symbol: symbol,
+      status: 'LOCAL_ONLY',
+      local_qty: 0,
+      broker_qty: 0,
+      qty_delta: -qty,
+      local_notional: 0,
+      pods: [],
+    };
+    row.local_qty += qty;
+    row.local_notional += Math.abs(qty * price);
+    row.pods.push({
+      pod_id: p._pod || p.pod_id || '',
+      qty: qty,
+      current_price: price,
+      notional: Math.abs(qty * price),
+    });
+    rowsBySymbol[symbol] = row;
+  });
+  return Object.keys(rowsBySymbol).sort().map(function(k) {
+    var row = rowsBySymbol[k];
+    row.qty_delta = Number(row.broker_qty || 0) - Number(row.local_qty || 0);
+    return row;
+  });
+}
+
+function renderBrokerReconciliationFallback(el, reason) {
+  var positions = localBrokerPositionRows();
+  var diagnostics = recentExecutionDiagnostics(12);
+  if (!positions.length && !diagnostics.length) {
+    el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load broker reconciliation</div><div class="empty-hint">' + escapeHtml(reason || '') + '</div></div>';
+    return;
+  }
+  var html = '<div class="broker-panel">' +
+    '<div class="sec-hdr"><span class="sec-title">Broker Reconciliation</span><span class="badge b-pending">LOCAL SNAPSHOT</span>' +
+    '<button class="export-btn" onclick="renderBrokerReconciliation()">Refresh</button></div>' +
+    '<div class="broker-errors"><div>' + escapeHtml(reason || 'Broker reconciliation unavailable; showing local dashboard state') + '</div></div>' +
+    '<div class="sec-hdr"><span class="sec-title">Position Match</span><span class="sec-badge">' + positions.length + ' local</span></div>' +
+    '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr><th>Symbol</th><th>Status</th><th class="r">Local Qty</th><th class="r">Broker Qty</th><th class="r">Delta</th><th>Pods</th></tr></thead><tbody>';
+  if (!positions.length) {
+    html += '<tr><td colspan="6" class="empty"><div class="empty-txt">No local positions loaded yet</div></td></tr>';
+  } else {
+    html += positions.map(function(p) {
+      var podsTxt = (p.pods || []).map(function(pp) {
+        return (pp.pod_id || '').toUpperCase() + ' ' + Number(pp.qty || 0).toFixed(4);
+      }).join(', ');
+      return '<tr><td style="font-weight:600">' + tickerDisplay(p.symbol || '') + '</td>' +
+        '<td><span class="badge b-pending">' + escapeHtml(p.status || 'LOCAL_ONLY') + '</span></td>' +
+        '<td class="r">' + Number(p.local_qty || 0).toFixed(4) + '</td>' +
+        '<td class="r">—</td><td class="r">—</td><td>' + (podsTxt ? escapeHtml(podsTxt) : '—') + '</td></tr>';
+    }).join('');
+  }
+  html += '</tbody></table></div>';
+  html += '<div class="sec-hdr"><span class="sec-title">Recent Execution Diagnostics</span><span class="sec-badge">' + diagnostics.length + ' item' + (diagnostics.length === 1 ? '' : 's') + '</span></div>' +
+    '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr><th>Pod</th><th>Symbol</th><th>Status</th><th>Stage</th><th>Reason</th><th>Next Action</th></tr></thead><tbody>';
+  html += diagnostics.length ? diagnostics.map(function(d) {
+    var ss = d.status === 'REJECTED' ? 'b-rejected' : d.status === 'PENDING' ? 'b-pending' : 'b-partial';
+    return '<tr><td>' + escapeHtml(String(d.pod_id || '').toUpperCase()) + '</td><td style="font-weight:600">' + tickerDisplay(d.symbol || '') + '</td>' +
+      '<td><span class="badge ' + ss + '">' + escapeHtml(d.status || '') + '</span></td><td class="exec-stage">' + escapeHtml((d.stage || '—').replace(/_/g, ' ')) + '</td>' +
+      '<td><span class="exec-reason" title="' + escapeHtml(d.reason || '') + '">' + escapeHtml(d.reason || '—') + '</span></td><td>' + escapeHtml(orderDiagnosticAction(d)) + '</td></tr>';
+  }).join('') : '<tr><td colspan="6" class="empty"><div class="empty-txt">No rejected or pending diagnostics</div></td></tr>';
+  html += '</tbody></table></div></div>';
+  el.innerHTML = html;
+}
+
+function renderBrokerReconciliation() {
+  var el = document.getElementById('broker-reconciliation-panel');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><div class="empty-txt">Reconciling with Alpaca…</div></div>';
+  Promise.all([
+    fetchJsonWithTimeout('/api/broker-reconciliation', {}, 4500),
+    reconcileExecutionOrders().catch(function() { return { updates: [], errors: ['Order reconciliation failed'] }; })
+  ]).then(function(results) {
+    var data = results[0] || {};
+    var exec = results[1] || {};
+    var acct = data.account || {};
+    var mismatches = data.mismatches || [];
+    var positions = data.positions || [];
+    if (!positions.length && _positionsFromApi && _positionsFromApi.length) {
+      positions = localBrokerPositionRows();
+      errors.push('Broker reconciliation endpoint returned no positions; showing local dashboard positions only');
+    }
+    var openOrders = data.open_orders || [];
+    var errors = (data.errors || []).concat(exec.errors || []);
+    var statusClass = data.status === 'OK' && !errors.length ? 'b-active' : 'b-rejected';
+    var statusText = data.status === 'OK' && !errors.length ? 'IN SYNC' : 'CHECK';
+
+    var html = '<div class="broker-panel">';
+    html += '<div class="sec-hdr"><span class="sec-title">Broker Reconciliation</span>' +
+      '<span class="badge ' + statusClass + '">' + statusText + '</span>' +
+      '<button class="export-btn" onclick="renderBrokerReconciliation()">Refresh</button></div>';
+    html += '<div class="kpi-row">' +
+      '<div class="kpi"><div class="kpi-lbl">Broker Equity</div><div class="kpi-val">' + moneyOrDash(acct.equity) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Buying Power</div><div class="kpi-val">' + moneyOrDash(acct.buying_power) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Broker Positions</div><div class="kpi-val">' + (acct.position_count != null ? acct.position_count : positions.length) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Order Updates</div><div class="kpi-val">' + ((exec.updates || []).length || 0) + '</div><div class="kpi-sub">reconciled now</div></div>' +
+      '</div>';
+
+    if (errors.length) {
+      html += '<div class="broker-errors">' + errors.map(function(e) {
+        return '<div>' + escapeHtml(e) + '</div>';
+      }).join('') + '</div>';
+    }
+
+    html += '<div class="sec-hdr"><span class="sec-title">Position Match</span><span class="sec-badge">' + mismatches.length + ' mismatch' + (mismatches.length === 1 ? '' : 'es') + '</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Symbol</th><th>Status</th><th class="r">Local Qty</th><th class="r">Broker Qty</th><th class="r">Delta</th><th>Pods</th>' +
+      '</tr></thead><tbody>';
+    if (!positions.length) {
+      html += '<tr><td colspan="6" class="empty"><div class="empty-txt">No local or broker positions</div></td></tr>';
+    } else {
+      html += positions.map(function(p) {
+        var ok = p.status === 'OK';
+        var podsTxt = (p.pods || []).map(function(pp) {
+          return (pp.pod_id || '').toUpperCase() + ' ' + Number(pp.qty || 0).toFixed(4);
+        }).join(', ');
+        return '<tr>' +
+          '<td style="font-weight:600">' + tickerDisplay(p.symbol || '') + '</td>' +
+          '<td><span class="badge ' + (ok ? 'b-active' : 'b-rejected') + '">' + escapeHtml(p.status || '') + '</span></td>' +
+          '<td class="r">' + Number(p.local_qty || 0).toFixed(4) + '</td>' +
+          '<td class="r">' + Number(p.broker_qty || 0).toFixed(4) + '</td>' +
+          '<td class="r ' + (ok ? '' : 'neg') + '">' + Number(p.qty_delta || 0).toFixed(4) + '</td>' +
+          '<td>' + (podsTxt ? escapeHtml(podsTxt) : '—') + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div>';
+
+    var diagnostics = recentExecutionDiagnostics(12);
+    html += '<div class="sec-hdr"><span class="sec-title">Recent Execution Diagnostics</span><span class="sec-badge">' + diagnostics.length + ' item' + (diagnostics.length === 1 ? '' : 's') + '</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Pod</th><th>Symbol</th><th>Status</th><th>Stage</th><th>Reason</th><th>Next Action</th>' +
+      '</tr></thead><tbody>';
+    if (!diagnostics.length) {
+      html += '<tr><td colspan="6" class="empty"><div class="empty-txt">No rejected or pending diagnostics</div></td></tr>';
+    } else {
+      html += diagnostics.map(function(d) {
+        var ss = d.status === 'REJECTED' ? 'b-rejected' : d.status === 'PENDING' ? 'b-pending' : 'b-partial';
+        return '<tr>' +
+          '<td>' + escapeHtml(String(d.pod_id || '').toUpperCase()) + '</td>' +
+          '<td style="font-weight:600">' + tickerDisplay(d.symbol || '') + '</td>' +
+          '<td><span class="badge ' + ss + '">' + escapeHtml(d.status || '') + '</span></td>' +
+          '<td class="exec-stage">' + escapeHtml((d.stage || '—').replace(/_/g, ' ')) + '</td>' +
+          '<td><span class="exec-reason" title="' + escapeHtml(d.reason || '') + '">' + escapeHtml(d.reason || '—') + '</span></td>' +
+          '<td>' + escapeHtml(orderDiagnosticAction(d)) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div>';
+
+    html += '<div class="sec-hdr"><span class="sec-title">Broker Open Orders</span><span class="sec-badge">' + openOrders.length + ' open</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Order</th><th>Symbol</th><th>Side</th><th class="r">Qty</th><th>Status</th><th>Submitted</th>' +
+      '</tr></thead><tbody>';
+    if (!openOrders.length) {
+      html += '<tr><td colspan="6" class="empty"><div class="empty-txt">No open broker orders</div></td></tr>';
+    } else {
+      html += openOrders.map(function(o) {
+        return '<tr>' +
+          '<td class="mono">' + escapeHtml(String(o.order_id || '').slice(0, 12)) + '</td>' +
+          '<td style="font-weight:600">' + tickerDisplay(o.symbol || '') + '</td>' +
+          '<td><span class="badge ' + (String(o.side || '').toUpperCase() === 'BUY' ? 'b-buy' : 'b-sell') + '">' + escapeHtml(String(o.side || '').toUpperCase()) + '</span></td>' +
+          '<td class="r">' + Number(o.qty || 0).toFixed(4) + '</td>' +
+          '<td><span class="badge b-pending">' + escapeHtml(o.status || '') + '</span></td>' +
+          '<td>' + escapeHtml(String(o.submitted_at || '—')) + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    html += '</tbody></table></div></div>';
+    el.innerHTML = html;
+  }).catch(function(err) {
+    renderBrokerReconciliationFallback(el, err && err.message ? err.message : 'Could not load broker reconciliation');
+  });
+}
+
+function localDecisionAuditItems(limit) {
+  var items = [];
+  (activityFeed || []).forEach(function(a) {
+    var action = a.action || '';
+    if (action && ['trade_decision', 'thesis_verification', 'thesis_review', 'position_review', 'mandate_update', 'allocation'].indexOf(action) === -1) return;
+    items.push({
+      ts: a.ts || a.timestamp || '',
+      pod_id: a.pod_id || '',
+      stage: action || 'agent_activity',
+      agent: a.agent_role || a.agent_id || '',
+      symbol: a.symbol || '',
+      decision: a.summary || '',
+      detail: a.detail || '',
+      status: 'INFO',
+      reason: a.reason || '',
+    });
+  });
+  Object.keys(orderBook || {}).forEach(function(oid) {
+    var o = orderBook[oid] || {};
+    items.push({
+      ts: o.ts || o.timestamp || o.submitted_at || '',
+      pod_id: o.pod_id || o.podId || '',
+      stage: o.stage || 'execution',
+      agent: 'execution',
+      symbol: o.symbol || '',
+      decision: ((o.side || '') + ' ' + (o.qty || o.quantity || '')).trim(),
+      detail: o.reason || o.rejection_reason || o.rejection_detail || '',
+      status: String(o.status || 'INFO').toUpperCase(),
+      reason: o.reason || o.rejection_reason || o.rejection_detail || '',
+      order_id: oid,
+    });
+  });
+  (executedTrades || []).forEach(function(t) {
+    items.push({
+      ts: t.ts || t.timestamp || '',
+      pod_id: t.podId || t.pod_id || '',
+      stage: 'execution_fill',
+      agent: 'execution',
+      symbol: t.symbol || '',
+      decision: ((t.side || '') + ' ' + (t.qty || '')).trim(),
+      detail: 'Filled at ' + (t.price || t.fill_price || ''),
+      status: String(t.status || 'FILLED').toUpperCase(),
+      reason: '',
+      order_id: t.orderId || t.order_id || '',
+    });
+  });
+  items.sort(function(a, b) { return String(b.ts || '').localeCompare(String(a.ts || '')); });
+  return items.slice(0, limit || 80);
+}
+
+function executionTruthBadgeClass(status) {
+  status = String(status || '').toUpperCase();
+  if (status === 'REJECTED' || status === 'BLOCKED') return 'b-rejected';
+  if (status === 'PENDING' || status === 'PROPOSED' || status === 'PARTIAL') return 'b-pending';
+  if (status === 'FILLED') return 'b-filled';
+  return 'b-active';
+}
+
+function renderExecutionTruthPanel(rows) {
+  rows = rows || [];
+  var html = '<div style="margin-bottom:12px">' +
+    '<div class="sec-hdr"><span class="sec-title">Execution Truth</span>' +
+    '<span class="sec-badge">' + rows.length + ' pod' + (rows.length === 1 ? '' : 's') + '</span></div>';
+  if (!rows.length) {
+    return html + '<div class="empty"><div class="empty-txt">No execution truth snapshot yet</div></div></div>';
+  }
+  html += '<div class="tbl-wrap"><table class="dtbl"><thead><tr>' +
+    '<th>Pod</th><th>Status</th><th>PM Decision</th><th>Gate / Stage</th><th>Reason</th><th>Last Order</th>' +
+    '</tr></thead><tbody>';
+  html += rows.map(function(row) {
+    var status = String(row.status || 'UNKNOWN').toUpperCase();
+    var gateBits = [];
+    if (row.thesis_gate && row.thesis_gate.passed === false) gateBits.push('thesis failed');
+    if (row.data_gate && row.data_gate.passed === false) gateBits.push('data failed');
+    var stage = gateBits.length ? gateBits.join(', ') : (row.stage || '—');
+    var order = row.last_order_result || {};
+    var orderText = order.symbol
+      ? (tickerDisplay(order.symbol) + ' ' + escapeHtml(order.side || '') + ' ' + escapeHtml(order.qty || '') + ' ' + escapeHtml(order.status || ''))
+      : '—';
+    var symbols = (row.active_symbols || []).map(tickerDisplay).join(', ');
+    var pmText = row.pm_summary || (symbols ? 'Active: ' + symbols : 'No active trade');
+    return '<tr>' +
+      '<td><b>' + escapeHtml(String(row.pod_id || '').toUpperCase()) + '</b></td>' +
+      '<td><span class="badge ' + executionTruthBadgeClass(status) + '">' + escapeHtml(status.replace(/_/g, ' ')) + '</span></td>' +
+      '<td>' + escapeHtml(pmText) + '</td>' +
+      '<td>' + escapeHtml(String(stage).replace(/_/g, ' ')) + '</td>' +
+      '<td style="max-width:320px;white-space:normal">' + escapeHtml(row.reason || '—') + '</td>' +
+      '<td>' + orderText + '</td>' +
+      '</tr>';
+  }).join('');
+  return html + '</tbody></table></div></div>';
+}
+
+function renderDecisionAudit() {
+  var el = document.getElementById('decision-audit-panel');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><div class="empty-txt">Loading decision audit…</div></div>';
+  fetchJsonWithTimeout('/api/decision-audit?limit=80', {}, 3500).then(function(data) {
+    var items = data.items || [];
+    if (!items.length) items = localDecisionAuditItems(80);
+    var truthRows = data.execution_truth && data.execution_truth.pods ? data.execution_truth.pods : [];
+    var html = '<div class="broker-panel">';
+    html += '<div class="sec-hdr"><span class="sec-title">Decision Audit Trail</span>' +
+      '<span class="sec-badge">' + items.length + ' event' + (items.length === 1 ? '' : 's') + '</span>' +
+      '<button class="export-btn" onclick="renderDecisionAudit()">Refresh</button></div>';
+    html += renderExecutionTruthPanel(truthRows);
+    html += '<div class="audit-list">';
+    if (!items.length) {
+      html += '<div class="empty"><div class="empty-txt">No decision events yet</div></div>';
+    } else {
+      html += items.map(function(item) {
+        var status = String(item.status || 'INFO').toUpperCase();
+        var cls = status === 'REJECTED' ? 'b-rejected' : status === 'FILLED' ? 'b-filled' : status === 'PENDING' ? 'b-pending' : 'b-active';
+        var pod = item.pod_id ? String(item.pod_id).toUpperCase() : 'FIRM';
+        var detail = item.detail || item.reason || '';
+        return '<div class="audit-card">' +
+          '<div class="audit-card-head">' +
+            '<span class="badge ' + cls + '">' + escapeHtml(status) + '</span>' +
+            '<span class="audit-stage">' + escapeHtml((item.stage || 'event').replace(/_/g, ' ')) + '</span>' +
+            '<span class="audit-pod">' + escapeHtml(pod) + '</span>' +
+            (item.symbol ? '<span class="audit-symbol">' + tickerDisplay(item.symbol) + '</span>' : '') +
+            '<span class="audit-time">' + escapeHtml(formatRelativeTime(item.ts)) + '</span>' +
+          '</div>' +
+          '<div class="audit-decision">' + escapeHtml(item.decision || '—') + '</div>' +
+          (detail ? '<div class="audit-detail">' + escapeHtml(detail) + '</div>' : '') +
+          '</div>';
+      }).join('');
+    }
+    html += '</div></div>';
+    el.innerHTML = html;
+  }).catch(function(err) {
+    var items = localDecisionAuditItems(80);
+    if (!items.length) {
+      el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load decision audit</div></div>';
+      return;
+    }
+    var html = '<div class="broker-panel"><div class="sec-hdr"><span class="sec-title">Decision Audit Trail</span>' +
+      '<span class="sec-badge">' + items.length + ' local event' + (items.length === 1 ? '' : 's') + '</span>' +
+      '<button class="export-btn" onclick="renderDecisionAudit()">Refresh</button></div>' +
+      '<div class="broker-errors"><div>' + escapeHtml(err && err.message ? err.message : 'Decision audit endpoint unavailable; showing local dashboard events') + '</div></div>' +
+      '<div class="audit-list">';
+    html += items.map(function(item) {
+      var status = String(item.status || 'INFO').toUpperCase();
+      var cls = status === 'REJECTED' ? 'b-rejected' : status === 'FILLED' ? 'b-filled' : status === 'PENDING' ? 'b-pending' : 'b-active';
+      var pod = item.pod_id ? String(item.pod_id).toUpperCase() : 'FIRM';
+      var detail = item.detail || item.reason || '';
+      return '<div class="audit-card"><div class="audit-card-head">' +
+        '<span class="badge ' + cls + '">' + escapeHtml(status) + '</span>' +
+        '<span class="audit-stage">' + escapeHtml((item.stage || 'event').replace(/_/g, ' ')) + '</span>' +
+        '<span class="audit-pod">' + escapeHtml(pod) + '</span>' +
+        (item.symbol ? '<span class="audit-symbol">' + tickerDisplay(item.symbol) + '</span>' : '') +
+        '<span class="audit-time">' + escapeHtml(formatRelativeTime(item.ts)) + '</span></div>' +
+        '<div class="audit-decision">' + escapeHtml(item.decision || '—') + '</div>' +
+        (detail ? '<div class="audit-detail">' + escapeHtml(detail) + '</div>' : '') + '</div>';
+    }).join('');
+    el.innerHTML = html + '</div></div>';
   });
 }
 
@@ -465,6 +1143,9 @@ function switchResearchSubTab(name) {
   });
   if (name === 'historical' && researchHistoryChart) {
     researchHistoryChart.resize();
+  }
+  if (name === 'feed-health') {
+    renderResearchFeedAudit();
   }
 }
 document.querySelectorAll('.sub-tab-btn').forEach(btn => {
@@ -889,6 +1570,7 @@ function updateVixKpi() {
 function formatRelativeTime(ts) {
   if (!ts) return '—';
   const d = typeof ts === 'string' ? new Date(ts) : ts;
+  if (isNaN(d.getTime())) return '';
   const now = Date.now();
   const diff = now - d.getTime();
   if (diff < 60000) return 'Just now';
@@ -897,19 +1579,96 @@ function formatRelativeTime(ts) {
   return Math.floor(diff / 86400000) + 'd ago';
 }
 
+function newsItemText(item) {
+  return String((item && (item.text || item.title || item.headline || item.summary)) || '').trim();
+}
+
+function newsItemSource(item) {
+  return String((item && (item.handle || item.username || item.source || item.publisher)) || 'news').trim() || 'news';
+}
+
+function newsItemTimestamp(item) {
+  if (!item) return 0;
+  var raw = item.timestamp || item.published || item.published_at || item.date || item.ts;
+  var ms = raw ? new Date(raw).getTime() : 0;
+  return Number.isFinite(ms) ? ms : 0;
+}
+
+function newsItemKey(item) {
+  var url = String((item && item.url) || '').trim().toLowerCase();
+  if (url && url !== '#') return 'url|' + url;
+  return 'text|' + newsItemSource(item).toLowerCase() + '|' + newsItemText(item).toLowerCase().slice(0, 180);
+}
+
+function normalizeNewsFeed(items) {
+  var seen = new Set();
+  return (items || [])
+    .filter(function(item) { return item && newsItemText(item); })
+    .sort(function(a, b) { return newsItemTimestamp(b) - newsItemTimestamp(a); })
+    .filter(function(item) {
+      var key = newsItemKey(item);
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, NEWS_CACHE_LIMIT);
+}
+
+function mergeNewsFeed(incoming) {
+  researchXFeed = normalizeNewsFeed((researchXFeed || []).concat(incoming || []));
+  researchXTweetCount = researchXFeed.length;
+}
+
+function newsFeedStats(feed) {
+  var sources = {};
+  var scored = 0;
+  var fresh = 0;
+  var newest = 0;
+  var now = Date.now();
+  (feed || []).forEach(function(item) {
+    var source = newsItemSource(item);
+    sources[source] = (sources[source] || 0) + 1;
+    if (item.sentiment != null || item.relevancy != null || item.impact != null) scored += 1;
+    var ts = newsItemTimestamp(item);
+    if (ts) {
+      newest = Math.max(newest, ts);
+      if (now - ts <= NEWS_FRESH_MS) fresh += 1;
+    }
+  });
+  var sourceRows = Object.keys(sources)
+    .sort(function(a, b) { return sources[b] - sources[a] || a.localeCompare(b); })
+    .map(function(source) { return { source: source, count: sources[source] }; });
+  return {
+    total: (feed || []).length,
+    source_count: sourceRows.length,
+    sources: sourceRows,
+    scored: scored,
+    fresh: fresh,
+    newest: newest,
+  };
+}
+
 function createNewsCard(item) {
-  const text = item.text || item.title || item.headline || '';
+  const text = newsItemText(item);
   const url = item.url || '#';
-  const source = item.handle || item.username || item.source || 'news';
+  const source = newsItemSource(item);
   const ts = item.timestamp || item.published;
+  const tsMs = newsItemTimestamp(item);
   const sent = item.sentiment;
   const cat = item.category || 'Markets';
+  const isFresh = tsMs && Date.now() - tsMs <= NEWS_FRESH_MS;
+  const hasSentiment = sent != null || item.relevancy != null || item.impact != null;
   const sentClass = sent != null && sent > 0.1 ? 'bullish' : sent != null && sent < -0.1 ? 'bearish' : 'neutral';
-  return '<div class="news-card">' +
+  const scoreLabel = hasSentiment
+    ? '<span class="nc-score">sentiment</span>'
+    : '<span class="nc-score muted">raw</span>';
+  return '<div class="news-card' + (isFresh ? ' fresh' : '') + '">' +
     '<div class="nc-meta">' +
+    (isFresh ? '<span class="nc-new">NEW</span>' : '') +
     '<span class="nc-cat">' + escapeHtml(cat) + '</span>' +
     '<span class="nc-dot ' + sentClass + '"></span>' +
     '<span class="nc-time">' + formatRelativeTime(ts) + '</span>' +
+    scoreLabel +
     '</div>' +
     '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" class="nc-title">' + escapeHtml(truncate(text, 80)) + '</a>' +
     '<div class="nc-source">' + escapeHtml(source) + '</div>' +
@@ -922,17 +1681,32 @@ function renderNewsFeed() {
   const sentimentEl = document.getElementById('social-sentiment-val');
   const countEl = document.getElementById('social-tweet-count');
   const sourcesEl = document.getElementById('social-sources-count');
+  const uniqueSourcesEl = document.getElementById('social-unique-sources');
+  const sourceBreakdownEl = document.getElementById('social-source-breakdown');
   const refreshEl = document.getElementById('social-last-refresh');
   const badgeEl = document.getElementById('social-badge');
 
-  const feed = researchXFeed || [];
-  const count = researchXTweetCount != null ? researchXTweetCount : feed.length;
-  const sentiment = researchSocialScore != null ? researchSocialScore.toFixed(3) : '—';
+  const feed = normalizeNewsFeed(researchXFeed || []);
+  researchXFeed = feed;
+  researchXTweetCount = feed.length;
+  const stats = newsFeedStats(feed);
+  const count = stats.total;
+  const sentiment = researchSocialScore != null ? researchSocialScore.toFixed(3) : '-';
 
   if (sentimentEl) sentimentEl.textContent = sentiment;
   if (countEl) countEl.textContent = count;
-  if (sourcesEl) sourcesEl.textContent = feed.length ? feed.length + '/25' : '0/25';
-  if (refreshEl) refreshEl.textContent = newsLastRefresh ? formatRelativeTime(newsLastRefresh) : '—';
+  if (sourcesEl) sourcesEl.textContent = NEWS_SCORE_WINDOW;
+  if (uniqueSourcesEl) uniqueSourcesEl.textContent = stats.source_count;
+  if (sourceBreakdownEl) {
+    const topSources = stats.sources.slice(0, 6).map(function(row) {
+      return row.source + ' ' + row.count;
+    }).join(' | ');
+    sourceBreakdownEl.textContent = topSources
+      ? 'Fresh ' + stats.fresh + ' | Showing ' + Math.min(stats.total, NEWS_DISPLAY_LIMIT) + ' of ' + stats.total + ' | ' + topSources
+      : 'Waiting for source mix...';
+  }
+  const newestIso = stats.newest ? new Date(stats.newest).toISOString() : newsLastRefresh;
+  if (refreshEl) refreshEl.textContent = newestIso ? formatRelativeTime(newestIso) : '-';
   if (badgeEl) badgeEl.textContent = count > 0 ? count : '';
 
   if (!container) return;
@@ -951,7 +1725,140 @@ function renderNewsFeed() {
     wrap.className = 'news-feed-wrap';
     container.appendChild(wrap);
   }
-  wrap.innerHTML = feed.slice(0, 100).map(createNewsCard).join('');
+  wrap.innerHTML = feed.slice(0, NEWS_DISPLAY_LIMIT).map(createNewsCard).join('');
+}
+
+function setText(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function researchTags(values, cls) {
+  const arr = Array.isArray(values) ? values.filter(Boolean) : [];
+  if (!arr.length) return '<span class="rf-tag muted">none</span>';
+  return arr.slice(0, 8).map(function(v) {
+    return '<span class="rf-tag ' + (cls || '') + '">' + escapeHtml(String(v)) + '</span>';
+  }).join('');
+}
+
+function renderResearchSourceHealthTable(sources) {
+  const panel = document.getElementById('research-source-health-panel');
+  const badge = document.getElementById('rf-source-badge');
+  if (badge) badge.textContent = (sources || []).length + ' sources';
+  if (!panel) return;
+  if (!sources || !sources.length) {
+    panel.innerHTML = '<div class="empty-txt">No source health yet</div>';
+    return;
+  }
+  panel.innerHTML =
+    '<table class="dtbl research-source-table">' +
+      '<thead><tr>' +
+        '<th>Source</th><th>Type</th><th>Status</th><th>Items</th><th>Last Success</th><th>Failures</th><th>Error</th>' +
+      '</tr></thead>' +
+      '<tbody>' +
+        sources.map(function(source) {
+          const status = String(source.status || 'unknown').toLowerCase();
+          const statusClass = status === 'ok' || status === 'success' || status === 'cached' ? 'ok' : status === 'stale' ? 'warn' : 'bad';
+          return '<tr>' +
+            '<td>' + escapeHtml(source.source || '-') + '</td>' +
+            '<td>' + escapeHtml(source.source_type || '-') + '</td>' +
+            '<td><span class="rf-status ' + statusClass + '">' + escapeHtml(status.toUpperCase()) + '</span></td>' +
+            '<td>' + (source.item_count || 0) + '</td>' +
+            '<td>' + escapeHtml(formatRelativeTime(source.last_success_at)) + '</td>' +
+            '<td>' + (source.consecutive_failures || 0) + '</td>' +
+            '<td>' + escapeHtml(truncate(source.error || '-', 80)) + '</td>' +
+          '</tr>';
+        }).join('') +
+      '</tbody>' +
+    '</table>';
+}
+
+function renderResearchFeedItems(items) {
+  const panel = document.getElementById('research-feed-audit-panel');
+  const badge = document.getElementById('rf-item-badge');
+  if (badge) badge.textContent = (items || []).length + ' items';
+  if (!panel) return;
+  if (!items || !items.length) {
+    panel.innerHTML = '<div class="empty-txt">No research feed audit yet</div>';
+    return;
+  }
+  panel.innerHTML = items.map(function(item) {
+    const action = item.action_audit || {};
+    const actionStatus = String(action.status || 'monitor').toLowerCase();
+    const matched = Array.isArray(action.matched_events) ? action.matched_events : [];
+    const url = item.url || '#';
+    const title = item.title || item.text || 'Untitled research item';
+    const urgency = item.urgency != null ? Math.round(Number(item.urgency) * 100) + '%' : '-';
+    return '<div class="research-item-card">' +
+      '<div class="rf-item-top">' +
+        '<div>' +
+          '<div class="rf-item-meta">' +
+            '<span>' + escapeHtml(item.source || 'news') + '</span>' +
+            '<span>' + escapeHtml(item.source_type || '-') + '</span>' +
+            '<span>' + escapeHtml(formatRelativeTime(item.published_at || item.last_seen_at)) + '</span>' +
+            '<span>urgency ' + escapeHtml(urgency) + '</span>' +
+          '</div>' +
+          '<a href="' + escapeHtml(url) + '" target="_blank" rel="noopener" class="rf-item-title">' + escapeHtml(title) + '</a>' +
+        '</div>' +
+        '<span class="rf-action ' + actionStatus + '">' + escapeHtml(actionStatus.replace('_', ' ').toUpperCase()) + '</span>' +
+      '</div>' +
+      '<div class="rf-route-grid">' +
+        '<div><span class="rf-label">Pods</span><div class="rf-tags">' + researchTags(item.affected_pods, 'pod') + '</div></div>' +
+        '<div><span class="rf-label">Factors</span><div class="rf-tags">' + researchTags(item.factors, 'factor') + '</div></div>' +
+        '<div><span class="rf-label">Tickers</span><div class="rf-tags">' + researchTags(item.tickers, 'ticker') + '</div></div>' +
+        '<div><span class="rf-label">Held</span><div class="rf-tags">' + researchTags(item.held_symbols, 'held') + '</div></div>' +
+      '</div>' +
+      '<div class="rf-next-action">' + escapeHtml(action.next_action || 'Monitor for trade thesis relevance.') + '</div>' +
+      (matched.length ? '<div class="rf-matches">' + matched.map(function(m) {
+        return '<span>' + escapeHtml((m.kind || 'event') + ' ' + (m.pod_id || '') + ' ' + (m.symbol || '') + ' ' + (m.action || m.status || '')) + '</span>';
+      }).join('') + '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+async function fetchResearchFeedAudit() {
+  if (researchFeedAuditLoading) return researchFeedAudit;
+  researchFeedAuditLoading = true;
+  try {
+    const response = await fetch('/api/research-feed?limit=100');
+    if (!response.ok) throw new Error('research feed request failed');
+    researchFeedAudit = await response.json();
+  } catch (err) {
+    researchFeedAudit = {
+      status: 'ERROR',
+      items: [],
+      sources: [],
+      item_count: 0,
+      source_count: 0,
+      source_error_count: 1,
+      last_fetch_time: null,
+      error: String(err && err.message ? err.message : err),
+    };
+  } finally {
+    researchFeedAuditLoading = false;
+  }
+  return researchFeedAudit;
+}
+
+async function renderResearchFeedAudit(force) {
+  if (force || !researchFeedAudit) {
+    await fetchResearchFeedAudit();
+  }
+  const report = researchFeedAudit || {};
+  const items = report.items || [];
+  const sources = report.sources || [];
+  const needsReview = items.filter(function(item) {
+    return item.action_audit && item.action_audit.status === 'needs_review';
+  }).length;
+
+  setText('rf-status', report.status || '-');
+  setText('rf-items', report.item_count != null ? report.item_count : items.length);
+  setText('rf-sources', report.source_count != null ? report.source_count : sources.length);
+  setText('rf-source-errors', (report.source_error_count || 0) + ' checks');
+  setText('rf-review', needsReview);
+  setText('rf-last-fetch', 'last fetch ' + (report.last_fetch_time ? formatRelativeTime(report.last_fetch_time) : '-'));
+  renderResearchSourceHealthTable(sources);
+  renderResearchFeedItems(items);
 }
 
 function updateResearchTab(signals, confidence, macroScore) {
@@ -990,28 +1897,23 @@ function handleMessage(msg) {
       benchmarkReturns = snap.benchmark_returns;
     }
     if (snap.drawdown_tier) drawdownTierBadge = snap.drawdown_tier;
-    fetch('/api/nav-history?limit=200').then(function(r) { return r.json(); }).then(function(data) {
+    fetch('/api/nav-history?limit=' + MAX_NAV_HISTORY).then(function(r) { return r.json(); }).then(function(data) {
       var hist = (data && data.history) ? data.history : [];
       if (hist.length === 0) return;
-      navHistory = [];
-      hist.forEach(function(h) {
-        var tsMs = Date.parse(h.ts) || Date.now();
-        navHistory.push({
-          t: new Date(tsMs).toLocaleTimeString(),
-          ts: tsMs,
-          firmNav: h.nav || 0,
-          pods: {},
-          drawdown: 0
-        });
-      });
-      if (navHistory.length > MAX_HISTORY) navHistory = navHistory.slice(-MAX_HISTORY);
-      updateNavChart();
+      if (replaceNavHistoryFromApi(hist)) {
+        updateNavChart();
+        updateDrawdownChart();
+        updatePodsTable();
+        updateFirmMetrics();
+        updatePerfTable();
+        updateAttribution();
+      }
     }).catch(function() {});
     var podSums = snap.pod_summaries || {};
     for (var pid in podSums) {
       var m = podSums[pid];
       if (m && m.data) {
-        pods[m.pod_id || pid] = Object.assign(pods[m.pod_id || pid] || {}, m.data);
+        pods[m.pod_id || pid] = mergePodData(m.pod_id || pid, m.data);
       }
       var pData = (m && m.data) ? m.data : m;
       if (pData) {
@@ -1027,7 +1929,7 @@ function handleMessage(msg) {
           window._allPolySignals[pid] = pData.polymarket_signals;
         }
         if (pData.x_feed && pData.x_feed.length > 0) {
-          researchXFeed = (researchXFeed || []).concat(pData.x_feed);
+          mergeNewsFeed(pData.x_feed);
         }
       }
     }
@@ -1061,11 +1963,14 @@ function handleMessage(msg) {
     });
     if (activityFeed.length > 50) activityFeed = activityFeed.slice(0, 50);
     (snap.recent_orders || []).forEach(function(o) {
-      if (o.data && o.data.order_id) orderBook[o.data.order_id] = o.data;
+      if (o.data && o.data.order_id) orderBook[o.data.local_order_id || o.data.order_id] = o.data;
     });
     (snap.position_reviews || []).forEach(function(rv) {
       addReviewEvent(rv);
     });
+    if (snap.loss_reviews) {
+      renderLossReviews(snap.loss_reviews);
+    }
     updateExecTable();
     updatePodsTable();
     updateFirmMetrics();
@@ -1115,7 +2020,7 @@ function handleMessage(msg) {
     const pod_id = msg.pod_id || data.pod_id;
     if (pod_id) {
       if (msg.type === 'pod_summary') {
-      pods[pod_id] = Object.assign(pods[pod_id] || {}, data);
+        pods[pod_id] = mergePodData(pod_id, data);
         if (data.performance_metrics && Object.keys(data.performance_metrics).length > 0) {
           pods[pod_id].performance_metrics = data.performance_metrics;
         }
@@ -1166,14 +2071,7 @@ function handleMessage(msg) {
         if (data.poly_sentiment !== undefined) researchPolySentiment = data.poly_sentiment || 0;
         if (data.social_score !== undefined) researchSocialScore = data.social_score || 0;
         if (data.x_feed !== undefined) {
-          researchXFeed = (researchXFeed || []).concat(data.x_feed || []);
-          const seen = new Set();
-          researchXFeed = researchXFeed.filter(t => {
-            const key = (t.handle || t.username || '') + '|' + (t.text || t.title || '');
-            if (seen.has(key)) return false;
-            seen.add(key);
-            return true;
-          }).slice(-200);
+          mergeNewsFeed(data.x_feed || []);
         }
         if (data.x_tweet_count !== undefined) researchXTweetCount = (researchXFeed || []).length;
         if (data.news_last_refresh) newsLastRefresh = data.news_last_refresh;
@@ -1199,7 +2097,7 @@ function handleMessage(msg) {
       // (price ticker pod_summary messages are NOT iterations)
       // Track per-pod NAV for sparklines
       if (!podNavSpark[pod_id]) podNavSpark[pod_id] = [];
-      podNavSpark[pod_id].push(data.nav || 0);
+      podNavSpark[pod_id].push(getPodNav(pods[pod_id]) || 0);
       if (podNavSpark[pod_id].length > 20) podNavSpark[pod_id].shift();
       updatePodsTable();
       updateFirmMetrics();
@@ -1241,6 +2139,11 @@ function handleMessage(msg) {
     var sev = ra.severity || (ra.action === 'firm_drawdown' ? 'warning' : 'warning');
     var txt = ra.message || ra.reason || JSON.stringify(ra);
     updateRiskAlertBanner(sev, txt);
+    if (ra.loss_review) {
+      var currentLoss = lossReviewState && lossReviewState.active ? lossReviewState.active : {};
+      currentLoss[ra.loss_review.pod_id] = ra.loss_review;
+      renderLossReviews(Object.assign({}, lossReviewState, { active: currentLoss }));
+    }
     if (typeof triggerRiskAlert === 'function') triggerRiskAlert(ra);
   } else if (msg.type === 'agent_activity') {
     var act = msg.data;
@@ -1259,9 +2162,12 @@ function handleMessage(msg) {
   } else if (msg.type === 'order_update') {
     var od = msg.data;
     if (od.order_id) {
-      orderBook[od.order_id] = od;
+      var orderKey = od.local_order_id || od.order_id;
+      var existingOrder = Object.assign({}, orderBook[orderKey] || {}, orderBook[od.order_id] || {});
+      orderBook[orderKey] = Object.assign(existingOrder, od);
+      if (orderKey !== od.order_id && orderBook[od.order_id]) delete orderBook[od.order_id];
       if (od.status === 'FILLED' || od.status === 'PARTIAL') {
-        addTrade(od.pod_id || 'unknown', od.symbol, od.side, od.fill_qty || od.qty, od.fill_price || 0, od.status, od.order_id);
+        addTrade(od.pod_id || 'unknown', od.symbol, od.side, od.fill_qty || od.qty, od.fill_price || 0, od.status, od.broker_order_id || od.order_id);
       }
       updateExecTable();
     }
@@ -1297,13 +2203,14 @@ function updatePodsTable() {
   tbody.innerHTML = ids.map(id => {
     const d   = pods[id];
     const rm  = d.risk_metrics || {};
-    let nav = d.nav ?? rm.nav ?? 0;
+    let nav = getCurrentPodNav(id);
     const invested = d.invested ?? rm.invested ?? 0;
     const startCap = d.starting_capital ?? rm.starting_capital;
     // Fallback: nav=0 but pod has allocated capital (idle pod) — show starting_capital
     if (nav === 0 && startCap > 0 && invested === 0) nav = startCap;
     const cash = d.cash ?? rm.cash ?? 0;
-    const pnl = d.daily_pnl ?? rm.daily_pnl ?? 0;
+    const dailyMove = getPodDailyMove(id);
+    const pnl = dailyMove.pnl;
     const st  = (d.status || 'UNKNOWN').toUpperCase();
     const stCls = st === 'ACTIVE' ? 'b-active' : st === 'HALTED' ? 'b-halted' : 'b-idle';
     const pc  = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : 'neu';
@@ -1315,7 +2222,7 @@ function updatePodsTable() {
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r"><span title="${navTitle}">$${nav.toFixed(2)}</span></td>
       <td class="r">${spark}</td>
-      <td class="r ${pc}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r ${pc}">${formatPnlWithPct(pnl, dailyMove.base || podDailyPnlBase(d), { pct: dailyMove.pct, pctDecimals: 2 })}</td>
       <td class="r">${sharpeStr}</td>
       <td class="r"><span class="badge ${stCls}">${st}</span></td>
     </tr>`;
@@ -1360,6 +2267,239 @@ function getPodPositions(d) {
 function getPodInvested(d) { return d.invested ?? (d.risk_metrics && d.risk_metrics.invested) ?? 0; }
 function getPodCash(d) { return d.cash ?? (d.risk_metrics && d.risk_metrics.cash) ?? 0; }
 function getPodStartCap(d) { return d.starting_capital ?? (d.risk_metrics && d.risk_metrics.starting_capital) ?? 0; }
+
+function asNumber(value, fallback) {
+  var n = Number(value);
+  return Number.isFinite(n) ? n : (fallback == null ? 0 : fallback);
+}
+
+var _lastValidNavSnapshot = null;
+
+function positiveNumber(value) {
+  var n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function copyPodNavs(podNavs) {
+  var out = {};
+  Object.keys(podNavs || {}).forEach(function(id) {
+    var nav = positiveNumber(podNavs[id]);
+    if (nav != null) out[id] = nav;
+  });
+  return out;
+}
+
+function inferSeedBaseline(referenceNav) {
+  var ref = positiveNumber(referenceNav);
+  if (ref == null) return null;
+  var rounded = Math.round(ref / 100) * 100;
+  if (rounded >= 500 && Math.abs(ref - rounded) <= Math.max(25, rounded * 0.10)) {
+    return rounded;
+  }
+  return ref;
+}
+
+function repairLeadingSeedNavPlaceholders(hist) {
+  var rows = (hist || []).map(function(row) {
+    var copy = Object.assign({}, row || {});
+    copy.pods = copyPodNavs(copy.pods || {});
+    return copy;
+  });
+  var podMax = {};
+  rows.forEach(function(row) {
+    Object.keys(row.pods || {}).forEach(function(id) {
+      var nav = positiveNumber(row.pods[id]);
+      if (nav == null) return;
+      podMax[id] = Math.max(podMax[id] || 0, nav);
+    });
+  });
+  Object.keys(podMax).forEach(function(id) {
+    var maxNav = podMax[id] || 0;
+    if (maxNav < 500) return;
+    var threshold = Math.max(500, maxNav * 0.5);
+    var firstValidIdx = -1;
+    for (var i = 0; i < rows.length; i += 1) {
+      var nav = positiveNumber(rows[i].pods && rows[i].pods[id]);
+      if (nav != null && nav >= threshold) {
+        firstValidIdx = i;
+        break;
+      }
+    }
+    if (firstValidIdx <= 0) return;
+    var baseline = inferSeedBaseline(rows[firstValidIdx].pods[id]);
+    if (baseline == null) return;
+    for (var j = 0; j < firstValidIdx; j += 1) {
+      var seedNav = positiveNumber(rows[j].pods && rows[j].pods[id]);
+      if (seedNav != null && seedNav < threshold) {
+        rows[j].pods[id] = baseline;
+      }
+    }
+  });
+  rows.forEach(function(row) {
+    var podSum = Object.keys(row.pods || {}).reduce(function(sum, id) {
+      return sum + (positiveNumber(row.pods[id]) || 0);
+    }, 0);
+    if (podSum > 0) row.nav = podSum;
+  });
+  return rows;
+}
+
+function mergePodData(podId, incoming) {
+  var prior = pods[podId] || {};
+  var data = incoming || {};
+  var merged = Object.assign({}, prior, data);
+  var status = String(data.status || prior.status || '').toUpperCase();
+  var inactiveLike = !sessionActive || status === 'IDLE' || status === 'HALTED' || status === 'STOPPED' || status === 'INACTIVE';
+  var priorNav = positiveNumber(getPodNav(prior));
+  var incomingHasNav = Object.prototype.hasOwnProperty.call(data, 'nav');
+  var incomingNav = incomingHasNav ? positiveNumber(data.nav) : null;
+
+  if (incomingHasNav && incomingNav == null && priorNav != null && inactiveLike) {
+    merged.nav = priorNav;
+  }
+
+  if (data.risk_metrics && typeof data.risk_metrics === 'object') {
+    var priorRisk = (prior.risk_metrics && typeof prior.risk_metrics === 'object') ? prior.risk_metrics : {};
+    var mergedRisk = Object.assign({}, priorRisk, data.risk_metrics);
+    var riskHasNav = Object.prototype.hasOwnProperty.call(data.risk_metrics, 'nav');
+    var incomingRiskNav = riskHasNav ? positiveNumber(data.risk_metrics.nav) : null;
+    var priorRiskNav = positiveNumber(priorRisk.nav) || priorNav;
+    if (riskHasNav && incomingRiskNav == null && priorRiskNav != null && inactiveLike) {
+      mergedRisk.nav = priorRiskNav;
+    }
+    merged.risk_metrics = mergedRisk;
+  }
+
+  return merged;
+}
+
+function buildNavHistoryPoint(tsMs, rawFirmNav, rawPods, fallbackSnapshot) {
+  var fallback = fallbackSnapshot || null;
+  var sourcePods = rawPods && typeof rawPods === 'object' ? rawPods : {};
+  var keys = Object.keys(sourcePods);
+  if (keys.length === 0 && fallback && fallback.pods) keys = Object.keys(fallback.pods);
+
+  var podNavs = {};
+  keys.forEach(function(id) {
+    var nav = positiveNumber(sourcePods[id]);
+    if (nav == null && fallback && fallback.pods) nav = positiveNumber(fallback.pods[id]);
+    if (nav != null) podNavs[id] = nav;
+  });
+
+  var podSum = Object.keys(podNavs).reduce(function(sum, id) { return sum + podNavs[id]; }, 0);
+  var firmNav = positiveNumber(rawFirmNav);
+  var fallbackFirmNav = fallback ? positiveNumber(fallback.firmNav) : null;
+  var collapsedAgainstFallback = fallbackFirmNav != null && (
+    (firmNav != null && firmNav < fallbackFirmNav * 0.5) ||
+    (podSum > 0 && podSum < fallbackFirmNav * 0.5)
+  );
+  if (collapsedAgainstFallback) {
+    firmNav = fallbackFirmNav;
+    if (fallback && fallback.pods) {
+      podNavs = copyPodNavs(fallback.pods);
+      podSum = Object.keys(podNavs).reduce(function(sum, id) { return sum + podNavs[id]; }, 0);
+    }
+  }
+  if (firmNav != null && podSum > firmNav) firmNav = podSum;
+  if (firmNav == null && podSum > 0) firmNav = podSum;
+  if (firmNav == null && fallback) firmNav = fallbackFirmNav;
+  if (firmNav == null) return null;
+
+  return {
+    t: formatNavTimestamp(tsMs),
+    ts: tsMs,
+    firmNav: firmNav,
+    pods: podNavs,
+    drawdown: 0,
+  };
+}
+
+function rememberNavSnapshot(point) {
+  if (!point || positiveNumber(point.firmNav) == null) return;
+  _lastValidNavSnapshot = {
+    firmNav: point.firmNav,
+    pods: copyPodNavs(point.pods || {}),
+  };
+}
+
+function replaceNavHistoryFromApi(hist) {
+  var nextHistory = [];
+  var fallback = null;
+  repairLeadingSeedNavPlaceholders(hist || []).forEach(function(h) {
+    var tsMs = Date.parse(h.ts) || Date.now();
+    var point = buildNavHistoryPoint(tsMs, h.nav != null ? h.nav : h.firmNav, h.pods || {}, fallback);
+    if (!point) return;
+    nextHistory.push(point);
+    fallback = {
+      firmNav: point.firmNav,
+      pods: copyPodNavs(point.pods || {}),
+    };
+  });
+  if (nextHistory.length === 0) return false;
+  navHistory = nextHistory.slice(-MAX_NAV_HISTORY);
+  rememberNavSnapshot(navHistory[navHistory.length - 1]);
+  recalculateNavDrawdowns();
+  return true;
+}
+
+function formatSignedMoney(value, decimals) {
+  var n = asNumber(value, 0);
+  var places = decimals == null ? 2 : decimals;
+  return (n >= 0 ? '+$' : '-$') + Math.abs(n).toFixed(places);
+}
+
+function formatSignedPct(value, decimals) {
+  var n = asNumber(value, 0);
+  var places = decimals == null ? 2 : decimals;
+  return (n >= 0 ? '+' : '') + n.toFixed(places) + '%';
+}
+
+function formatPnlWithPct(pnl, baseNotional, opts) {
+  opts = opts || {};
+  var n = asNumber(pnl, 0);
+  var text = formatSignedMoney(n, opts.moneyDecimals);
+  var pct = opts.pct;
+  var base = Math.abs(asNumber(baseNotional, 0));
+  if (pct == null && base > 0) pct = (n / base) * 100;
+  if (pct != null && Number.isFinite(Number(pct))) {
+    text += ' (' + formatSignedPct(Number(pct), opts.pctDecimals) + ')';
+  }
+  return text;
+}
+
+function positionEntryNotional(p) {
+  if (!p) return 0;
+  var explicit = Math.abs(asNumber(p.entry_notional || p.cost_notional || p.initial_notional, 0));
+  if (explicit > 0) return explicit;
+  var qty = Math.abs(asNumber(p.qty || p.quantity, 0));
+  var entry = asNumber(p.cost_basis || p.avg_entry || p.entry_price, 0);
+  if (qty > 0 && entry > 0) return qty * entry;
+  return Math.abs(asNumber(p.notional, 0));
+}
+
+function positionCurrentNotional(p) {
+  if (!p) return 0;
+  var qty = Math.abs(asNumber(p.qty || p.quantity, 0));
+  var price = asNumber(p.current_price || p.price, 0);
+  if (qty > 0 && price > 0) return qty * price;
+  var explicit = Math.abs(asNumber(p.current_notional || p.market_value, 0));
+  if (explicit > 0) return explicit;
+  return Math.abs(asNumber(p.notional, 0));
+}
+
+function tradeEntryNotional(t) {
+  if (!t) return 0;
+  var explicit = Math.abs(asNumber(t.entry_notional || t.initial_notional, 0));
+  if (explicit > 0) return explicit;
+  var qty = Math.abs(asNumber(t.qty || t.quantity || t.qty_sold, 0));
+  var entry = asNumber(t.entry_price || t.cost_basis || t.avg_entry || t.fill_price, 0);
+  if (qty > 0 && entry > 0) return qty * entry;
+  return Math.abs(asNumber(t.notional, 0));
+}
+
+function podDailyPnlBase(d) {
+  return Math.abs(getPodNav(d || {}) || getPodStartCap(d || {}) || 0);
+}
 
 function dateOnly(value) {
   if (value == null || value === '') return '';
@@ -1429,6 +2569,208 @@ function normalizeAllocationWeights(rawWeights, ids) {
   return weights;
 }
 
+function navDayKey(point) {
+  if (!point || !point.ts) return '';
+  var d = new Date(point.ts);
+  if (isNaN(d.getTime())) return '';
+  return d.toISOString().slice(0, 10);
+}
+
+function currentDayKey() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function latestNavPoint() {
+  return navHistory.length > 0 ? navHistory[navHistory.length - 1] : null;
+}
+
+function todayBaselineNavPoint() {
+  if (navHistory.length === 0) return null;
+  var today = currentDayKey();
+  for (var i = 0; i < navHistory.length; i += 1) {
+    if (navDayKey(navHistory[i]) === today) return navHistory[i];
+  }
+  return navHistory[0];
+}
+
+function pointPodNav(point, id) {
+  if (!point || !point.pods) return null;
+  var value = positiveNumber(point.pods[id]);
+  return value == null ? null : value;
+}
+
+function getCurrentPodNav(id) {
+  var latest = latestNavPoint();
+  var fromHistory = pointPodNav(latest, id);
+  if (fromHistory != null) return fromHistory;
+  return getPodNav(pods[id] || {});
+}
+
+function getPodStartingCapital(id, ids) {
+  var d = pods[id] || {};
+  var startCap = positiveNumber(getPodStartCap(d));
+  if (startCap != null) return startCap;
+  if (initialCapital > 0 && ids && ids.length > 0) return initialCapital / ids.length;
+  return 1000;
+}
+
+function getFirmStartingCapital(ids) {
+  var total = (ids || []).reduce(function(sum, id) {
+    return sum + getPodStartingCapital(id, ids);
+  }, 0);
+  if (total > 0) return total;
+  if (initialCapital > 0) return initialCapital;
+  return (ids && ids.length ? ids.length : 4) * 1000;
+}
+
+function getCurrentFirmNav(ids) {
+  var latest = latestNavPoint();
+  var firmNav = positiveNumber(latest && latest.firmNav);
+  if (firmNav != null) return firmNav;
+  return (ids || []).reduce(function(sum, id) {
+    return sum + getCurrentPodNav(id);
+  }, 0);
+}
+
+function getPodDailyMove(id) {
+  var latest = latestNavPoint();
+  var baseline = todayBaselineNavPoint();
+  var latestNav = pointPodNav(latest, id);
+  var baseNav = pointPodNav(baseline, id);
+  if (latestNav != null && baseNav != null) {
+    var pnl = latestNav - baseNav;
+    return {
+      pnl: pnl,
+      base: baseNav,
+      pct: baseNav > 0 ? (pnl / baseNav) * 100 : 0,
+      source: 'nav_history',
+    };
+  }
+  var d = pods[id] || {};
+  var fallbackPnl = asNumber(d.daily_pnl || (d.risk_metrics && d.risk_metrics.daily_pnl), 0);
+  var fallbackBase = podDailyPnlBase(d) || getPodStartingCapital(id, Object.keys(pods));
+  return {
+    pnl: fallbackPnl,
+    base: fallbackBase,
+    pct: fallbackBase > 0 ? (fallbackPnl / fallbackBase) * 100 : 0,
+    source: 'pod_summary',
+  };
+}
+
+function getFirmDailyMove(ids) {
+  var latest = latestNavPoint();
+  var baseline = todayBaselineNavPoint();
+  var latestNav = positiveNumber(latest && latest.firmNav);
+  var baseNav = positiveNumber(baseline && baseline.firmNav);
+  if (latestNav != null && baseNav != null) {
+    var pnl = latestNav - baseNav;
+    return {
+      pnl: pnl,
+      base: baseNav,
+      pct: baseNav > 0 ? (pnl / baseNav) * 100 : 0,
+      source: 'nav_history',
+    };
+  }
+  var fallbackPnl = (ids || []).reduce(function(sum, id) { return sum + getPodPnl(pods[id] || {}); }, 0);
+  var fallbackBase = getCurrentFirmNav(ids);
+  return {
+    pnl: fallbackPnl,
+    base: fallbackBase,
+    pct: fallbackBase > 0 ? (fallbackPnl / fallbackBase) * 100 : 0,
+    source: 'pod_summary',
+  };
+}
+
+function tradePodId(t) {
+  return String((t && (t.pod_id || t.pod || t._pod)) || '').toLowerCase();
+}
+
+function tradeSymbol(t) {
+  return String((t && (t.symbol || t.ticker)) || '').toUpperCase();
+}
+
+function tradeExitDay(t) {
+  return dateOnly(t && (t.exit_date || t.exit_time || t.closed_at || t.timestamp || t.ts));
+}
+
+function isClosedToday(t) {
+  return tradeExitDay(t) === currentDayKey();
+}
+
+function closedTradePnl(t) {
+  return asNumber(t && (t.realized_pnl != null ? t.realized_pnl : t.pnl), 0);
+}
+
+function getPodClosedToday(id) {
+  return (_ctData || []).filter(function(t) {
+    return tradePodId(t) === id.toLowerCase() && isClosedToday(t);
+  });
+}
+
+function getPodRealizedToday(id) {
+  var trades = getPodClosedToday(id);
+  var pnl = trades.reduce(function(sum, t) { return sum + closedTradePnl(t); }, 0);
+  var base = trades.reduce(function(sum, t) { return sum + tradeEntryNotional(t); }, 0);
+  return { pnl: pnl, base: base, trades: trades.length };
+}
+
+function getPodOpenPositions(id) {
+  var rows = (_positionsFromApi && _positionsFromApi.length > 0)
+    ? _positionsFromApi
+    : getPodPositions(pods[id] || {}).map(function(p) { return Object.assign({ _pod: id }, p || {}); });
+  return rows.filter(function(p) {
+    return String(p._pod || p.pod_id || '').toLowerCase() === id.toLowerCase();
+  });
+}
+
+function getPodOpenPnl(id) {
+  var positions = getPodOpenPositions(id);
+  var pnl = positions.reduce(function(sum, p) {
+    return sum + asNumber(p.unrealized_pnl != null ? p.unrealized_pnl : p.unrealised_pnl, 0);
+  }, 0);
+  var base = positions.reduce(function(sum, p) { return sum + positionEntryNotional(p); }, 0);
+  return { pnl: pnl, base: base, positions: positions.length };
+}
+
+function getPodTradeCount(id) {
+  var executed = executedTrades.filter(function(t) {
+    return String(t.podId || t.pod_id || '').toLowerCase() === id.toLowerCase();
+  }).length;
+  var closed = (_ctData || []).filter(function(t) {
+    return tradePodId(t) === id.toLowerCase();
+  }).length;
+  return Math.max(executed, closed);
+}
+
+function buildPnlContributors(ids) {
+  var rows = [];
+  (ids || Object.keys(pods)).forEach(function(id) {
+    getPodOpenPositions(id).forEach(function(p) {
+      var pnl = asNumber(p.unrealized_pnl != null ? p.unrealized_pnl : p.unrealised_pnl, 0);
+      if (Math.abs(pnl) < 0.005) return;
+      rows.push({
+        pod: id,
+        symbol: String(p.symbol || '').toUpperCase(),
+        type: 'Open',
+        pnl: pnl,
+        base: positionEntryNotional(p),
+      });
+    });
+    getPodClosedToday(id).forEach(function(t) {
+      var pnl = closedTradePnl(t);
+      if (Math.abs(pnl) < 0.005) return;
+      rows.push({
+        pod: id,
+        symbol: tradeSymbol(t),
+        type: 'Closed today',
+        pnl: pnl,
+        base: tradeEntryNotional(t),
+      });
+    });
+  });
+  return rows.sort(function(a, b) { return Math.abs(b.pnl) - Math.abs(a.pnl); });
+}
+
 // Positions from /api/positions — single source for Top Holdings, drilldown, and KPI
 var _positionsFromApi = [];
 var _positionsFetchInFlight = false;
@@ -1453,6 +2795,9 @@ function fetchPositionsFromApi() {
       });
       updateTopHoldings();
       updateFirmMetrics();
+      updatePodsTable();
+      updatePerfTable();
+      updateAttribution();
       renderFactorRiskTable();
     })
     .catch(function() { _positionsFetchInFlight = false; });
@@ -1460,8 +2805,8 @@ function fetchPositionsFromApi() {
 
 function updateFirmMetrics() {
   const ids = Object.keys(pods);
-  const nav = ids.reduce((s,id) => s + getPodNav(pods[id]), 0);
-  const pnl = ids.reduce((s,id) => s + getPodPnl(pods[id]), 0);
+  const nav = getCurrentFirmNav(ids);
+  const dailyMove = getFirmDailyMove(ids);
   const act = ids.filter(id => (pods[id].status || '').toUpperCase() === 'ACTIVE').length;
   const pos = _positionsFromApi.length > 0 ? _positionsFromApi.length : ids.reduce((s,id) => {
     const p = getPodPositions(pods[id]);
@@ -1469,9 +2814,7 @@ function updateFirmMetrics() {
   }, 0);
 
   if (ids.length > 0) {
-    initialCapital = ids.reduce(function(s, id) {
-      return s + (getPodStartCap(pods[id]) || getPodNav(pods[id]));
-    }, 0);
+    initialCapital = getFirmStartingCapital(ids);
   }
 
   const firmInvested = ids.reduce((s,id) => s + getPodInvested(pods[id]), 0);
@@ -1484,8 +2827,8 @@ function updateFirmMetrics() {
 
   const pnlEl = document.getElementById('kpi-pnl');
   if (nav > 0) {
-    pnlEl.textContent = `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)} today`;
-    pnlEl.className   = 'kpi-sub ' + (pnl >= 0 ? 'pos' : 'neg');
+    pnlEl.textContent = `${formatPnlWithPct(dailyMove.pnl, dailyMove.base || nav, { pct: dailyMove.pct, pctDecimals: 2 })} today`;
+    pnlEl.className   = 'kpi-sub ' + (dailyMove.pnl >= 0 ? 'pos' : 'neg');
   } else {
     pnlEl.textContent = '—';
     pnlEl.className   = 'kpi-sub';
@@ -1494,11 +2837,9 @@ function updateFirmMetrics() {
   var cpnlEl = document.getElementById('kpi-cpnl');
   var cretEl = document.getElementById('kpi-cret');
   if (cpnlEl && initialCapital > 0) {
-    var cpnl = (firmInceptionPnl != null && typeof firmInceptionPnl === 'number')
-      ? firmInceptionPnl
-      : (nav - initialCapital);
+    var cpnl = nav - initialCapital;
     var cret = (cpnl / initialCapital) * 100;
-    cpnlEl.textContent = (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2);
+    cpnlEl.textContent = formatPnlWithPct(cpnl, initialCapital, { pct: cret, pctDecimals: 2 });
     cpnlEl.className = 'kpi-val ' + (cpnl >= 0 ? 'pos' : 'neg');
     if (cretEl) {
       cretEl.textContent = (cret >= 0 ? '+' : '') + cret.toFixed(2) + '%';
@@ -1514,69 +2855,227 @@ const POD_COLORS = { commodities: '#f5a623', crypto: '#8b6cff', equities: '#00d4
 function recordNavHistory() {
   const ids = Object.keys(pods);
   if (ids.length === 0) return;
-  const firmNav = ids.reduce((s,id) => s + (pods[id].nav || 0), 0);
-  const podNavs = {};
-  ids.forEach(id => { podNavs[id] = pods[id].nav || 0; });
+  const rawPodNavs = {};
+  ids.forEach(id => { rawPodNavs[id] = getPodNav(pods[id]); });
+  const rawFirmNav = ids.reduce((s,id) => s + (positiveNumber(rawPodNavs[id]) || 0), 0);
+  const point = buildNavHistoryPoint(Date.now(), rawFirmNav, rawPodNavs, sessionActive ? null : _lastValidNavSnapshot);
+  if (!point) return;
   // Track drawdown from high-water mark
   var hwm = 0;
   navHistory.forEach(function(h) { if (h.firmNav > hwm) hwm = h.firmNav; });
-  if (firmNav > hwm) hwm = firmNav;
-  var dd = hwm > 0 ? (firmNav - hwm) / hwm : 0;
-  navHistory.push({ t: new Date().toLocaleTimeString(), ts: Date.now(), firmNav, pods: podNavs, drawdown: dd });
-  if (navHistory.length > MAX_HISTORY) navHistory.shift();
+  if (point.firmNav > hwm) hwm = point.firmNav;
+  point.drawdown = hwm > 0 ? (point.firmNav - hwm) / hwm : 0;
+  navHistory.push(point);
+  rememberNavSnapshot(point);
+  if (navHistory.length > MAX_NAV_HISTORY) navHistory = navHistory.slice(-MAX_NAV_HISTORY);
   updateNavChart();
   updateDrawdownChart();
 }
 
+function formatNavTimestamp(tsMs) {
+  var d = new Date(tsMs || Date.now());
+  return d.toLocaleString('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+}
+
+function formatChartTimeLabel(tsMs) {
+  var d = new Date(tsMs || Date.now());
+  if (chartPeriod === '24h') {
+    return d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit', hour12: false });
+  }
+  if (chartPeriod === '7d' || chartPeriod === '30d') {
+    return d.toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', hour12: false });
+  }
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' });
+}
+
+function getChartPeriodCutoff(period) {
+  var now = new Date();
+  var p = period || chartPeriod || 'all';
+  if (p === '24h') return now.getTime() - 24 * 60 * 60 * 1000;
+  if (p === '7d') return now.getTime() - 7 * 24 * 60 * 60 * 1000;
+  if (p === '30d') return now.getTime() - 30 * 24 * 60 * 60 * 1000;
+  if (p === '3m') {
+    now.setMonth(now.getMonth() - 3);
+    return now.getTime();
+  }
+  if (p === '6m') {
+    now.setMonth(now.getMonth() - 6);
+    return now.getTime();
+  }
+  return null;
+}
+
+function recalculateNavDrawdowns() {
+  var hwm = 0;
+  navHistory.forEach(function(h) {
+    var nav = Number(h.firmNav || 0);
+    if (nav > hwm) hwm = nav;
+    h.drawdown = hwm > 0 ? (nav - hwm) / hwm : 0;
+  });
+}
+
 function getFilteredNavHistory() {
-  if (!chartTimeframeMinutes || chartTimeframeMinutes <= 0) return navHistory;
-  var cutoff = Date.now() - chartTimeframeMinutes * 60 * 1000;
-  return navHistory.filter(function(h) { return h.ts && h.ts >= cutoff; });
+  var cutoff = getChartPeriodCutoff(chartPeriod);
+  if (cutoff === null) return navHistory;
+  var filtered = navHistory.filter(function(h) { return h.ts && h.ts >= cutoff; });
+  return filtered.length > 0 ? filtered : navHistory.slice(-1);
+}
+
+function downsampleNavHistory(rows) {
+  if (!rows || rows.length <= MAX_CHART_POINTS) return rows || [];
+  var result = [];
+  var step = (rows.length - 1) / (MAX_CHART_POINTS - 1);
+  for (var i = 0; i < MAX_CHART_POINTS; i += 1) {
+    result.push(rows[Math.round(i * step)]);
+  }
+  return result;
+}
+
+function getChartNavHistory() {
+  return downsampleNavHistory(getFilteredNavHistory());
+}
+
+function navSeriesForPod(rows, podId) {
+  return (rows || []).map(function(h) {
+    return positiveNumber(h && h.pods ? h.pods[podId] : null);
+  });
+}
+
+function hasUsableSeries(values) {
+  return (values || []).some(function(v) { return v != null && v > 0; });
+}
+
+function firmNavDataset(rows, opts) {
+  var options = opts || {};
+  return {
+    label: options.label || 'FIRM NAV',
+    data: (rows || []).map(function(h) { return positiveNumber(h.firmNav) || null; }),
+    borderColor: options.borderColor || '#ffffff',
+    backgroundColor: options.backgroundColor || 'rgba(255,255,255,0.03)',
+    borderWidth: options.borderWidth || 2,
+    pointRadius: 0,
+    tension: 0.3,
+    fill: false,
+  };
+}
+
+function firstPositiveDatasetValue(datasets) {
+  for (var i = 0; i < (datasets || []).length; i += 1) {
+    var ds = datasets[i] || {};
+    if (String(ds.label || '').indexOf('S&P 500') === 0) continue;
+    for (var j = 0; j < (ds.data || []).length; j += 1) {
+      var v = positiveNumber(ds.data[j]);
+      if (v != null && v > 0) return v;
+    }
+  }
+  return null;
+}
+
+function benchmarkChartBase(rows, visibleDatasets) {
+  if (showFirmNav && rows && rows.length > 0) {
+    var firmBase = positiveNumber(rows[0].firmNav);
+    if (firmBase != null && firmBase > 0) return firmBase;
+  }
+  var datasetBase = firstPositiveDatasetValue(visibleDatasets);
+  if (datasetBase != null && datasetBase > 0) return datasetBase;
+  if (rows && rows.length > 0) {
+    return positiveNumber(rows[0].firmNav) || 1;
+  }
+  return 1;
+}
+
+function spBenchmarkDataset(rows, visibleDatasets) {
+  if (!showSpBenchmark || !rows || rows.length < 2) return null;
+  if (!benchmarkReturns || typeof benchmarkReturns !== 'object') return null;
+  var spyBench = benchmarkReturns.equities;
+  if (!spyBench || spyBench.return_pct == null) return null;
+
+  var start = benchmarkChartBase(rows, visibleDatasets);
+  var ret = Number(spyBench.return_pct) / 100;
+  if (!Number.isFinite(ret)) return null;
+  var line = rows.map(function(h, idx) {
+    var t = idx / Math.max(rows.length - 1, 1);
+    return start * (1 + ret * t);
+  });
+  return {
+    label: 'S&P 500 (rebased)',
+    data: line,
+    borderColor: 'rgba(160,170,185,0.7)',
+    borderWidth: 1.5,
+    borderDash: [4, 4],
+    pointRadius: 0,
+    tension: 0.1,
+    fill: false,
+  };
+}
+
+function resizeChartInstance(chart) {
+  if (chart && typeof chart.resize === 'function') {
+    chart.resize();
+  }
+}
+
+function resizePerformanceCharts() {
+  resizeChartInstance(navChart);
+  resizeChartInstance(ddChart);
+  resizeChartInstance(_modalNavChart);
+}
+
+function schedulePerformanceChartResize() {
+  if (typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(resizePerformanceCharts);
+  }
+  setTimeout(resizePerformanceCharts, 80);
+}
+
+function refreshPerformanceCharts() {
+  updateNavChart();
+  updateDrawdownChart();
+  schedulePerformanceChartResize();
 }
 
 function updateNavChart() {
-  var filtered = getFilteredNavHistory();
-  const ctx    = document.getElementById('navChart').getContext('2d');
-  const labels = filtered.map(h => h.t);
+  var filtered = getChartNavHistory();
+  const canvas = document.getElementById('navChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const ctx    = canvas.getContext('2d');
+  const labels = filtered.map(h => formatChartTimeLabel(h.ts));
   const ids    = Object.keys(pods).sort();
   const FALLBACK_COLORS = ['#00d4f0','#00d68f','#8b6cff','#f5a623'];
-  const datasets = [
-    { label:'FIRM NAV', data: filtered.map(h => h.firmNav),
-      borderColor:'#ffffff', backgroundColor:'rgba(255,255,255,0.03)',
-      borderWidth:2, pointRadius:0, tension:0.3, fill:false },
-    ...ids.map((id, i) => ({
-      label: id.toUpperCase(), data: filtered.map(h => h.pods[id] || 0),
+  const datasets = [];
+  if (showFirmNav) {
+    datasets.push(firmNavDataset(filtered));
+  }
+  ids.forEach((id, i) => {
+    var data = navSeriesForPod(filtered, id);
+    if (!hasUsableSeries(data)) return;
+    datasets.push({
+      label: id.toUpperCase(), data: data,
       borderColor: POD_COLORS[id] || FALLBACK_COLORS[i % FALLBACK_COLORS.length], borderWidth:1,
       pointRadius:0, tension:0.3, fill:false,
-    })),
-  ];
-  // Show S&P 500 (equities/SPY) benchmark as a dotted reference line
-  if (filtered.length >= 2 && benchmarkReturns && typeof benchmarkReturns === 'object') {
-    var spyBench = benchmarkReturns['equities'];
-    if (spyBench && spyBench.return_pct != null) {
-      var start = filtered[0].firmNav || 1;
-      var ret = Number(spyBench.return_pct) / 100;
-      var spyLine = filtered.map(function(h, idx) {
-        var t = idx / Math.max(filtered.length - 1, 1);
-        return start * (1 + ret * t);
-      });
-      datasets.push({
-        label: 'S&P 500',
-        data: spyLine,
-        borderColor: 'rgba(160,170,185,0.5)',
-        borderWidth: 1.5,
-        borderDash: [4, 4],
-        pointRadius: 0,
-        tension: 0.1,
-        fill: false,
-      });
-    }
+    });
+  });
+  if (datasets.length === 0 && filtered.length > 0) {
+    datasets.push(firmNavDataset(filtered, {
+      label: 'FIRM NAV',
+      borderColor: '#00d4f0',
+      backgroundColor: 'rgba(0,212,240,0.04)',
+    }));
   }
+  var benchmark = spBenchmarkDataset(filtered, datasets);
+  if (benchmark) datasets.push(benchmark);
 
   if (navChart) {
     navChart.data.labels   = labels;
     navChart.data.datasets = datasets;
     navChart.update('none');
+    schedulePerformanceChartResize();
     return;
   }
   navChart = new Chart(ctx, {
@@ -1596,6 +3095,7 @@ function updateNavChart() {
       },
     },
   });
+  schedulePerformanceChartResize();
 }
 
 var _modalNavChart = null;
@@ -1703,17 +3203,21 @@ function updatePerfTable() {
   if (ids.length === 0) return;
   document.getElementById('perf-table').innerHTML = ids.map(id => {
     const d   = pods[id];
-    const nav = d.nav || 0;
-    const sc  = d.starting_capital || (initialCapital / Math.max(Object.keys(pods).length, 1)) || 100;
+    const nav = getCurrentPodNav(id);
+    const sc  = getPodStartingCapital(id, ids);
     const ret = sc > 0 ? ((nav - sc) / sc * 100) : 0;
-    const pnl = d.daily_pnl || 0;
+    const dailyMove = getPodDailyMove(id);
+    const realized = getPodRealizedToday(id);
+    const openPnl = getPodOpenPnl(id);
     var pm = d.performance_metrics || {};
     var sharpeStr = (pm.sharpe != null && pm.sharpe !== 0) ? Number(pm.sharpe).toFixed(2) : '—';
     return `<tr>
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r">$${nav.toFixed(2)}</td>
       <td class="r ${ret >= 0 ? 'pos' : 'neg'}">${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%</td>
-      <td class="r ${pnl >= 0 ? 'pos' : 'neg'}">${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}</td>
+      <td class="r ${dailyMove.pnl >= 0 ? 'pos' : 'neg'}">${formatPnlWithPct(dailyMove.pnl, dailyMove.base || sc, { pct: dailyMove.pct, pctDecimals: 2 })}</td>
+      <td class="r ${realized.pnl >= 0 ? 'pos' : 'neg'}">${formatPnlWithPct(realized.pnl, realized.base || sc, { pctDecimals: 2 })}</td>
+      <td class="r ${openPnl.pnl >= 0 ? 'pos' : 'neg'}">${formatPnlWithPct(openPnl.pnl, openPnl.base || sc, { pctDecimals: 2 })}</td>
       <td class="r">${sharpeStr}</td>
     </tr>`;
   }).join('');
@@ -1819,6 +3323,84 @@ function updateRiskTable() {
 }
 
 // ─── 10. Execution ─────────────────────────────────────────────────────────
+function normalizeLossReviewPayload(data) {
+  data = data || {};
+  if (!data.active && typeof data === 'object') {
+    return { active: data, history: [], triggered_count: 0 };
+  }
+  return {
+    active: data.active || {},
+    history: data.history || [],
+    triggered_count: Number(data.triggered_count || 0)
+  };
+}
+
+function renderLossReviews(data) {
+  lossReviewState = normalizeLossReviewPayload(data || lossReviewState);
+  var panel = document.getElementById('loss-review-panel');
+  var badge = document.getElementById('loss-review-badge');
+  if (!panel) return;
+
+  var active = lossReviewState.active || {};
+  var reviews = Object.keys(active).sort().map(function(pid) { return active[pid]; });
+  var triggered = reviews.filter(function(r) { return r && r.triggered; });
+  if (badge) badge.textContent = triggered.length + ' active / ' + reviews.length + ' pods';
+
+  if (!reviews.length) {
+    panel.innerHTML = '<div class="empty"><div class="empty-txt">No loss reviews yet</div></div>';
+    return;
+  }
+
+  panel.innerHTML = reviews.map(function(r) {
+    r = r || {};
+    var status = String(r.status || 'clear').toLowerCase();
+    var statusCls = status === 'paused' ? 'critical' : (status === 'restricted' || status === 'watch' ? 'warning' : 'clear');
+    var dailyCls = Number(r.daily_pnl || 0) >= 0 ? 'pos' : 'neg';
+    var contributors = (r.top_contributors || []).slice(0, 4);
+    var contribHtml = contributors.length ? contributors.map(function(c) {
+      var pnl = Number(c.pnl || 0);
+      var cls = pnl >= 0 ? 'pos' : 'neg';
+      var navImpact = Number(c.nav_impact_pct || 0) * 100;
+      return '<tr>' +
+        '<td>' + escapeHtml(c.symbol || '') + '<div class="muted">' + escapeHtml(String(c.source || '').replace(/_/g, ' ')) + '</div></td>' +
+        '<td class="r ' + cls + '">' + formatPnlWithPct(pnl, Number(c.notional || 0), { pct: Number(c.pnl_pct || 0) * 100, pctDecimals: 2 }) + '</td>' +
+        '<td class="r ' + cls + '">' + (navImpact >= 0 ? '+' : '') + navImpact.toFixed(2) + '% NAV</td>' +
+      '</tr>';
+    }).join('') : '<tr><td colspan="3" class="empty"><div class="empty-txt">No negative contributor</div></td></tr>';
+
+    return '<div class="loss-review-card ' + statusCls + '">' +
+      '<div class="lr-head">' +
+        '<div><div class="lr-pod">' + escapeHtml(String(r.pod_id || '').toUpperCase()) + '</div>' +
+        '<div class="lr-reason">' + escapeHtml(r.trigger_reason || '') + '</div></div>' +
+        '<span class="lr-status ' + statusCls + '">' + escapeHtml(status) + '</span>' +
+      '</div>' +
+      '<div class="lr-metrics">' +
+        '<div><span>Daily P&L</span><b class="' + dailyCls + '">' + formatPnlWithPct(Number(r.daily_pnl || 0), Number(r.baseline_nav || r.starting_capital || 0), { pct: Number(r.daily_pnl_pct || 0) * 100, pctDecimals: 2 }) + '</b></div>' +
+        '<div><span>Open</span><b class="' + (Number(r.open_unrealized_pnl || 0) >= 0 ? 'pos' : 'neg') + '">' + formatSignedMoney(Number(r.open_unrealized_pnl || 0)) + '</b></div>' +
+        '<div><span>Realized</span><b class="' + (Number(r.realized_today || 0) >= 0 ? 'pos' : 'neg') + '">' + formatSignedMoney(Number(r.realized_today || 0)) + '</b></div>' +
+      '</div>' +
+      '<div class="lr-subtitle">Loss Drivers</div>' +
+      '<div class="tbl-wrap lr-table-wrap"><table class="dtbl"><thead><tr><th>Symbol</th><th class="r">P&L</th><th class="r">NAV Impact</th></tr></thead><tbody>' + contribHtml + '</tbody></table></div>' +
+      '<div class="lr-actions">' +
+        '<details open><summary>CRO Action</summary><p>' + escapeHtml(r.cro_action || '') + '</p></details>' +
+        '<details><summary>CIO Decision</summary><p>' + escapeHtml(r.cio_decision || '') + '</p></details>' +
+        '<details><summary>PM Defense Prompt</summary><p>' + escapeHtml(r.pm_defense_prompt || '') + '</p></details>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
+
+function fetchLossReviews() {
+  return fetchJsonWithTimeout('/api/loss-reviews', {}, 3500)
+    .then(function(data) {
+      renderLossReviews(data);
+      return data;
+    })
+    .catch(function() {
+      renderLossReviews(lossReviewState);
+    });
+}
+
 function getCommodityOpenPositions() {
   var positions = [];
   if (_positionsFromApi && _positionsFromApi.length > 0) {
@@ -1929,6 +3511,19 @@ function setExecFilter(filter) {
   updateExecTable();
 }
 
+function executionReasonForDisplay(t) {
+  var reason = t.reason || '';
+  var symbol = String(t.symbol || '');
+  var isGeneric = !reason || reason.toLowerCase() === 'order rejected';
+  if (t.status === 'REJECTED' && isGeneric && symbol.indexOf('/') >= 0) {
+    return 'Broker rejected before accepting the crypto order. Crypto orders must use GTC/IOC time-in-force; restart the server if this generic reason persists.';
+  }
+  if (t.status === 'REJECTED' && isGeneric) {
+    return 'Broker rejected before accepting the order; restart the server if the detailed stage/reason is still missing.';
+  }
+  return reason;
+}
+
 function updateExecTable() {
   var allItems = executedTrades.slice();
   var obKeys = Object.keys(orderBook);
@@ -1939,7 +3534,9 @@ function updateExecTable() {
       allItems.push({
         podId: o.pod_id || 'unknown', symbol: o.symbol, side: (o.side || '').toUpperCase(),
         qty: o.qty || 0, price: o.fill_price || 0, status: o.status,
-        ts: o.timestamp || '', orderId: oid
+        ts: o.timestamp || '', orderId: oid,
+        stage: o.stage || '',
+        reason: o.reason || o.rejection_detail || o.rejection_reason || ''
       });
     }
   });
@@ -1956,12 +3553,15 @@ function updateExecTable() {
   document.getElementById('kpi-trades').textContent = executedTrades.length + pendingRejectCount;
   document.getElementById('kpi-filled').textContent = executedTrades.filter(function(t) { return t.status === 'FILLED'; }).length;
   if (allItems.length === 0) {
-    document.getElementById('exec-table').innerHTML = '<tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr>';
+    document.getElementById('exec-table').innerHTML = '<tr><td colspan="8" class="empty"><div class="empty-txt">No trades yet</div></td></tr>';
     return;
   }
   document.getElementById('exec-table').innerHTML = allItems.slice(0, 30).map(function(t) {
     var sc = t.side === 'BUY' ? 'b-buy' : 'b-sell';
     var ss = t.status === 'FILLED' ? 'b-filled' : t.status === 'PENDING' ? 'b-pending' : t.status === 'PARTIAL' ? 'b-partial' : t.status === 'REJECTED' ? 'b-rejected' : 'b-pending';
+    var reason = executionReasonForDisplay(t);
+    var stage = (t.stage || (t.status === 'REJECTED' && reason ? 'broker' : '')).replace(/_/g, ' ');
+    var reasonCell = reason ? '<span class="exec-reason" title="' + escapeHtml(reason) + '">' + escapeHtml(reason) + '</span>' : '-';
     return '<tr>' +
       '<td>' + (t.podId || 'unknown').toUpperCase() + '</td>' +
       '<td style="font-weight:600">' + tickerDisplay(t.symbol || '') + '</td>' +
@@ -1969,6 +3569,8 @@ function updateExecTable() {
       '<td class="r">' + (t.qty || 0) + '</td>' +
       '<td class="r">$' + (t.price || 0).toFixed(2) + '</td>' +
       '<td class="r"><span class="badge ' + ss + '">' + (t.status || '') + '</span></td>' +
+      '<td>' + (stage ? '<span class="exec-stage">' + escapeHtml(stage.toUpperCase()) + '</span>' : '-') + '</td>' +
+      '<td>' + reasonCell + '</td>' +
       '</tr>';
   }).join('');
 }
@@ -2032,6 +3634,19 @@ function updateGovHub() {
 
 // ─── 12. Top Holdings ──────────────────────────────────────────────────────
 // Uses _positionsFromApi (fetched from /api/positions) — same as drilldown and KPI
+function positionPriceCell(p, fallback) {
+  var price = Number(p.current_price || fallback || 0);
+  var source = String(p.price_source || '').toUpperCase();
+  var stale = !!p.price_stale;
+  var meta = '';
+  if (stale) {
+    meta = '<div class="quote-meta quote-stale">STALE' + (source ? ' - ' + escapeHtml(source) : '') + '</div>';
+  } else if (source) {
+    meta = '<div class="quote-meta">' + escapeHtml(source) + '</div>';
+  }
+  return '<div class="price-stack">$' + price.toFixed(2) + meta + '</div>';
+}
+
 function updateTopHoldings() {
   var tbody = document.getElementById('holdings-table');
   var badge = document.getElementById('holdings-badge');
@@ -2059,7 +3674,8 @@ function updateTopHoldings() {
     var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
     var entry = p.cost_basis || p.avg_entry || 0;
-    var notional = p.notional || (p.qty || 0) * (p.current_price || entry);
+    var notional = positionCurrentNotional(p);
+    var entryNotional = positionEntryNotional(p);
     var podEsc = escapeHtml(p._pod || '');
     var symEsc = escapeHtml(p.symbol || '');
     var entryDate = escapeHtml(p.entry_date || '—');
@@ -2074,8 +3690,8 @@ function updateTopHoldings() {
       '<td style="font-weight:600" title="' + symTitle + '">' + tickerDisplay(p.symbol || '') + alertBadge + (thesis ? ' <span style="color:var(--text-dim);font-size:9px">✦</span>' : '') + '</td>' +
       '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
       '<td class="r">$' + entry.toFixed(2) + '</td>' +
-      '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
-      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+      '<td class="r">' + positionPriceCell(p, entry) + '</td>' +
+      '<td class="r ' + pc + '">' + formatPnlWithPct(pnl, entryNotional, { pct: p.pnl_pct, pctDecimals: 2 }) + '</td>' +
       '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
       '<td class="r">' + entryDate + '</td>' +
       '</tr>';
@@ -2109,7 +3725,7 @@ function applySortHoldings(arr) {
     else if (col === 'price')      { av = a.current_price || 0; bv = b.current_price || 0; }
     else if (col === 'pnl')        { av = a.unrealized_pnl || a.unrealised_pnl || 0; bv = b.unrealized_pnl || b.unrealised_pnl || 0; }
     else if (col === 'entry_date') { av = a.entry_date || ''; bv = b.entry_date || ''; }
-    else /* notional */            { av = Math.abs(a.notional || (a.qty || 0) * (a.current_price || 0)); bv = Math.abs(b.notional || (b.qty || 0) * (b.current_price || 0)); }
+    else /* notional */            { av = positionCurrentNotional(a); bv = positionCurrentNotional(b); }
     if (av < bv) return asc ? -1 : 1;
     if (av > bv) return asc ? 1 : -1;
     return 0;
@@ -2129,6 +3745,29 @@ function updateSortIcons() {
 // ─── 12b. Position Detail Modal ─────────────────────────────────────────────
 var _openModalPodId = null;
 var _openModalSymbol = null;
+var _positionDetailRequestToken = 0;
+
+function positionModalKeyHandler(e) {
+  if (e.key === 'Escape') closePositionModal();
+}
+
+function setPositionDetailsOpen(group, open) {
+  var overlay = document.getElementById('pos-modal-overlay');
+  if (!overlay) return;
+  var selector = group === 'fills' ? '.pos-fills details' : group === 'reasoning' ? '.pmh-list details' : 'details';
+  overlay.querySelectorAll(selector).forEach(function(detail) {
+    detail.open = !!open;
+  });
+}
+
+function enhancePositionModalDetails(overlay) {
+  if (!overlay) return;
+  overlay.querySelectorAll('.pos-fills details, .pmh-list details').forEach(function(detail) {
+    detail.addEventListener('toggle', function() {
+      if (detail.open) detail.scrollIntoView({ block: 'nearest' });
+    });
+  });
+}
 
 function showPositionDetail(podId, symbol) {
   var overlay = document.getElementById('pos-modal-overlay');
@@ -2140,8 +3779,11 @@ function showPositionDetail(podId, symbol) {
     document.body.appendChild(overlay);
   }
   overlay.classList.add('open');
+  document.removeEventListener('keydown', positionModalKeyHandler);
+  document.addEventListener('keydown', positionModalKeyHandler);
   _openModalPodId = podId;
   _openModalSymbol = symbol;
+  var requestToken = ++_positionDetailRequestToken;
 
   // Build modal immediately from data already on the frontend
   var localData = buildPositionFromLocal(podId, symbol);
@@ -2156,9 +3798,13 @@ function showPositionDetail(podId, symbol) {
   var timeout = setTimeout(function() { controller.abort(); }, 4000);
   fetch('/api/position/' + encodeURIComponent(podId) + '/' + encodeURIComponent(symbol), { signal: controller.signal })
     .then(function(r) { clearTimeout(timeout); if (!r.ok) throw new Error(r.statusText); return r.json(); })
-    .then(function(d) { renderPositionModal(d, overlay); })
+    .then(function(d) {
+      if (requestToken !== _positionDetailRequestToken || _openModalPodId !== podId || _openModalSymbol !== symbol) return;
+      renderPositionModal(d, overlay);
+    })
     .catch(function() {
       clearTimeout(timeout);
+      if (requestToken !== _positionDetailRequestToken || _openModalPodId !== podId || _openModalSymbol !== symbol) return;
       if (!localData) {
         overlay.innerHTML = '<div class="pos-modal"><div class="pos-modal-err">Position data unavailable. Try again between iterations.</div><button class="pos-modal-close" onclick="closePositionModal()">Close</button></div>';
       }
@@ -2207,6 +3853,10 @@ function buildPositionFromLocal(podId, symbol) {
     take_profit_pct: pos.take_profit_pct || 0.15,
     max_hold_days: pos.max_hold_days || 0,
     conviction: pos.conviction || 0,
+    thesis_status: pos.thesis_status || 'unknown',
+    thesis_issues: pos.thesis_issues || [],
+    thesis_review: pos.thesis_review || {},
+    entry_macro_regime: pos.entry_macro_regime || '',
     days_held: daysHeld,
     fills: pos.fills || [],
     partial_exits: pos.partial_exits || []
@@ -2216,11 +3866,20 @@ function buildPositionFromLocal(podId, symbol) {
 function closePositionModal() {
   var o = document.getElementById('pos-modal-overlay');
   if (o) o.classList.remove('open');
+  document.removeEventListener('keydown', positionModalKeyHandler);
+  _positionDetailRequestToken++;
   _openModalPodId = null;
   _openModalSymbol = null;
 }
 
 function renderPositionModal(d, overlay) {
+  var previousDetailState = {};
+  if (overlay) {
+    overlay.querySelectorAll('details[data-detail-key]').forEach(function(detail) {
+      previousDetailState[detail.getAttribute('data-detail-key')] = !!detail.open;
+    });
+  }
+
   var pnl = d.unrealized_pnl || 0;
   var pnlCls = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
   var pnlPct = d.pnl_pct || 0;
@@ -2257,8 +3916,8 @@ function renderPositionModal(d, overlay) {
       var thesisText = cleanThesis(f.entry_thesis || f.reasoning || '', d.symbol);
       var conv = f.conviction > 0 ? ' · ' + (f.conviction * 100).toFixed(0) + '% conviction' : '';
       var tag = f.strategy_tag ? ' · ' + escapeHtml(f.strategy_tag) : '';
-      var openAttr = (idx === fills.length - 1 || f._synthetic) ? ' open' : '';
-      return '<details class="fill-entry ' + cls + '"' + openAttr + '>' +
+      var openAttr = idx === 0 ? ' open' : '';
+      return '<details class="fill-entry ' + cls + '" data-detail-key="fill-' + idx + '"' + openAttr + '>' +
         '<summary class="fill-summary">' +
           '<span class="fill-icon">' + icon + '</span>' +
           '<span class="fill-info">' +
@@ -2289,11 +3948,12 @@ function renderPositionModal(d, overlay) {
       d.partial_exits.map(function(e) {
         var rpnl = e.realized_pnl || 0;
         var rpCls = rpnl >= 0 ? 'pos' : 'neg';
+        var rpBase = tradeEntryNotional({ qty: e.qty_sold, entry_price: e.entry_price || d.cost_basis });
         return '<div class="exit-entry">' +
           '<span class="exit-date">' + (e.date || '—') + '</span>' +
           '<span class="exit-qty">Sold ' + e.qty_sold + ' (' + e.pct_of_original + '% of original)</span>' +
           '<span class="exit-px">@ $' + (e.exit_price || 0).toFixed(2) + '</span>' +
-          '<span class="exit-pnl ' + rpCls + '">P&L: ' + (rpnl >= 0 ? '+' : '') + '$' + rpnl.toFixed(4) + '</span>' +
+          '<span class="exit-pnl ' + rpCls + '">P&L: ' + formatPnlWithPct(rpnl, rpBase, { moneyDecimals: 4, pctDecimals: 2 }) + '</span>' +
         '</div>';
       }).join('') + '</div>';
   }
@@ -2302,6 +3962,23 @@ function renderPositionModal(d, overlay) {
 
   var avgEntry = d.cost_basis || 0;
   var thesis = cleanThesis(d.entry_thesis || '', d.symbol);
+  var review = d.thesis_review || {};
+  var thesisStatus = String(d.thesis_status || review.status || 'unknown').toLowerCase();
+  var thesisIssues = d.thesis_issues || review.issues || [];
+  var thesisIssueHtml = thesisIssues && thesisIssues.length
+    ? '<ul class="thesis-issues">' + thesisIssues.map(function(issue) {
+        return '<li>' + escapeHtml(String(issue)) + '</li>';
+      }).join('') + '</ul>'
+    : '<div class="thesis-ok">No lifecycle issues detected.</div>';
+  var thesisMonitors = review.monitors && review.monitors.length
+    ? '<div class="thesis-monitors">Monitors: ' + escapeHtml(review.monitors.join(', ')) + '</div>'
+    : '';
+  var fillControls = fills.length > 0
+    ? '<span class="pos-section-actions">' +
+        '<button type="button" class="pos-detail-btn" onclick="setPositionDetailsOpen(\'fills\', true)">Expand all</button>' +
+        '<button type="button" class="pos-detail-btn" onclick="setPositionDetailsOpen(\'fills\', false)">Collapse all</button>' +
+      '</span>'
+    : '';
 
   overlay.innerHTML = '<div class="pos-modal">' +
     '<button class="pos-modal-close" onclick="closePositionModal()">&times;</button>' +
@@ -2312,7 +3989,7 @@ function renderPositionModal(d, overlay) {
         '<span class="badge b-' + escapeHtml(d.pod_id) + '">' + escapeHtml(d.pod_id).toUpperCase() + '</span>' +
       '</div>' +
       '<div class="pos-hdr-right">' +
-        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(4) + ' <span class="pos-hdr-pct">(' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%)</span></div>' +
+        '<div class="pos-hdr-pnl ' + pnlCls + '">' + formatPnlWithPct(pnl, Math.abs((d.qty || 0) * (d.cost_basis || 0)), { moneyDecimals: 4, pct: pnlPct, pctDecimals: 2 }) + '</div>' +
       '</div>' +
     '</div>' +
     // Summary grid
@@ -2320,9 +3997,21 @@ function renderPositionModal(d, overlay) {
       '<div class="pos-cell"><div class="pos-cell-lbl">Entry Date</div><div class="pos-cell-val">' + (d.entry_date || '—') + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Days Held</div><div class="pos-cell-val">' + (d.days_held > 0 ? d.days_held : (d.entry_date ? '< 1' : '—')) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Avg Entry</div><div class="pos-cell-val">$' + (d.cost_basis || 0).toFixed(2) + '</div></div>' +
-      '<div class="pos-cell"><div class="pos-cell-lbl">Current Price</div><div class="pos-cell-val">$' + (d.current_price || 0).toFixed(2) + '</div></div>' +
+      '<div class="pos-cell"><div class="pos-cell-lbl">Current Price</div><div class="pos-cell-val">' + positionPriceCell(d, 0) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Quantity</div><div class="pos-cell-val">' + (d.qty || 0) + '</div></div>' +
       '<div class="pos-cell"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + totalRetCls + '">' + (pnlPct >= 0 ? '+' : '') + pnlPct.toFixed(2) + '%</div></div>' +
+    '</div>' +
+    '<div class="pos-section">' +
+      '<div class="pos-section-title">Thesis Health</div>' +
+      '<div class="thesis-health thesis-' + escapeHtml(thesisStatus) + '">' +
+        '<div class="thesis-health-row">' +
+          '<span class="thesis-status">' + escapeHtml(thesisStatus.toUpperCase()) + '</span>' +
+          '<span class="thesis-score">Score ' + ((review.score != null ? Number(review.score) : 0).toFixed(2)) + '</span>' +
+          (review.block_adds ? '<span class="thesis-block">Adds blocked</span>' : '') +
+        '</div>' +
+        thesisIssueHtml +
+        thesisMonitors +
+      '</div>' +
     '</div>' +
     // Exit conditions bar
     '<div class="pos-section">' +
@@ -2344,6 +4033,7 @@ function renderPositionModal(d, overlay) {
     // Fill timeline
     '<div class="pos-section">' +
       '<div class="pos-section-title">Fill Timeline (' + fillsCount + (fills.length > 0 && fills[0]._synthetic ? ' — entry reconstructed' : ' fills') + ')</div>' +
+      (fillControls ? '<div class="pos-section-controlbar">' + fillControls + '</div>' : '') +
       '<div class="pos-fills">' + fillsHtml + '</div>' +
     '</div>' +
     // Partial exits
@@ -2359,24 +4049,36 @@ function renderPositionModal(d, overlay) {
         var ts = r.timestamp ? new Date(r.timestamp).toLocaleString() : '';
         var conv = r.conviction > 0 ? ' (' + (r.conviction * 100).toFixed(0) + '% conviction)' : '';
         var text = cleanThesis(r.reasoning || '', d.symbol);
-        return '<details class="pmh-entry ' + actionCls + '"' + (idx === 0 ? ' open' : '') + '>' +
+        return '<details class="pmh-entry ' + actionCls + '" data-detail-key="reason-' + idx + '"' + (idx === 0 ? ' open' : '') + '>' +
           '<summary class="pmh-header"><span class="rh-badge">' + escapeHtml(r.action) + '</span><span class="rh-ts">' + escapeHtml(ts + conv) + '</span><span class="pmh-caret">▾</span></summary>' +
           '<div class="pmh-text">' + escapeHtml(text || 'No reasoning captured.') + '</div>' +
         '</details>';
       }).join('');
-      return '<div class="pos-section"><div class="pos-section-title">PM Reasoning History (' + rh.length + ' entries)</div>' +
+      var controls = '<span class="pos-section-actions">' +
+        '<button type="button" class="pos-detail-btn" onclick="setPositionDetailsOpen(\'reasoning\', true)">Expand all</button>' +
+        '<button type="button" class="pos-detail-btn" onclick="setPositionDetailsOpen(\'reasoning\', false)">Collapse all</button>' +
+      '</span>';
+      return '<div class="pos-section"><div class="pos-section-title pos-section-title-row"><span>PM Reasoning History (' + rh.length + ' entries)</span>' + controls + '</div>' +
         '<div class="pmh-list">' + items + '</div></div>';
     })() +
   '</div>';
+  Object.keys(previousDetailState).forEach(function(key) {
+    var detail = overlay.querySelector('details[data-detail-key="' + key + '"]');
+    if (detail) detail.open = previousDetailState[key];
+  });
+  enhancePositionModalDetails(overlay);
 }
 
 // ─── 13. Drawdown Chart ───────────────────────────────────────────────────
 function updateDrawdownChart() {
   var canvas = document.getElementById('ddChart');
-  if (!canvas) return;
-  var filtered = getFilteredNavHistory();
+  if (!canvas || typeof Chart === 'undefined') return;
+  var filtered = getChartNavHistory();
+  if (filtered.length < 2 && navHistory.length >= 2) {
+    filtered = downsampleNavHistory(navHistory.slice(-MAX_CHART_POINTS));
+  }
   if (filtered.length < 2) return;
-  var labels = filtered.map(function(h) { return h.t; });
+  var labels = filtered.map(function(h) { return formatChartTimeLabel(h.ts); });
   var ddData = filtered.map(function(h) { return (h.drawdown || 0) * 100; });
   var datasets = [{
     label: 'DRAWDOWN %',
@@ -2392,6 +4094,7 @@ function updateDrawdownChart() {
     ddChart.data.labels = labels;
     ddChart.data.datasets = datasets;
     ddChart.update('none');
+    schedulePerformanceChartResize();
     return;
   }
   ddChart = new Chart(canvas.getContext('2d'), {
@@ -2411,6 +4114,7 @@ function updateDrawdownChart() {
       },
     },
   });
+  schedulePerformanceChartResize();
 }
 
 // ─── 14. Decision Timeline ─────────────────────────────────────────────────
@@ -2567,10 +4271,11 @@ function exportPods() {
   var headers = ['Pod','NAV','Daily P&L','VaR 95%','Leverage','Drawdown','Status'];
   var rows = ids.map(function(id) {
     var d = pods[id];
+    var dailyMove = getPodDailyMove(id);
     return [
       id.toUpperCase(),
-      (d.nav || 0).toFixed(2),
-      (d.daily_pnl || 0).toFixed(2),
+      getCurrentPodNav(id).toFixed(2),
+      dailyMove.pnl.toFixed(2),
       d.var_95 != null ? d.var_95.toFixed(2) : '',
       d.gross_leverage != null ? d.gross_leverage.toFixed(2) : '',
       d.drawdown != null ? (d.drawdown * 100).toFixed(1) + '%' : '',
@@ -2591,8 +4296,9 @@ function exportTrades() {
 function exportNavHistory() {
   var podIds = Object.keys(pods).sort();
   var headers = ['Time','Firm NAV','Drawdown %'].concat(podIds.map(function(id) { return id.toUpperCase(); }));
-  var rows = navHistory.map(function(h) {
-    var row = [h.t, h.firmNav.toFixed(2), ((h.drawdown || 0) * 100).toFixed(1) + '%'];
+  var rows = getFilteredNavHistory().map(function(h) {
+    var timeLabel = h.ts ? new Date(h.ts).toISOString() : h.t;
+    var row = [timeLabel, h.firmNav.toFixed(2), ((h.drawdown || 0) * 100).toFixed(1) + '%'];
     podIds.forEach(function(id) { row.push(((h.pods && h.pods[id]) || 0).toFixed(2)); });
     return row;
   });
@@ -2615,6 +4321,8 @@ function fetchClosedTrades(force) {
       _ctData = Array.isArray(data) ? data : (data && (data.value || data.closed_positions)) || [];
       renderClosedTrades();
       renderOutcomeStats();
+      updatePerfTable();
+      updateAttribution();
     })
     .catch(function() { clearTimeout(timeout); });
 }
@@ -2633,6 +4341,7 @@ function renderClosedTrades() {
     var pnl = t.realized_pnl || 0;
     totalPnl += pnl;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+    var pnlBase = tradeEntryNotional(t);
     var thesis = t.entry_reasoning || '';
     var entryDate = displayDateOnly(t.entry_date || t.entry_time);
     var exitDate = displayDateOnly(t.exit_date || t.exit_time);
@@ -2642,7 +4351,7 @@ function renderClosedTrades() {
       '<td class="r">$' + (t.entry_price || 0).toFixed(2) + '</td>' +
       '<td class="r">$' + (t.exit_price || 0).toFixed(2) + '</td>' +
       '<td class="r">' + (t.qty || 0) + '</td>' +
-      '<td class="r ct-pnl ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+      '<td class="r ct-pnl ' + pc + '">' + formatPnlWithPct(pnl, pnlBase, { pctDecimals: 2 }) + '</td>' +
       '<td class="r">' + (t.holding_days != null ? t.holding_days : '—') + '</td>' +
       '<td>' + escapeHtml(entryDate) + '</td>' +
       '<td>' + escapeHtml(exitDate) + '</td>' +
@@ -2652,13 +4361,50 @@ function renderClosedTrades() {
 }
 
 // ─── 17. Chart Timeframe Toggle ────────────────────────────────────────────
-function setChartTimeframe(minutes) {
-  chartTimeframeMinutes = minutes;
-  document.querySelectorAll('.tf-btn').forEach(function(b) {
-    b.classList.toggle('active', parseInt(b.dataset.tf) === minutes);
+function setChartPeriod(period) {
+  chartPeriod = period || 'all';
+  chartTimeframeMinutes = 0;
+  document.querySelectorAll('.tf-btn[data-period]').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.period === chartPeriod);
   });
+  refreshPerformanceCharts();
+}
+
+function setFirmNavVisible(visible) {
+  showFirmNav = !!visible;
+  var checkbox = document.getElementById('firm-nav-toggle');
+  if (checkbox) checkbox.checked = showFirmNav;
   updateNavChart();
-  updateDrawdownChart();
+  syncModalNavChart();
+  schedulePerformanceChartResize();
+}
+
+function setSpBenchmarkVisible(visible) {
+  showSpBenchmark = !!visible;
+  var checkbox = document.getElementById('sp-benchmark-toggle');
+  if (checkbox) checkbox.checked = showSpBenchmark;
+  updateNavChart();
+  syncModalNavChart();
+  schedulePerformanceChartResize();
+}
+
+function syncModalNavChart() {
+  if (_modalNavChart && navChart) {
+    _modalNavChart.data.labels = navChart.data.labels.slice();
+    _modalNavChart.data.datasets = navChart.data.datasets.map(function(ds) {
+      return Object.assign({}, ds, { data: ds.data.slice() });
+    });
+    _modalNavChart.update('none');
+    resizeChartInstance(_modalNavChart);
+  }
+}
+
+function setChartTimeframe(minutes) {
+  var mins = Number(minutes || 0);
+  if (mins >= 1440 && mins < 7 * 1440) return setChartPeriod('24h');
+  if (mins >= 7 * 1440 && mins < 30 * 1440) return setChartPeriod('7d');
+  if (mins >= 30 * 1440 && mins < 90 * 1440) return setChartPeriod('30d');
+  return setChartPeriod('all');
 }
 
 // ─── 18. Pod Drill-Down ────────────────────────────────────────────────────
@@ -2682,8 +4428,8 @@ function openDrilldown(podId) {
     { lbl: 'NAV', val: '$' + nav.toFixed(2) },
     { lbl: 'Invested', val: '$' + inv.toFixed(2) },
     { lbl: 'Cash', val: '$' + csh.toFixed(2) },
-    { lbl: 'Daily P&L', val: (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) },
-    { lbl: 'Cum. P&L', val: (cpnl >= 0 ? '+' : '') + '$' + cpnl.toFixed(2) },
+    { lbl: 'Daily P&L', val: formatPnlWithPct(pnl, nav, { pctDecimals: 2 }) },
+    { lbl: 'Cum. P&L', val: formatPnlWithPct(cpnl, sc, { pctDecimals: 2 }) },
     { lbl: 'Return', val: cret },
     { lbl: 'Leverage', val: d.gross_leverage != null ? d.gross_leverage.toFixed(2) + 'x' : '—' },
     { lbl: 'Drawdown', val: d.drawdown != null ? (d.drawdown * 100).toFixed(1) + '%' : '—' },
@@ -2698,7 +4444,8 @@ function openDrilldown(podId) {
       var pnl = p.unrealized_pnl || p.unrealised_pnl || 0;
       var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
       var entry = p.cost_basis || p.avg_entry || 0;
-      var notional = p.notional || (p.qty || 0) * (p.current_price || entry);
+      var notional = positionCurrentNotional(p);
+      var entryNotional = positionEntryNotional(p);
       var entryDate = escapeHtml(p.entry_date || '—');
       var podEsc = escapeHtml(podId);
       var symEsc = escapeHtml(p.symbol || '');
@@ -2709,7 +4456,7 @@ function openDrilldown(podId) {
         '<td class="r">' + (p.qty || 0).toFixed(4) + '</td>' +
         '<td class="r">$' + entry.toFixed(2) + '</td>' +
         '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
-        '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+        '<td class="r ' + pc + '">' + formatPnlWithPct(pnl, entryNotional, { pct: p.pnl_pct, pctDecimals: 2 }) + '</td>' +
         '<td class="r">$' + Math.abs(notional).toFixed(0) + '</td>' +
         '<td class="r">' + entryDate + '</td>' +
         '</tr>';
@@ -2881,32 +4628,59 @@ function updateAttribution() {
   var firmPnl = 0;
   var podStats = ids.map(function(id) {
     var d = pods[id];
-    var nav = d.nav || 0;
-    var sc = d.starting_capital || nav;
-    var pnl = nav - sc;
+    var nav = getCurrentPodNav(id);
+    var sc = getPodStartingCapital(id, ids);
+    var move = getPodDailyMove(id);
+    var pnl = move.pnl;
+    var realized = getPodRealizedToday(id);
+    var openPnl = getPodOpenPnl(id);
     firmPnl += pnl;
-    var podTrades = executedTrades.filter(function(t) { return (t.podId || '').toLowerCase() === id.toLowerCase(); });
-    var tradeCount = podTrades.length;
-    var ret = sc > 0 ? (pnl / sc * 100) : 0;
-    return { id: id, pnl: pnl, ret: ret, trades: tradeCount, nav: nav };
+    return {
+      id: id,
+      pnl: pnl,
+      ret: move.pct,
+      trades: getPodTradeCount(id),
+      nav: nav,
+      base: move.base || sc,
+      realized: realized,
+      openPnl: openPnl,
+    };
   });
   var maxAbsPnl = Math.max.apply(null, podStats.map(function(p) { return Math.abs(p.pnl); })) || 1;
 
-  var html = '<div class="attr-bars">';
+  var html = '<div class="attr-section-title">Today by Pod</div><div class="attr-bars">';
   podStats.forEach(function(p) {
     var pct = firmPnl !== 0 ? (p.pnl / Math.abs(firmPnl) * 100) : 0;
     var barW = Math.abs(p.pnl) / maxAbsPnl * 100;
     var col = p.pnl >= 0 ? '#00d68f' : '#e84040';
-    var status = p.pnl > 0 ? 'Positive' : p.pnl < 0 ? 'Negative' : 'Flat';
     html += '<div class="attr-row">' +
       '<span class="attr-pod">' + p.id.toUpperCase() + '</span>' +
       '<div class="attr-bar-wrap"><div class="attr-bar" style="width:' + barW.toFixed(0) + '%;background:' + col + '"></div></div>' +
-      '<span class="attr-val" style="color:' + col + '">' + (p.pnl >= 0 ? '+' : '') + '$' + p.pnl.toFixed(2) + '</span>' +
+      '<span class="attr-val" style="color:' + col + '">' + formatPnlWithPct(p.pnl, p.base || p.nav || 0, { pct: p.ret, pctDecimals: 1 }) + '</span>' +
       '<span class="attr-pct">' + (pct >= 0 ? '+' : '') + pct.toFixed(0) + '%</span>' +
-      '<span class="attr-stat">' + p.trades + ' trades · ' + (p.ret >= 0 ? '+' : '') + p.ret.toFixed(1) + '% return</span>' +
+      '<span class="attr-stat">realized ' + formatPnlWithPct(p.realized.pnl, p.realized.base, { pctDecimals: 1 }) + ' - open ' + formatPnlWithPct(p.openPnl.pnl, p.openPnl.base, { pctDecimals: 1 }) + '</span>' +
       '</div>';
   });
   html += '</div>';
+
+  var contributors = buildPnlContributors(ids).slice(0, 8);
+  html += '<div class="attr-section-title attr-contrib-title">Top P&amp;L Contributors</div>';
+  if (contributors.length === 0) {
+    html += '<div class="empty"><div class="empty-txt">No material contributors yet</div></div>';
+  } else {
+    html += '<div class="tbl-wrap attr-contrib-wrap"><table class="dtbl attr-contrib-table">' +
+      '<thead><tr><th>Symbol</th><th>Pod</th><th>Type</th><th class="r">P&amp;L</th></tr></thead><tbody>';
+    contributors.forEach(function(row) {
+      var cls = row.pnl >= 0 ? 'pos' : 'neg';
+      html += '<tr>' +
+        '<td class="pod-name">' + escapeHtml(row.symbol || '-') + '</td>' +
+        '<td>' + escapeHtml(String(row.pod || '').toUpperCase()) + '</td>' +
+        '<td>' + escapeHtml(row.type) + '</td>' +
+        '<td class="r ' + cls + '">' + formatPnlWithPct(row.pnl, row.base, { pctDecimals: 2 }) + '</td>' +
+        '</tr>';
+    });
+    html += '</tbody></table></div>';
+  }
   container.innerHTML = html;
 }
 
@@ -3025,7 +4799,7 @@ function renderReviews() {
               '<td class="r">' + (p.qty || 0).toFixed(3) + '</td>' +
               '<td class="r">$' + entry.toFixed(2) + '</td>' +
               '<td class="r">$' + (p.current_price || entry).toFixed(2) + '</td>' +
-              '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+              '<td class="r ' + pc + '">' + formatPnlWithPct(pnl, positionEntryNotional(p), { pct: p.pnl_pct, pctDecimals: 2 }) + '</td>' +
               '<td class="ct-thesis-cell" title="' + escapeHtml(thesis) + '">' + escapeHtml(thesis) + '</td></tr>';
           }).join('') +
           '</tbody></table></div>';
@@ -3102,15 +4876,19 @@ function buildClosedOutcomeStatsByPod() {
   var grouped = {};
   (_ctData || []).forEach(function(t) {
     var pid = String(t.pod_id || t._pod || 'unknown').toLowerCase();
-    if (!grouped[pid]) grouped[pid] = { trades: [], total_pnl: 0, wins: 0, winners: [], losers: [] };
+    if (!grouped[pid]) grouped[pid] = { trades: [], total_pnl: 0, total_notional: 0, wins: 0, winners: [], losers: [], winner_notional: 0, loser_notional: 0 };
     var pnl = Number(t.realized_pnl || 0);
+    var notional = tradeEntryNotional(t);
     grouped[pid].trades.push(t);
     grouped[pid].total_pnl += pnl;
+    grouped[pid].total_notional += notional;
     if (pnl > 0) {
       grouped[pid].wins += 1;
       grouped[pid].winners.push(pnl);
+      grouped[pid].winner_notional += notional;
     } else if (pnl < 0) {
       grouped[pid].losers.push(pnl);
+      grouped[pid].loser_notional += notional;
     }
   });
 
@@ -3125,6 +4903,10 @@ function buildClosedOutcomeStatsByPod() {
       win_rate: n > 0 ? g.wins / n : 0,
       avg_pnl: n > 0 ? g.total_pnl / n : 0,
       total_pnl: g.total_pnl,
+      avg_notional: n > 0 ? g.total_notional / n : 0,
+      total_notional: g.total_notional,
+      avg_winner_notional: g.winners.length > 0 ? g.winner_notional / g.winners.length : 0,
+      avg_loser_notional: g.losers.length > 0 ? g.loser_notional / g.losers.length : 0,
       avg_winner: g.winners.length > 0 ? winTotal / g.winners.length : 0,
       avg_loser: g.losers.length > 0 ? lossTotal / g.losers.length : 0
     };
@@ -3182,11 +4964,11 @@ function renderOutcomeStats() {
       '<div class="outcome-stats-row">' +
         stat('Trades', s.total_trades || 0, '') +
         stat('Win Rate', ((s.win_rate || 0) * 100).toFixed(0) + '%', wrCls) +
-        stat('Avg P&amp;L', (s.avg_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.avg_pnl) || 0).toFixed(2), avgCls) +
-        stat('Closed P&amp;L', (s.total_pnl >= 0 ? '+' : '') + '$' + (Math.abs(s.total_pnl) || 0).toFixed(2), totCls) +
-        stat('NAV P&amp;L', navPnl == null ? '-' : (navPnl >= 0 ? '+' : '') + '$' + Math.abs(navPnl).toFixed(2), navCls) +
-        stat('Avg Winner', '+$' + (s.avg_winner || 0).toFixed(2), 'pos') +
-        stat('Avg Loser', '$' + (s.avg_loser || 0).toFixed(2), 'neg') +
+        stat('Avg P&amp;L', formatPnlWithPct(s.avg_pnl || 0, s.avg_notional || 0, { pctDecimals: 2 }), avgCls) +
+        stat('Closed P&amp;L', formatPnlWithPct(s.total_pnl || 0, s.total_notional || 0, { pctDecimals: 2 }), totCls) +
+        stat('NAV P&amp;L', navPnl == null ? '-' : formatPnlWithPct(navPnl, startCap, { pctDecimals: 2 }), navCls) +
+        stat('Avg Winner', formatPnlWithPct(s.avg_winner || 0, s.avg_winner_notional || 0, { pctDecimals: 2 }), 'pos') +
+        stat('Avg Loser', formatPnlWithPct(s.avg_loser || 0, s.avg_loser_notional || 0, { pctDecimals: 2 }), 'neg') +
       '</div>' +
     '</div>';
   }).join('');
@@ -3257,6 +5039,7 @@ function renderClosedPositions() {
   tbody.innerHTML = _closedPositions.map(function(p, idx) {
     var pnl = p.realized_pnl || 0;
     var pc = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+    var pnlBase = tradeEntryNotional(p);
     var entryP = p.entry_price || 0;
     var exitP = p.exit_price || 0;
     var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
@@ -3278,7 +5061,7 @@ function renderClosedPositions() {
       '<td class="r">$' + entryP.toFixed(2) + '</td>' +
       '<td class="r">$' + exitP.toFixed(2) + '</td>' +
       '<td class="r">' + (p.qty || 0) + '</td>' +
-      '<td class="r ' + pc + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</td>' +
+      '<td class="r ' + pc + '">' + formatPnlWithPct(pnl, pnlBase, { pct: retPct, pctDecimals: 2 }) + '</td>' +
       '<td class="r ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</td>' +
       '<td class="r">' + holdDays + '</td>' +
       '<td>' + entryDate + '</td>' +
@@ -3303,6 +5086,7 @@ function showClosedPositionDetail(idx) {
 
   var pnl = p.realized_pnl || 0;
   var pnlCls = pnl > 0 ? 'pos' : pnl < 0 ? 'neg' : '';
+  var pnlBase = tradeEntryNotional(p);
   var entryP = p.entry_price || 0;
   var exitP = p.exit_price || 0;
   var retPct = entryP > 0 ? ((exitP - entryP) / entryP * 100) : 0;
@@ -3331,7 +5115,7 @@ function showClosedPositionDetail(idx) {
       '</div>' +
       '<div class="pos-hdr-right">' +
         '<div class="pos-hdr-avg">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div>' +
-        '<div class="pos-hdr-pnl ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + ' realized</div>' +
+        '<div class="pos-hdr-pnl ' + pnlCls + '">' + formatPnlWithPct(pnl, pnlBase, { pct: retPct, pctDecimals: 2 }) + ' realized</div>' +
       '</div>' +
     '</div>' +
     '<div class="pos-grid">' +
@@ -3345,7 +5129,7 @@ function showClosedPositionDetail(idx) {
     '<div class="pos-section">' +
       '<div class="pos-section-title">Performance</div>' +
       '<div style="display:flex;gap:16px;flex-wrap:wrap">' +
-        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Realized P&L</div><div class="pos-cell-val ' + pnlCls + '">' + (pnl >= 0 ? '+' : '') + '$' + pnl.toFixed(2) + '</div></div>' +
+        '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Realized P&L</div><div class="pos-cell-val ' + pnlCls + '">' + formatPnlWithPct(pnl, pnlBase, { pct: retPct, pctDecimals: 2 }) + '</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Total Return</div><div class="pos-cell-val ' + retCls + '">' + (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Conviction</div><div class="pos-cell-val">' + (((p.conviction || 0) * 100).toFixed(0)) + '%</div></div>' +
         '<div class="pos-cell" style="flex:1;min-width:120px"><div class="pos-cell-lbl">Side</div><div class="pos-cell-val">' + (p.side || 'long').toUpperCase() + '</div></div>' +

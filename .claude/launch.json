@@ -6,6 +6,12 @@
       "runtimeExecutable": "python",
       "runtimeArgs": ["run.py"],
       "port": 8001
+    },
+    {
+      "name": "preview",
+      "runtimeExecutable": "python",
+      "runtimeArgs": ["preview/serve.py"],
+      "port": 8090
     }
   ]
 }

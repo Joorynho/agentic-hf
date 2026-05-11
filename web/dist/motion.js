@@ -652,11 +652,15 @@ canvas.addEventListener('mousemove', (e) => {
       const nav = podData.nav != null ? '$' + Number(podData.nav).toFixed(2) : '—';
       const pnl = podData.daily_pnl != null ? Number(podData.daily_pnl).toFixed(2) : '—';
       const pnlClass = Number(podData.daily_pnl || 0) >= 0 ? 'pos' : 'neg';
+      const pnlVal = Number(podData.daily_pnl || 0);
+      const pnlBase = Math.abs(Number(podData.nav || podData.starting_capital || 0));
+      const pnlPct = pnlBase > 0 ? ` (${pnlVal >= 0 ? '+' : ''}${(pnlVal / pnlBase * 100).toFixed(2)}%)` : '';
+      const pnlDisplay = podData.daily_pnl != null ? `${pnlVal >= 0 ? '+$' : '-$'}${Math.abs(pnlVal).toFixed(2)}${pnlPct}` : pnl;
       const status = podData.status || 'ACTIVE';
       tooltip.querySelector('.tt-stats').innerHTML = `
         <div class="stat-row"><span>Role</span><span class="stat-val">${role || '—'}</span></div>
         <div class="stat-row"><span>NAV</span><span class="stat-val">${nav}</span></div>
-        <div class="stat-row"><span>P&L</span><span class="stat-val ${pnlClass}">${pnl}</span></div>
+        <div class="stat-row"><span>P&L</span><span class="stat-val ${pnlClass}">${pnlDisplay}</span></div>
         <div class="stat-row"><span>Status</span><span class="stat-val">${status}</span></div>
       `;
     } else if (isGov) {

@@ -14,7 +14,7 @@ from datetime import date, timedelta
 try:
     from src.core.llm import llm_chat, has_llm_key
 except Exception:  # pragma: no cover
-    def llm_chat(messages, max_tokens=300):  # type: ignore[misc]
+    def llm_chat(messages, max_tokens=300, task=None):  # type: ignore[misc]
         return ""
     def has_llm_key():  # type: ignore[misc]
         return False
@@ -123,7 +123,7 @@ Output ONLY valid JSON, no commentary:
         try:
             if not has_llm_key():
                 return []
-            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=600)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=600, task="theme_scan")
             m = re.search(r'\{[\s\S]*\}', raw)
             if not m:
                 return []
@@ -157,7 +157,7 @@ Output ONLY valid JSON: {{"valid": true/false, "reason": "brief explanation"}}""
                     if search_content:
                         validated.append(candidate)
                     continue
-                raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=100)
+                raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=100, task="theme_validation")
                 m = re.search(r'\{[^}]+\}', raw)
                 if m:
                     data = json.loads(m.group())
@@ -186,7 +186,7 @@ Output ONLY valid JSON: {{"still_valid": true/false, "reason": "brief explanatio
             if not has_llm_key():
                 next_review = (date.today() + timedelta(days=7)).isoformat()
                 return {**ticker_data, "next_review_date": next_review}
-            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=100)
+            raw = llm_chat([{"role": "user", "content": prompt}], max_tokens=100, task="thesis_verification")
             m = re.search(r'\{[^}]+\}', raw)
             if m:
                 data = json.loads(m.group())

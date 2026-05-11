@@ -9,6 +9,7 @@ Provides REST API and WebSocket real-time data bridge to SessionManager EventBus
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -117,6 +118,7 @@ class EventBusListener:
             'position_reviews': [],
             'recent_activity': [],
             'recent_orders': [],
+            'loss_reviews': {},
         }
 
     async def subscribe(self):
@@ -370,6 +372,7 @@ class EventBusListener:
                 "recent_activity": self._app_state.get('recent_activity', [])[:20],
                 "recent_orders": self._app_state.get('recent_orders', [])[:30],
                 "position_reviews": self._app_state.get('position_reviews', []),
+                "loss_reviews": self._app_state.get('loss_reviews', {}),
             },
         }
 
@@ -380,6 +383,7 @@ class EventBusListener:
         snap["data"]["firm_peak_nav"] = getattr(app.state, "firm_peak_nav", 0.0)
         snap["data"]["benchmark_returns"] = getattr(app.state, "benchmark_returns", {}) or {}
         snap["data"]["drawdown_tier"] = getattr(app.state, "drawdown_tier", "none")
+        snap["data"]["loss_reviews"] = getattr(app.state, "loss_reviews", {}) or {}
         return snap
 
 
@@ -490,6 +494,7 @@ def create_app(
     app.state.firm_peak_nav: float = 0.0
     app.state.benchmark_returns: dict = {}
     app.state.drawdown_tier: str = "none"
+    app.state.loss_reviews: dict = {}
     app.state.session_manager = session_manager
     if session_manager:
         session_manager._restartable = True
@@ -578,6 +583,20 @@ def create_app(
         Reads directly from SessionManager accountants — bypasses EventBus/WebSocket."""
         sm = app.state.session_manager
         if sm and hasattr(sm, "get_all_positions"):
+            refresh = getattr(sm, "refresh_live_position_prices_if_due", None)
+            has_concrete_refresh = callable(refresh) and (
+                hasattr(type(sm), "refresh_live_position_prices_if_due")
+                or "refresh_live_position_prices_if_due" in getattr(sm, "__dict__", {})
+            )
+            if has_concrete_refresh:
+                try:
+                    maybe_awaitable = refresh()
+                    if inspect.isawaitable(maybe_awaitable):
+                        await asyncio.wait_for(maybe_awaitable, timeout=4.0)
+                except asyncio.TimeoutError:
+                    logger.debug("[web] positions price refresh timed out; returning cached positions")
+                except Exception as exc:
+                    logger.debug("[web] positions price refresh failed; returning cached positions: %s", exc)
             positions = sm.get_all_positions()
             return {"positions": positions}
         # Fallback when session not started
@@ -620,6 +639,245 @@ def create_app(
         if not sm:
             raise HTTPException(status_code=503, detail="Session not initialized")
         return sm._compute_execution_quality()
+
+    @app.get("/api/broker-reconciliation")
+    async def get_broker_reconciliation():
+        """Compare local pod accountants with Alpaca broker state."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        return await sm.get_broker_reconciliation()
+
+    @app.get("/api/state-health")
+    async def get_state_health():
+        """State-integrity diagnostics for NAV, capital, and broker sync."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_state_health"):
+            return await sm.get_state_health()
+
+        pods = []
+        for pod_id, summary in (app.state.pod_summaries or {}).items():
+            rm = summary.get("risk_metrics", {}) if isinstance(summary, dict) else {}
+            nav = summary.get("nav", rm.get("nav", 0.0)) if isinstance(summary, dict) else 0.0
+            starting = summary.get("starting_capital", rm.get("starting_capital", app.state.capital_per_pod)) if isinstance(summary, dict) else app.state.capital_per_pod
+            pods.append({
+                "pod_id": pod_id,
+                "status": "OK" if nav else "CHECK",
+                "issues": [] if nav else ["Missing live NAV"],
+                "starting_capital": starting or 0.0,
+                "allocated_capital": app.state.capital_per_pod,
+                "nav": nav or 0.0,
+                "cash": summary.get("cash", rm.get("cash", 0.0)) if isinstance(summary, dict) else 0.0,
+                "invested": summary.get("invested", rm.get("invested", 0.0)) if isinstance(summary, dict) else 0.0,
+                "position_count": len(summary.get("positions", summary.get("current_positions", []))) if isinstance(summary, dict) else 0,
+                "last_nav_ts": summary.get("timestamp") if isinstance(summary, dict) else None,
+                "last_nav_quality": "live_state",
+            })
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "status": "OK" if all(p["status"] == "OK" for p in pods) else "CHECK",
+            "warnings": [],
+            "session_active": bool(sm.session_active) if sm else False,
+            "iteration": app.state.iteration,
+            "capital_per_pod": app.state.capital_per_pod,
+            "pods": pods,
+            "nav_history": {
+                "total_rows": 0,
+                "repaired_rows": 0,
+                "quality_counts": {},
+                "first_ts": None,
+                "last_ts": None,
+                "latest_by_pod": {},
+            },
+            "broker": {
+                "status": "UNKNOWN",
+                "mismatch_count": None,
+                "open_order_count": None,
+                "errors": [],
+            },
+            "data_quality": {
+                "status": "UNKNOWN",
+                "position_count": 0,
+                "check_count": 0,
+                "stale_price_count": 0,
+                "missing_source_count": 0,
+                "missing_notional_count": 0,
+                "blocked_trade_count": 0,
+                "broker_mismatch_count": None,
+                "positions": [],
+                "recent_failures": [],
+            },
+        }
+
+    @app.get("/api/data-quality")
+    async def get_data_quality():
+        """Market-data freshness and notional-integrity diagnostics."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        if not hasattr(sm, "get_data_quality_report"):
+            raise HTTPException(status_code=501, detail="Data quality diagnostics unavailable")
+        return sm.get_data_quality_report()
+
+    @app.get("/api/loss-reviews")
+    async def get_loss_reviews():
+        """Active pod loss-review and risk-intervention state."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_loss_review_report"):
+            return sm.get_loss_review_report()
+        return getattr(app.state, "loss_reviews", {}) or {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "active": {},
+            "history": [],
+            "count": 0,
+            "triggered_count": 0,
+        }
+
+    @app.get("/api/research-feed")
+    async def get_research_feed(limit: int = 100):
+        """Persistent research feed, source health, routing, and action audit."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        if not hasattr(sm, "get_research_feed_report"):
+            raise HTTPException(status_code=501, detail="Research feed diagnostics unavailable")
+        listener_state = getattr(getattr(app.state, "listener", None), "_app_state", {}) or {}
+        return sm.get_research_feed_report(limit=limit, listener_state=listener_state)
+
+    @app.get("/api/execution-truth")
+    async def get_execution_truth():
+        """Latest per-pod explanation from PM decision through runtime gates and execution."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        if not hasattr(sm, "get_execution_truth"):
+            raise HTTPException(status_code=501, detail="Execution truth diagnostics unavailable")
+        payload = sm.get_execution_truth()
+        listener_state = getattr(getattr(app.state, "listener", None), "_app_state", {}) or {}
+        payload["recent_orders"] = [
+            (msg.get("data", {}) if isinstance(msg, dict) else msg)
+            for msg in (listener_state.get("recent_orders", []) or [])[:20]
+        ]
+        return payload
+
+    @app.get("/api/decision-audit")
+    async def get_decision_audit(limit: int = 50):
+        """Recent decision trail combining PM, governance, and execution events."""
+        listener_state = getattr(getattr(app.state, "listener", None), "_app_state", {}) or {}
+        items: list[dict] = []
+
+        for msg in listener_state.get("recent_activity", []) or []:
+            data = msg.get("data", {}) if isinstance(msg, dict) else {}
+            action = data.get("action", "")
+            if action not in {
+                "trade_decision",
+                "thesis_verification",
+                "thesis_review",
+                "position_review",
+                "position_review_decision",
+                "position_review_final",
+                "mandate_update",
+                "allocation",
+            }:
+                continue
+            items.append({
+                "ts": msg.get("timestamp") or data.get("ts"),
+                "pod_id": data.get("pod_id", ""),
+                "stage": action,
+                "agent": data.get("agent_role") or data.get("agent_id", ""),
+                "symbol": data.get("symbol", ""),
+                "decision": data.get("summary", ""),
+                "detail": data.get("detail", ""),
+                "status": "INFO",
+                "reason": data.get("reason", ""),
+            })
+
+        for msg in listener_state.get("recent_governance", []) or []:
+            data = msg.get("data", {}) if isinstance(msg, dict) else {}
+            items.append({
+                "ts": msg.get("timestamp"),
+                "pod_id": "firm",
+                "stage": "governance",
+                "agent": data.get("agent", ""),
+                "symbol": "",
+                "decision": data.get("decision", ""),
+                "detail": data.get("reasoning", ""),
+                "status": "INFO",
+                "reason": data.get("narrative", ""),
+            })
+
+        for msg in listener_state.get("recent_orders", []) or []:
+            data = msg.get("data", {}) if isinstance(msg, dict) else {}
+            status = str(data.get("status", "")).upper()
+            items.append({
+                "ts": msg.get("timestamp") or data.get("submitted_at"),
+                "pod_id": data.get("pod_id", ""),
+                "stage": data.get("stage") or "execution",
+                "agent": "execution",
+                "symbol": data.get("symbol", ""),
+                "decision": f"{data.get('side', '')} {data.get('qty', '')}".strip(),
+                "detail": data.get("reason") or data.get("rejection_detail", ""),
+                "status": status or "INFO",
+                "reason": data.get("reason") or data.get("rejection_reason") or data.get("rejection_detail", ""),
+                "order_id": data.get("order_id"),
+                "local_order_id": data.get("local_order_id"),
+                "broker_order_id": data.get("broker_order_id"),
+            })
+
+        for msg in listener_state.get("recent_trades", []) or []:
+            data = msg.get("data", {}) if isinstance(msg, dict) else {}
+            items.append({
+                "ts": msg.get("timestamp") or data.get("timestamp"),
+                "pod_id": data.get("pod_id", ""),
+                "stage": "execution_fill",
+                "agent": "execution",
+                "symbol": data.get("symbol", ""),
+                "decision": f"{data.get('side', '')} {data.get('qty', '')}".strip(),
+                "detail": f"Filled at {data.get('fill_price') or data.get('price') or 'unknown price'}",
+                "status": "FILLED",
+                "reason": "",
+                "order_id": data.get("order_id"),
+                "local_order_id": data.get("local_order_id"),
+                "broker_order_id": data.get("broker_order_id"),
+            })
+
+        items.sort(key=lambda x: x.get("ts") or "", reverse=True)
+        limit = max(1, min(int(limit or 50), 200))
+        return {
+            "items": items[:limit],
+            "count": len(items[:limit]),
+            "execution_truth": (
+                app.state.session_manager.get_execution_truth()
+                if app.state.session_manager and hasattr(app.state.session_manager, "get_execution_truth")
+                else None
+            ),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @app.post("/api/execution-reconciliation")
+    async def post_execution_reconciliation():
+        """Reconcile stale local order state against Alpaca order status."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        listener = getattr(app.state, "listener", None)
+        local_orders = []
+        if listener is not None and hasattr(listener, "_app_state"):
+            local_orders = listener._app_state.get("recent_orders", []) or []
+        try:
+            return await asyncio.wait_for(
+                sm.reconcile_execution_state(local_orders=local_orders),
+                timeout=3.5,
+            )
+        except asyncio.TimeoutError:
+            return {
+                "checked_local_orders": 0,
+                "broker_open_orders": [],
+                "updates": [],
+                "canceled_stale_orders": [],
+                "errors": ["Execution reconciliation timed out; showing cached local order state"],
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
 
     @app.get("/api/benchmarks")
     async def get_benchmarks():
@@ -807,6 +1065,7 @@ def create_app(
         firm_peak_nav: float = 0.0,
         benchmark_returns: Optional[dict] = None,
         drawdown_tier: str = "none",
+        loss_reviews: Optional[dict] = None,
     ):
         """Update session state in app (called by SessionManager)."""
         app.state.iteration = iteration
@@ -819,6 +1078,8 @@ def create_app(
         if benchmark_returns is not None:
             app.state.benchmark_returns = benchmark_returns
         app.state.drawdown_tier = drawdown_tier
+        if loss_reviews is not None:
+            app.state.loss_reviews = loss_reviews
 
         # Broadcast iteration update so dashboard shows real iteration count
         if hasattr(app.state, "listener") and app.state.listener is not None:
@@ -859,6 +1120,8 @@ def create_app(
                         "data": data,
                         "timestamp": ts,
                     }
+                if loss_reviews is not None:
+                    listener._app_state["loss_reviews"] = loss_reviews
 
     app.state.update_session_state = update_session_state
 

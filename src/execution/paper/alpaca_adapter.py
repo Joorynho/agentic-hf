@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import json
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -50,6 +53,7 @@ class AlpacaAdapter:
         self._api_key = api_key
         self._secret_key = secret_key
         self._paper = paper
+        self._asset_cache: dict[str, dict] = {}
 
         # REST client for trading + historical data
         self._client = REST(
@@ -84,8 +88,233 @@ class AlpacaAdapter:
 
     @staticmethod
     def _is_crypto_symbol(symbol: str) -> bool:
-        """Return True if symbol is crypto (e.g., BTC/USD, ETH/USD)."""
-        return "/" in symbol and symbol.upper().endswith("/USD")
+        """Return True if symbol looks like an Alpaca crypto pair."""
+        if "/" not in symbol:
+            return False
+        quote = symbol.upper().rsplit("/", 1)[-1]
+        return quote in {"USD", "USDT", "USDC", "BTC"}
+
+    @staticmethod
+    def _clean_error_message(exc: Exception) -> str:
+        """Return a readable broker error string for logs and dashboard display."""
+        message = str(exc).strip()
+        if message.lower() in {"", "order rejected", "rejected"}:
+            response = getattr(exc, "response", None)
+            response_text = getattr(response, "text", None)
+            if response_text:
+                try:
+                    payload = json.loads(response_text)
+                    if payload.get("message"):
+                        return str(payload["message"])
+                except Exception:
+                    pass
+            raw_error = getattr(exc, "_error", None)
+            if isinstance(raw_error, dict) and raw_error.get("message"):
+                return str(raw_error["message"])
+            if isinstance(raw_error, str):
+                try:
+                    payload = ast.literal_eval(raw_error)
+                    if isinstance(payload, dict) and payload.get("message"):
+                        return str(payload["message"])
+                except Exception:
+                    pass
+        if not message:
+            message = exc.__class__.__name__
+        return " ".join(message.split())
+
+    @staticmethod
+    def _order_rejection_reason(order_status) -> str | None:
+        """Extract the best available rejection detail from an Alpaca order object."""
+        for attr in ("reason", "reject_reason", "rejected_reason", "failed_reason"):
+            value = getattr(order_status, attr, None)
+            if value:
+                return str(value)
+        status = getattr(order_status, "status", None)
+        if status:
+            return f"Alpaca order status: {status}"
+        return None
+
+    @staticmethod
+    def _asset_value(asset, *names: str):
+        """Read an Alpaca asset attribute across object/dict/raw payload forms."""
+        if isinstance(asset, dict):
+            for name in names:
+                if name in asset:
+                    return asset[name]
+        raw = getattr(asset, "_raw", None)
+        if isinstance(raw, dict):
+            for name in names:
+                if name in raw:
+                    return raw[name]
+        for name in names:
+            value = getattr(asset, name, None)
+            if value is not None:
+                return value
+        return None
+
+    @staticmethod
+    def _as_bool(value, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"true", "1", "yes", "y"}
+        return bool(value)
+
+    @staticmethod
+    def _rejected_order_result(
+        symbol: str,
+        qty: float,
+        side: str,
+        reason: str,
+        order_id: str | None = None,
+        broker_status: str | None = None,
+        stage: str = "broker_submit",
+        reason_code: str | None = None,
+    ) -> dict:
+        """Build a rejected order payload while preserving the broker reason."""
+        return {
+            "order_id": order_id,
+            "symbol": symbol,
+            "qty": qty,
+            "side": side,
+            "status": "REJECTED",
+            "filled_qty": 0.0,
+            "filled_avg_price": None,
+            "filled_at": None,
+            "reason": reason,
+            "rejection_reason": reason,
+            "rejection_detail": reason,
+            "broker_status": broker_status,
+            "stage": stage,
+            "reason_code": reason_code,
+        }
+
+    def _asset_capability_from_asset(self, symbol: str, asset) -> dict:
+        """Normalize Alpaca asset metadata into a stable preflight shape."""
+        asset_class = self._asset_value(asset, "asset_class", "class") or ""
+        status = self._asset_value(asset, "status") or ""
+        is_crypto = self._is_crypto_symbol(symbol) or str(asset_class).lower() == "crypto"
+        return {
+            "symbol": str(self._asset_value(asset, "symbol") or symbol).upper(),
+            "asset_class": str(asset_class).lower(),
+            "status": str(status).lower(),
+            "tradable": self._as_bool(self._asset_value(asset, "tradable"), default=True),
+            "fractionable": self._as_bool(
+                self._asset_value(asset, "fractionable"),
+                default=is_crypto,
+            ),
+            "shortable": self._as_bool(self._asset_value(asset, "shortable"), default=False),
+            "is_crypto": is_crypto,
+        }
+
+    async def get_asset_capability(self, symbol: str) -> dict:
+        """Return cached Alpaca tradability metadata for a symbol."""
+        key = symbol.upper()
+        cached = self._asset_cache.get(key)
+        if cached:
+            return dict(cached)
+        asset = await asyncio.to_thread(self._client.get_asset, key)
+        capability = self._asset_capability_from_asset(key, asset)
+        self._asset_cache[key] = capability
+        return dict(capability)
+
+    def _sync_position_qty(self, symbol: str) -> float:
+        """Return signed held quantity if Alpaca has a position, else 0."""
+        try:
+            pos = self._client.get_position(symbol)
+            qty = abs(float(getattr(pos, "qty", 0.0) or 0.0))
+            return qty if getattr(pos, "side", "long") == "long" else -qty
+        except Exception:
+            return 0.0
+
+    async def _preflight_order(
+        self,
+        symbol: str,
+        qty: float,
+        side: str,
+        order_type: str,
+        limit_price: float | None = None,
+        estimated_price: float | None = None,
+    ) -> dict | None:
+        """Return a rejected payload when an order is non-executable before submit."""
+        symbol_key = symbol.upper()
+        side = side.lower()
+        order_type = order_type.lower()
+
+        def reject(reason: str, reason_code: str) -> dict:
+            logger.warning("[alpaca] Preflight rejected %s %s %s: %s", side, qty, symbol, reason)
+            return self._rejected_order_result(
+                symbol,
+                qty,
+                side,
+                reason,
+                stage="preflight",
+                reason_code=reason_code,
+            )
+
+        if qty <= 0:
+            return reject("Quantity must be greater than zero", "invalid_quantity")
+        if side not in {"buy", "sell"}:
+            return reject(f"Unsupported side '{side}'", "invalid_side")
+        if order_type not in {"market", "limit"}:
+            return reject(f"Unsupported order type '{order_type}'", "invalid_order_type")
+        if order_type == "limit" and (limit_price is None or limit_price <= 0):
+            return reject("Limit orders require a positive limit price", "invalid_limit_price")
+
+        try:
+            asset = await self.get_asset_capability(symbol_key)
+        except Exception as exc:
+            return reject(
+                f"Asset capability lookup failed for {symbol}: {self._clean_error_message(exc)}",
+                "asset_lookup_failed",
+            )
+
+        status = asset.get("status")
+        if status and status != "active":
+            return reject(f"Asset {symbol} is not active in Alpaca (status={status})", "asset_not_active")
+        if asset.get("tradable") is False:
+            return reject(f"Asset {symbol} is not tradable in Alpaca", "asset_not_tradable")
+
+        is_crypto = bool(asset.get("is_crypto"))
+        time_in_force = "gtc" if is_crypto else "day"
+        if is_crypto and time_in_force not in {"gtc", "ioc"}:
+            return reject("Crypto orders must use GTC or IOC time-in-force", "invalid_crypto_tif")
+
+        if side == "buy" and not is_crypto and qty != int(qty) and not asset.get("fractionable"):
+            return reject(f"Asset {symbol} does not support fractional buying", "asset_not_fractionable")
+
+        if side == "sell":
+            held_qty = self._sync_position_qty(symbol)
+            long_qty = max(held_qty, 0.0)
+            excess_short_qty = max(qty - long_qty, 0.0)
+            if excess_short_qty > 0:
+                if is_crypto:
+                    return reject("Alpaca crypto short selling is not supported", "crypto_short_not_supported")
+                if not asset.get("shortable"):
+                    return reject(f"Asset {symbol} is not shortable in Alpaca", "asset_not_shortable")
+                if excess_short_qty != int(excess_short_qty):
+                    return reject("Fractional short selling is not supported", "fractional_short_not_supported")
+
+        price = limit_price if limit_price and limit_price > 0 else estimated_price
+        if side == "buy" and price and price > 0:
+            required_notional = float(qty) * float(price)
+            try:
+                account = await asyncio.to_thread(self._client.get_account)
+                buying_power = float(getattr(account, "buying_power", 0.0) or 0.0)
+                if required_notional > buying_power + 1e-6:
+                    return reject(
+                        f"Insufficient Alpaca buying power (${buying_power:.2f} available, ${required_notional:.2f} required)",
+                        "insufficient_buying_power",
+                    )
+            except Exception as exc:
+                return reject(
+                    f"Buying power check failed: {self._clean_error_message(exc)}",
+                    "buying_power_lookup_failed",
+                )
+
+        return None
 
     def _barset_to_bar_list(
         self, barset, symbols: list[str], source: str = "alpaca"
@@ -133,6 +362,110 @@ class AlpacaAdapter:
                                 source=source,
                             )
                         )
+        return results
+
+    @staticmethod
+    def _positive_float(value) -> float | None:
+        try:
+            price = float(value)
+        except Exception:
+            return None
+        return price if math.isfinite(price) and price > 0 else None
+
+    @staticmethod
+    def _entity_for_symbol(rows, symbol: str):
+        if not rows:
+            return None
+        aliases = {
+            symbol,
+            symbol.upper(),
+            symbol.replace("/", ""),
+            symbol.replace("/", "").upper(),
+            symbol.replace("/", "-"),
+            symbol.replace("/", "-").upper(),
+        }
+        for alias in aliases:
+            try:
+                if alias in rows:
+                    return rows[alias]
+            except Exception:
+                pass
+        return None
+
+    @classmethod
+    def _price_from_crypto_snapshot(cls, snapshot) -> float | None:
+        if not snapshot:
+            return None
+
+        latest_trade = getattr(snapshot, "latest_trade", None)
+        price = cls._positive_float(getattr(latest_trade, "price", None))
+        if price is not None:
+            return price
+
+        latest_quote = getattr(snapshot, "latest_quote", None)
+        bid = cls._positive_float(getattr(latest_quote, "bid_price", None))
+        ask = cls._positive_float(getattr(latest_quote, "ask_price", None))
+        if bid is not None and ask is not None:
+            return (bid + ask) / 2.0
+
+        for attr in ("minute_bar", "daily_bar", "prev_daily_bar"):
+            bar = getattr(snapshot, attr, None)
+            price = cls._positive_float(getattr(bar, "close", None))
+            if price is not None:
+                return price
+        return None
+
+    async def fetch_crypto_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Fetch latest crypto marks from Alpaca market data."""
+        crypto_symbols = [s for s in symbols if self._is_crypto_symbol(s)]
+        if not crypto_symbols:
+            return {}
+
+        results: dict[str, dict] = {}
+        try:
+            snapshots = await asyncio.to_thread(
+                self._client.get_crypto_snapshots, crypto_symbols, loc="us"
+            )
+        except Exception as exc:
+            logger.debug("[alpaca] get_crypto_snapshots failed: %s", exc)
+            snapshots = {}
+
+        for symbol in crypto_symbols:
+            snapshot = self._entity_for_symbol(snapshots, symbol)
+            price = self._price_from_crypto_snapshot(snapshot)
+            if price is not None:
+                results[symbol] = {
+                    "symbol": symbol,
+                    "name": symbol.split("/", 1)[0],
+                    "price": price,
+                    "change_amount": 0.0,
+                    "change_pct": 0.0,
+                    "source": "alpaca_crypto_snapshot",
+                }
+
+        missing = [s for s in crypto_symbols if s not in results]
+        if missing:
+            try:
+                trades = await asyncio.to_thread(
+                    self._client.get_latest_crypto_trades, missing, loc="us"
+                )
+            except Exception as exc:
+                logger.debug("[alpaca] get_latest_crypto_trades failed: %s", exc)
+                trades = {}
+            for symbol in missing:
+                trade = self._entity_for_symbol(trades, symbol)
+                price = self._positive_float(getattr(trade, "price", None))
+                if price is not None:
+                    results[symbol] = {
+                        "symbol": symbol,
+                        "name": symbol.split("/", 1)[0],
+                        "price": price,
+                        "change_amount": 0.0,
+                        "change_pct": 0.0,
+                        "source": "alpaca_crypto_trade",
+                    }
+
+        logger.debug("[alpaca] fetch_crypto_quotes: %d/%d symbols", len(results), len(crypto_symbols))
         return results
 
     async def fetch_bars(
@@ -209,6 +542,7 @@ class AlpacaAdapter:
         side: str,  # "buy" or "sell"
         order_type: str = "market",
         limit_price: Optional[float] = None,
+        estimated_price: Optional[float] = None,
         timeout_seconds: int = 30,
         max_retries: int = 3,
     ) -> dict:
@@ -229,6 +563,19 @@ class AlpacaAdapter:
             - filled_at: timestamp if filled, else None
         """
         try:
+            side = side.lower()
+            order_type = order_type.lower()
+            preflight_rejection = await self._preflight_order(
+                symbol,
+                qty,
+                side,
+                order_type,
+                limit_price=limit_price,
+                estimated_price=estimated_price,
+            )
+            if preflight_rejection:
+                return preflight_rejection
+
             # Alpaca does not support fractional short sells -- round to whole shares
             if side == "sell" and qty != int(qty):
                 try:
@@ -240,17 +587,23 @@ class AlpacaAdapter:
                     import math
                     whole_qty = math.floor(qty)
                     if whole_qty < 1:
-                        logger.info("[alpaca] Skipping short sell %s: fractional qty %.4f rounds to 0", symbol, qty)
-                        return {
-                            "order_id": None, "symbol": symbol, "qty": qty, "side": side,
-                            "status": "REJECTED", "filled_qty": 0.0, "filled_avg_price": None, "filled_at": None,
-                        }
+                        reason = f"Fractional short sell quantity {qty:.4f} rounds to 0 whole shares"
+                        logger.info("[alpaca] Skipping short sell %s: %s", symbol, reason)
+                        return self._rejected_order_result(
+                            symbol,
+                            qty,
+                            side,
+                            reason,
+                            stage="preflight",
+                            reason_code="fractional_short_rounds_to_zero",
+                        )
                     logger.info("[alpaca] Rounded short sell %s: %.4f -> %d (whole shares required)", symbol, qty, whole_qty)
                     qty = float(whole_qty)
 
             # Submit order with retry on transient network errors
             order = None
             last_submit_err = None
+            time_in_force = "gtc" if self._is_crypto_symbol(symbol) else "day"
             for attempt in range(max_retries):
                 try:
                     order = self._client.submit_order(
@@ -258,7 +611,7 @@ class AlpacaAdapter:
                         qty=qty,
                         side=side,
                         type=order_type,
-                        time_in_force="day",
+                        time_in_force=time_in_force,
                         limit_price=limit_price if order_type == "limit" else None,
                     )
                     break
@@ -291,6 +644,26 @@ class AlpacaAdapter:
             for i in range(timeout_seconds):
                 # Check current order status
                 order_status = self._client.get_order(order.id)
+                broker_status = str(getattr(order_status, "status", "") or "").lower()
+                if broker_status in {"rejected", "canceled", "expired"}:
+                    reason = self._order_rejection_reason(order_status) or f"Alpaca order status: {broker_status}"
+                    logger.warning(
+                        "[alpaca] Order rejected: %s %s %s (id=%s, reason=%s)",
+                        side,
+                        qty,
+                        symbol,
+                        order.id,
+                        reason,
+                    )
+                    return self._rejected_order_result(
+                        symbol,
+                        qty,
+                        side,
+                        reason,
+                        order_id=order.id,
+                        broker_status=broker_status.upper(),
+                        stage="broker_status",
+                    )
 
                 if order_status.filled_qty and float(order_status.filled_qty) > 0:
                     filled_at = datetime.now(timezone.utc)
@@ -315,6 +688,7 @@ class AlpacaAdapter:
                         "filled_qty": filled_qty,
                         "filled_avg_price": fill_price,
                         "filled_at": filled_at,
+                        "stage": "broker_fill",
                     }
 
                     logger.info(
@@ -347,21 +721,14 @@ class AlpacaAdapter:
                 "filled_qty": float(order.filled_qty) if order.filled_qty else 0.0,
                 "filled_avg_price": None,
                 "filled_at": None,
+                "stage": "broker_poll",
             }
             return result
 
         except Exception as exc:
-            logger.error("[alpaca] place_order failed: %s", exc)
-            return {
-                "order_id": None,
-                "symbol": symbol,
-                "qty": qty,
-                "side": side,
-                "status": "REJECTED",
-                "filled_qty": 0.0,
-                "filled_avg_price": None,
-                "filled_at": None,
-            }
+            reason = self._clean_error_message(exc)
+            logger.error("[alpaca] place_order failed: %s", reason)
+            return self._rejected_order_result(symbol, qty, side, reason, stage="broker_submit")
 
     def _sync_list_positions(self) -> list:
         """Synchronous call to Alpaca list_positions — called via to_thread."""
@@ -398,13 +765,18 @@ class AlpacaAdapter:
             dict with keys: status, filled_qty, filled_avg_price
         """
         try:
-            order = self._client.get_order(order_id)
+            order = await asyncio.to_thread(self._client.get_order, order_id)
             return {
                 "status": order.status,
+                "symbol": getattr(order, "symbol", None),
+                "side": getattr(order, "side", None),
+                "qty": float(order.qty) if getattr(order, "qty", None) else 0.0,
                 "filled_qty": float(order.filled_qty) if order.filled_qty else 0.0,
                 "filled_avg_price": float(order.filled_avg_price)
                 if order.filled_avg_price
                 else None,
+                "submitted_at": getattr(order, "submitted_at", None),
+                "reason": self._order_rejection_reason(order),
             }
         except Exception as exc:
             logger.error("[alpaca] get_order_status failed for %s: %s", order_id, exc)
@@ -482,7 +854,7 @@ class AlpacaAdapter:
             list of dicts with order_id, symbol, side, qty, status, submitted_at
         """
         try:
-            orders = self._client.list_orders(status="open")
+            orders = await asyncio.to_thread(self._client.list_orders, status="open")
             return [
                 {
                     "order_id": o.id,

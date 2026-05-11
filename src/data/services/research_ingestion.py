@@ -14,6 +14,8 @@ import logging
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
+from src.core.research_feed import ResearchFeedStore
+
 if TYPE_CHECKING:
     from src.data.adapters.fred_adapter import FredAdapter
     from src.data.adapters.polymarket_adapter import PolymarketAdapter
@@ -48,6 +50,8 @@ class ResearchIngestionService:
         rss_adapter: Optional[RssAdapter] = None,
         x_adapter: Optional[XAdapter] = None,
         interval_seconds: int = _DEFAULT_INTERVAL,
+        feed_store: ResearchFeedStore | None = None,
+        feed_store_path: str | None = None,
     ) -> None:
         self._fred = fred_adapter
         self._poly = polymarket_adapter
@@ -55,6 +59,7 @@ class ResearchIngestionService:
         self._x = x_adapter
         self._interval = interval_seconds
         self._task: asyncio.Task | None = None
+        self._feed_store = feed_store or ResearchFeedStore(feed_store_path or ":memory:")
 
         # Shared data — updated in-place on every fetch cycle
         self.fred_snapshot: dict = {}
@@ -86,6 +91,12 @@ class ResearchIngestionService:
                 pass
         logger.info("[research_ingestion] Background service stopped")
 
+    def close(self) -> None:
+        try:
+            self._feed_store.close()
+        except Exception:
+            pass
+
     # ------------------------------------------------------------------
     # Background loop
     # ------------------------------------------------------------------
@@ -101,6 +112,7 @@ class ResearchIngestionService:
 
     async def _fetch(self) -> None:
         """Fetch all shared research data concurrently."""
+        fetch_started = datetime.now(timezone.utc)
         fred, poly, news, x_feed = await asyncio.gather(
             self._fetch_fred(),
             self._fetch_poly(),
@@ -111,22 +123,36 @@ class ResearchIngestionService:
 
         if not isinstance(fred, Exception):
             self.fred_snapshot = fred
+            self._record_source_status("FRED", "macro", "ok", len(self.fred_snapshot), ts=fetch_started)
         else:
+            self._record_source_status("FRED", "macro", "error", 0, str(fred), ts=fetch_started)
             logger.debug("[research_ingestion] FRED fetch error: %s", fred)
 
         if not isinstance(poly, Exception):
             self.poly_signals = poly
+            self._record_source_status("Polymarket", "prediction", "ok", len(self.poly_signals), ts=fetch_started)
         else:
+            self._record_source_status("Polymarket", "prediction", "error", 0, str(poly), ts=fetch_started)
             logger.debug("[research_ingestion] Polymarket fetch error: %s", poly)
 
         if not isinstance(news, Exception):
             self.news_items = news
+            self._record_items(self.news_items, "rss", fetch_started)
+            self._record_source_status("RSS aggregate", "rss", "ok", len(self.news_items), ts=fetch_started)
         else:
+            self._record_source_status("RSS aggregate", "rss", "error", 0, str(news), ts=fetch_started)
             logger.debug("[research_ingestion] RSS fetch error: %s", news)
 
         if not isinstance(x_feed, Exception):
             self.x_feed = x_feed
+            self._record_items(self.x_feed, "news", fetch_started)
+            self._record_adapter_source_health(
+                getattr(self._x, "get_feed_health", lambda: [])(),
+                fetch_started,
+            )
+            self._record_source_status("News aggregate", "news", "ok", len(self.x_feed), ts=fetch_started)
         else:
+            self._record_source_status("News aggregate", "news", "error", 0, str(x_feed), ts=fetch_started)
             logger.debug("[research_ingestion] X feed fetch error: %s", x_feed)
 
         self.last_fetch_time = datetime.now(timezone.utc)
@@ -138,6 +164,44 @@ class ResearchIngestionService:
             len(self.news_items),
             len(self.x_feed),
         )
+
+    def _record_items(self, items: list, source_type: str, ts: datetime) -> None:
+        try:
+            self._feed_store.record_items(items, source_type=source_type, ts=ts)
+        except Exception as exc:
+            logger.debug("[research_ingestion] Feed store item write failed: %s", exc)
+
+    def _record_source_status(
+        self,
+        source: str,
+        source_type: str,
+        status: str,
+        item_count: int,
+        error: str = "",
+        ts: datetime | None = None,
+    ) -> None:
+        try:
+            self._feed_store.record_source_status(
+                source,
+                source_type,
+                status,
+                item_count=item_count,
+                error=error,
+                ts=ts,
+            )
+        except Exception as exc:
+            logger.debug("[research_ingestion] Feed store source write failed: %s", exc)
+
+    def _record_adapter_source_health(self, rows: list[dict], ts: datetime) -> None:
+        for row in rows or []:
+            self._record_source_status(
+                str(row.get("source") or "unknown"),
+                str(row.get("source_type") or "news"),
+                str(row.get("status") or "unknown"),
+                int(row.get("item_count") or 0),
+                str(row.get("error") or ""),
+                ts=ts,
+            )
 
     async def _fetch_fred(self) -> dict:
         if not self._fred:
@@ -181,3 +245,7 @@ class ResearchIngestionService:
             "x_feed": self.x_feed,
             "last_fetch_time": self.last_fetch_time.isoformat() if self.last_fetch_time else None,
         }
+
+    def get_research_feed_summary(self, limit: int = 100) -> dict:
+        """Return persistent research feed plus source-health state."""
+        return self._feed_store.summary(limit=limit)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from src.core.bus.collaboration_runner import CollaborationRunner
@@ -16,6 +16,12 @@ from src.core.models.execution import Order, RiskApprovalToken, PodPosition
 from src.core.models.market import Bar
 from src.core.models.pod_summary import PodSummary, PodRiskMetrics, PodExposureBucket
 from src.core.signal_scorer import SignalScorer
+from src.core.thesis_lifecycle import (
+    current_regime,
+    expansion_thesis_is_fresh,
+    format_thesis_reviews_for_prompt,
+    review_position_thesis,
+)
 from src.core.trade_outcomes import TradeOutcomeTracker
 from src.pods.base.agent import BasePodAgent
 from src.pods.base.gateway import PodGateway
@@ -137,6 +143,19 @@ class PodRuntime:
                 "position_limit_notional": round(accountant.nav * 0.20, 2),
                 "positions_summary": pos_summary,
             }
+
+            loss_review = self._ns.get("loss_review") or {}
+            loss_restriction = self._ns.get("loss_review_restriction") or {}
+            loss_review_text = self._ns.get("loss_review_text") or ""
+            if loss_review:
+                ctx["loss_review"] = loss_review
+            if loss_restriction:
+                ctx["loss_review_restriction"] = loss_restriction
+                ctx["sizing_context"]["loss_review_restriction"] = loss_restriction
+                if loss_restriction.get("block_new_risk"):
+                    ctx["sizing_context"]["risk_mode"] = "reduce_only"
+            if loss_review_text:
+                ctx["sizing_context"]["loss_review_text"] = loss_review_text
             if self._pod_id == "commodities":
                 factor_report = compute_factor_report(
                     accountant.current_positions,
@@ -150,6 +169,8 @@ class PodRuntime:
                 ctx["sizing_context"]["risk_mode"] = factor_report.get("risk_mode", "normal")
                 ctx["sizing_context"]["factor_exposure_report"] = factor_report
                 ctx["sizing_context"]["factor_exposure_text"] = factor_text
+            if ctx["sizing_context"].get("loss_review_restriction", {}).get("block_new_risk"):
+                ctx["sizing_context"]["risk_mode"] = "reduce_only"
 
         # Store performance metrics in namespace for PM/CIO access
         if accountant and hasattr(accountant, "performance_summary"):
@@ -175,11 +196,21 @@ class PodRuntime:
         if firm_memo:
             ctx["firm_memo"] = firm_memo
 
+        thesis_reviews = self._review_open_position_theses(ctx, accountant)
+        if thesis_reviews:
+            thesis_text = format_thesis_reviews_for_prompt(thesis_reviews)
+            ctx["thesis_lifecycle_reviews"] = thesis_reviews
+            ctx["thesis_lifecycle_text"] = thesis_text
+            if "sizing_context" in ctx:
+                ctx["sizing_context"]["thesis_lifecycle_reviews"] = thesis_reviews
+                ctx["sizing_context"]["thesis_lifecycle_text"] = thesis_text
+
         # 3. PM (with Signal↔PM challenge, max 5 iter — handled inside pm.run_cycle)
         pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
         ctx.update(pm_out)
 
         # 3.1 Thesis verification: evaluate PM reasoning quality, request revision if weak
+        thesis_gate_result = {"passed": True, "quality_score": 1.0, "feedback": ""}
         try:
             from src.core.models.messages import AgentMessage as _AgentMessage
             from datetime import timezone as _tz
@@ -188,8 +219,10 @@ class PodRuntime:
             if _active:
                 _verifier = ThesisVerifier()
                 _revision_occurred = False
+                _last_result = None
                 for _round in range(2):
                     _result = await _verifier.verify_with_llm(_pm_decision, self._pod_id)
+                    _last_result = _result
                     if _result.passed:
                         if _revision_occurred:
                             # Publish "thesis revised and verified" event
@@ -240,8 +273,33 @@ class PodRuntime:
                         _pm_decision = self._ns.get("last_pm_decision") or _pm_decision
                     finally:
                         self._ns.set("thesis_revision_feedback", None)
+                if _last_result is not None:
+                    thesis_gate_result = {
+                        "passed": bool(_last_result.passed),
+                        "quality_score": float(_last_result.quality_score),
+                        "feedback": _last_result.feedback,
+                    }
+                    if not _last_result.passed:
+                        await self._bus.publish("agent.activity", _AgentMessage(
+                            timestamp=datetime.now(_tz.utc),
+                            sender=f"{self._pod_id}.pm",
+                            recipient="dashboard",
+                            topic="agent.activity",
+                            payload={
+                                "agent_id": f"{self._pod_id}_pm",
+                                "agent_role": "PM",
+                                "pod_id": self._pod_id,
+                                "action": "thesis_gate_failed",
+                                "summary": (
+                                    f"{self._pod_id.upper()} PM: BUY thesis gate failed "
+                                    f"(score={_last_result.quality_score:.2f}); new buys blocked"
+                                ),
+                                "detail": _last_result.feedback[:500],
+                            },
+                        ), publisher_id=f"{self._pod_id}.pm")
         except Exception as _e:
             logger.debug("[%s] Thesis verification skipped: %s", self._pod_id, _e)
+        self._ns.set("thesis_gate_result", thesis_gate_result)
 
         # Emit pod macro view for cross-pod intelligence
         features = ctx.get("features", {})
@@ -287,6 +345,11 @@ class PodRuntime:
                             "[%s] Rejected trade for %s — symbol belongs to %s universe, not %s",
                             self._pod_id, ord_.symbol, other_pod, self._pod_id,
                         )
+                        self._record_trade_block(
+                            "universe",
+                            ord_,
+                            f"Symbol belongs to {other_pod} universe, not {self._pod_id}",
+                        )
                         blocked = True
                     break
             if not blocked:
@@ -312,10 +375,121 @@ class PodRuntime:
 
             trade_reasoning = self._entry_thesis_for_order(order, matching_trade, last_pm)
 
+            allowed_by_loss_review, loss_review_reason = self._loss_review_allows_order(order, accountant)
+            if not allowed_by_loss_review:
+                logger.warning(
+                    "[%s] Loss review blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    loss_review_reason,
+                )
+                self._record_trade_block("loss_review", order, loss_review_reason)
+                try:
+                    from src.core.models.messages import AgentMessage as _AgentMessage
+
+                    await self._bus.publish("agent.activity", _AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{self._pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": self._pod_id,
+                            "action": "loss_review_gate_failed",
+                            "summary": (
+                                f"{self._pod_id.upper()} loss review blocked "
+                                f"{order.side.value.upper()} {order.symbol}"
+                            ),
+                            "detail": loss_review_reason[:500],
+                        },
+                    ), publisher_id=f"{self._pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[%s] Failed to publish loss review gate event: %s", self._pod_id, exc)
+                rejected_count += 1
+                continue
+
+            if order.side.value.upper() == "BUY" and not thesis_gate_result.get("passed", True):
+                logger.warning(
+                    "[%s] Thesis quality gate blocked BUY %s: %s",
+                    self._pod_id, order.symbol, thesis_gate_result.get("feedback", ""),
+                )
+                self._record_trade_block(
+                    "thesis_gate",
+                    order,
+                    thesis_gate_result.get("feedback", "") or "Entry thesis failed verification",
+                )
+                rejected_count += 1
+                continue
+
+            existing_review = thesis_reviews.get(order.symbol.upper()) if thesis_reviews else None
+            existing_position = accountant.current_positions.get(order.symbol) if accountant else None
+            is_expansion = (
+                existing_position is not None
+                and (
+                    (order.side.value.upper() == "BUY" and existing_position.qty > 0)
+                    or (order.side.value.upper() == "SELL" and existing_position.qty < 0)
+                )
+            )
+            if (
+                is_expansion
+            ):
+                fresh_ok, fresh_reason = expansion_thesis_is_fresh(trade_reasoning, existing_review)
+                if not fresh_ok:
+                    logger.warning(
+                        "[%s] Thesis lifecycle gate blocked add to %s: %s",
+                        self._pod_id, order.symbol, fresh_reason,
+                    )
+                    self._record_trade_block("thesis_lifecycle", order, fresh_reason)
+                    rejected_count += 1
+                    continue
+
+            data_quality = self._pre_trade_data_quality(order, accountant, ctx)
+            self._ns.set("last_data_quality_check", data_quality)
+            if not data_quality.get("passed", False):
+                logger.warning(
+                    "[%s] Data quality gate blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    "; ".join(data_quality.get("issues", [])),
+                )
+                self._record_data_quality_failure(data_quality)
+                self._record_trade_block(
+                    "data_quality",
+                    order,
+                    "; ".join(data_quality.get("issues", [])) or "Market data quality gate failed",
+                )
+                try:
+                    from src.core.models.messages import AgentMessage
+
+                    await self._bus.publish("agent.activity", AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{self._pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": self._pod_id,
+                            "action": "data_quality_gate_failed",
+                            "summary": (
+                                f"{self._pod_id.upper()} data gate blocked "
+                                f"{order.side.value.upper()} {order.symbol}"
+                            ),
+                            "detail": "; ".join(data_quality.get("issues", []))[:500],
+                        },
+                    ), publisher_id=f"{self._pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[%s] Failed to publish data quality gate event: %s", self._pod_id, exc)
+                rejected_count += 1
+                continue
+
             # Set per-order metadata so exec trader can attach it to fills
             self._ns.set("pm_trade_metadata", {
-                "entry_thesis": trade_reasoning[:500],
-                "reasoning": trade_reasoning[:500],
+                "entry_thesis": trade_reasoning,
+                "reasoning": trade_reasoning,
                 "conviction": order.conviction,
                 "strategy_tag": order.strategy_tag,
                 "signal_snapshot": last_pm.get("signal_snapshot", {}),
@@ -323,6 +497,14 @@ class PodRuntime:
                 "take_profit_pct": matching_trade.get("take_profit_pct"),
                 "exit_when": matching_trade.get("exit_when", ""),
                 "max_hold_days": matching_trade.get("max_hold_days", 0),
+                "entry_macro_regime": current_regime(ctx.get("features")),
+                "thesis_review": existing_review or {
+                    "symbol": order.symbol.upper(),
+                    "status": "valid",
+                    "score": thesis_gate_result.get("quality_score", 1.0),
+                    "issues": [],
+                    "reviewed_at": datetime.utcnow().isoformat(),
+                },
             })
 
             # Concentration guard: block firm-level sector overconcentration on BUY orders
@@ -338,10 +520,12 @@ class PodRuntime:
                 allowed, reason = check_concentration(sector, firm_exposure)
                 if not allowed:
                     logger.warning("[%s] Concentration limit blocked %s buy: %s", self._pod_id, order.symbol, reason)
+                    self._record_trade_block("concentration", order, reason)
                     rejected_count += 1
                     continue
 
             # 4. Risk sign-off loop (PM↔Risk deliberation per order)
+            self._ns.set("last_risk_rejection_reason", None)
             approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
 
             # Execute exit orders first (stop-loss / take-profit)
@@ -361,12 +545,20 @@ class PodRuntime:
 
             if approved_order is None:
                 rejected_count += 1
+                self._record_trade_block(
+                    "risk",
+                    order,
+                    self._ns.get("last_risk_rejection_reason") or "Risk did not approve the order",
+                )
                 logger.info("[%s] Order %d/%d rejected by Risk: %s %s",
                             self._pod_id, executed_count + rejected_count,
                             len(valid_orders), order.side.value, order.symbol)
                 continue
 
             # 5. Execution Trader (with governance constraints)
+            last_block = self._ns.get("last_trade_block") or {}
+            if str(last_block.get("symbol", "")).upper() == approved_order.symbol.upper():
+                self._ns.set("last_trade_block", None)
             exec_ctx = dict(ctx)
             exec_ctx["approved_order"] = approved_order
             exec_ctx["mandate"] = self._ns.get("governance_mandate")
@@ -383,6 +575,186 @@ class PodRuntime:
 
         # 6. Ops
         await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
+
+    @staticmethod
+    def _parse_timestamp(value) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, datetime):
+                ts = value
+            else:
+                ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _freshness_limit_seconds(symbol: str) -> int:
+        return 180 if "/" in str(symbol) else 900
+
+    def _namespace_price_quality(self, symbol: str) -> dict:
+        prices = self._ns.get("last_prices") or {}
+        updated = self._ns.get("last_price_updated_at") or {}
+        sources = self._ns.get("last_price_sources") or {}
+        raw_price = prices.get(symbol)
+        try:
+            price = float(raw_price)
+        except (TypeError, ValueError):
+            price = 0.0
+        ts = self._parse_timestamp(updated.get(symbol))
+        age_s = (datetime.now(timezone.utc) - ts).total_seconds() if ts else None
+        limit_s = self._freshness_limit_seconds(symbol)
+        return {
+            "price": price,
+            "source": sources.get(symbol) or "last_prices",
+            "updated_at": ts.isoformat() if ts else "",
+            "age_seconds": round(age_s, 1) if age_s is not None else None,
+            "stale": ts is None or age_s is None or age_s > limit_s,
+            "limit_seconds": limit_s,
+        }
+
+    def _bar_price_quality(self, order: Order, ctx: dict) -> dict:
+        bar = ctx.get("bar")
+        if not bar or getattr(bar, "symbol", "").upper() != order.symbol.upper():
+            return {"price": 0.0}
+        try:
+            price = float(getattr(bar, "close", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            price = 0.0
+        return {
+            "price": price,
+            "source": f"bar:{getattr(bar, 'source', 'market')}",
+            "updated_at": getattr(bar, "timestamp", datetime.now(timezone.utc)).isoformat(),
+            "age_seconds": 0,
+            "stale": False,
+            "limit_seconds": self._freshness_limit_seconds(order.symbol),
+        }
+
+    @staticmethod
+    def _order_increases_risk(order: Order, accountant) -> bool:
+        """Return True when the order adds exposure instead of reducing it."""
+        existing_qty = 0.0
+        if accountant:
+            try:
+                pos = accountant.current_positions.get(order.symbol)
+                if pos is not None:
+                    existing_qty = float(getattr(pos, "qty", 0.0) or 0.0)
+            except Exception:
+                existing_qty = 0.0
+
+        side = order.side.value.upper()
+        qty = abs(float(order.quantity or 0.0))
+
+        if existing_qty > 0:
+            if side == "BUY":
+                return True
+            if side == "SELL":
+                return qty > abs(existing_qty)
+        if existing_qty < 0:
+            if side == "SELL":
+                return True
+            if side == "BUY":
+                return qty > abs(existing_qty)
+        return True
+
+    def _loss_review_allows_order(self, order: Order, accountant) -> tuple[bool, str]:
+        restriction = self._ns.get("loss_review_restriction") or {}
+        if not restriction:
+            return True, ""
+        blocks_new_risk = bool(restriction.get("block_new_risk")) or restriction.get("mode") == "reduce_only"
+        if not blocks_new_risk:
+            return True, ""
+        if not self._order_increases_risk(order, accountant):
+            return True, ""
+        reason = restriction.get("reason") or "Pod is in reduce-only loss-review mode"
+        return False, f"{reason}. New risk-increasing orders are blocked; reductions remain allowed."
+
+    def _pre_trade_data_quality(self, order: Order, accountant, ctx: dict) -> dict:
+        """Block new risk-increasing trades when market data is missing or stale."""
+        result = {
+            "passed": True,
+            "pod_id": self._pod_id,
+            "symbol": order.symbol,
+            "side": order.side.value.upper(),
+            "order_type": order.order_type.value,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "price": None,
+            "price_source": "",
+            "price_updated_at": "",
+            "price_age_seconds": None,
+            "issues": [],
+        }
+
+        if order.side.value.upper() != "BUY":
+            return result
+
+        issues: list[str] = []
+        existing_position = accountant.current_positions.get(order.symbol) if accountant else None
+        if existing_position is not None:
+            price = float(getattr(existing_position, "current_price", 0.0) or 0.0)
+            result["price"] = price
+            result["price_source"] = getattr(existing_position, "price_source", "") or ""
+            result["price_updated_at"] = getattr(existing_position, "price_updated_at", "") or ""
+            ts = self._parse_timestamp(result["price_updated_at"])
+            if ts:
+                result["price_age_seconds"] = round((datetime.now(timezone.utc) - ts).total_seconds(), 1)
+            if price <= 0:
+                issues.append("Existing position has no positive current price")
+            if not result["price_source"]:
+                issues.append("Existing position has no price source")
+            if not result["price_updated_at"]:
+                issues.append("Existing position has no price timestamp")
+            if bool(getattr(existing_position, "price_stale", False)):
+                issues.append("Existing position price is stale")
+        else:
+            price_info = self._namespace_price_quality(order.symbol)
+            if price_info.get("price", 0.0) <= 0:
+                price_info = self._bar_price_quality(order, ctx)
+
+            price = float(price_info.get("price") or 0.0)
+            result["price"] = price
+            result["price_source"] = price_info.get("source", "")
+            result["price_updated_at"] = price_info.get("updated_at", "")
+            result["price_age_seconds"] = price_info.get("age_seconds")
+            if price <= 0:
+                issues.append("No positive live price available for proposed BUY")
+            if not result["price_updated_at"]:
+                issues.append("No price freshness timestamp for proposed BUY")
+            if bool(price_info.get("stale", False)):
+                issues.append(
+                    f"Proposed BUY price is stale or unverified "
+                    f"(limit {price_info.get('limit_seconds', self._freshness_limit_seconds(order.symbol))}s)"
+                )
+
+        result["issues"] = issues
+        result["passed"] = not issues
+        return result
+
+    def _record_data_quality_failure(self, failure: dict) -> None:
+        failures = list(self._ns.get("data_quality_failures") or [])
+        failures.insert(0, dict(failure))
+        self._ns.set("data_quality_failures", failures[:50])
+
+    def _record_trade_block(self, stage: str, order: Order, reason: str) -> None:
+        """Record the latest runtime gate that stopped a proposed trade."""
+        block = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pod_id": self._pod_id,
+            "symbol": order.symbol,
+            "side": order.side.value.upper(),
+            "qty": order.quantity,
+            "stage": stage,
+            "status": "BLOCKED",
+            "reason": str(reason or "Trade blocked"),
+            "local_order_id": str(order.id),
+        }
+        self._ns.set("last_trade_block", block)
+        blocks = list(self._ns.get("trade_blocks") or [])
+        blocks.insert(0, block)
+        self._ns.set("trade_blocks", blocks[:50])
 
     def _log_pm_reasoning(self, pm_decision: dict) -> None:
         """Log PM reasoning for all held positions after each PM decision cycle."""
@@ -435,6 +807,7 @@ class PodRuntime:
             revised: Order | None = risk_out.get("revised_order")
             reason: str = risk_out.get("reason", "")
             if revised is None:
+                self._ns.set("last_risk_rejection_reason", reason or "Risk rejected order")
                 logger.info("[%s] Risk rejected %s %s: %s", self._pod_id, order.side.value, order.symbol, reason)
                 return None, all_exit_orders
 
@@ -455,6 +828,7 @@ class PodRuntime:
             )
             accepted_order = pm_accept.get("order")
             if accepted_order is None:
+                self._ns.set("last_risk_rejection_reason", reason or "PM declined risk revision")
                 logger.info("[%s] PM declined Risk revision for %s", self._pod_id, order.symbol)
                 return None, all_exit_orders
             current_order = accepted_order
@@ -475,6 +849,7 @@ class PodRuntime:
             revised: Order | None = risk_out.get("revised_order")
             reason: str = risk_out.get("reason", "")
             if revised is None:
+                self._ns.set("last_risk_rejection_reason", reason or "Risk rejected order")
                 logger.info("[%s] Risk rejected %s %s: %s", self._pod_id, order.side.value, order.symbol, reason)
                 return None
 
@@ -496,6 +871,7 @@ class PodRuntime:
             )
             accepted_order = pm_accept.get("order")
             if accepted_order is None:
+                self._ns.set("last_risk_rejection_reason", reason or "PM declined risk revision")
                 logger.info("[%s] PM declined Risk revision for %s", self._pod_id, order.symbol)
                 return None
             current_order = accepted_order
@@ -623,6 +999,39 @@ class PodRuntime:
                 ).strip()
         return ""
 
+    def _review_open_position_theses(self, ctx: dict, accountant) -> dict[str, dict]:
+        """Run a lightweight lifecycle review for every open position."""
+        if accountant is None:
+            self._ns.set("thesis_lifecycle_reviews", {})
+            self._ns.set("thesis_lifecycle_text", "")
+            return {}
+
+        features = ctx.get("features") or self._ns.get("features") or {}
+        reviews: dict[str, dict] = {}
+        for symbol, snap in accountant.current_positions.items():
+            meta = accountant._entry_metadata.get(symbol, {})
+            thesis = snap.entry_thesis or meta.get("entry_thesis") or meta.get("reasoning", "")
+            review = review_position_thesis(
+                symbol=symbol,
+                entry_thesis=thesis,
+                entry_metadata=meta,
+                position=snap,
+                features=features,
+                pod_id=self._pod_id,
+            )
+            reviews[symbol.upper()] = review
+            meta["thesis_status"] = review.get("status", "unknown")
+            meta["thesis_issues"] = list(review.get("issues", []))
+            meta["thesis_review"] = review
+            if not meta.get("entry_macro_regime"):
+                meta["entry_macro_regime"] = review.get("entry_macro_regime") or current_regime(features)
+            accountant._entry_metadata[symbol] = meta
+
+        text = format_thesis_reviews_for_prompt(reviews)
+        self._ns.set("thesis_lifecycle_reviews", reviews)
+        self._ns.set("thesis_lifecycle_text", text)
+        return reviews
+
     async def get_summary(self) -> PodSummary:
         """Generate PodSummary with real trading data from PortfolioAccountant.
 
@@ -675,6 +1084,12 @@ class PodRuntime:
                     take_profit_pct=snapshot.take_profit_pct,
                     max_hold_days=snapshot.max_hold_days,
                     conviction=snapshot.conviction,
+                    thesis_status=snapshot.thesis_status,
+                    thesis_issues=snapshot.thesis_issues,
+                    thesis_review=snapshot.thesis_review,
+                    price_source=snapshot.price_source,
+                    price_updated_at=snapshot.price_updated_at,
+                    price_stale=snapshot.price_stale,
                 )
             )
 

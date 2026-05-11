@@ -97,12 +97,20 @@ def test_positions_api_falls_back_to_metadata_reasoning_for_thesis():
     acct._entry_metadata["SLV"] = {
         "entry_time": "2026-04-29T10:00:00+00:00",
         "reasoning": "THESIS: silver beta to industrial recovery",
+        "thesis_status": "challenged",
+        "thesis_issues": ["Macro regime changed"],
+        "thesis_review": {"status": "challenged", "issues": ["Macro regime changed"], "block_adds": True},
     }
     manager._pod_runtimes = {"commodities": SimpleNamespace(_ns=_Namespace(acct))}
 
     rows = manager.get_all_positions()
 
     assert rows[0]["entry_thesis"] == "THESIS: silver beta to industrial recovery"
+    assert rows[0]["thesis_status"] == "challenged"
+    assert rows[0]["thesis_review"]["block_adds"] is True
+    assert rows[0]["entry_notional"] == 25.0
+    assert rows[0]["current_notional"] == rows[0]["notional"]
+    assert rows[0]["notional_basis"] == "current_price"
 
 
 def test_position_detail_backfills_all_buy_fill_theses_from_memory():

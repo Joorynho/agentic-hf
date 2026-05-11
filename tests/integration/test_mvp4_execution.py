@@ -108,6 +108,7 @@ async def test_execution_trader_submits_order_to_alpaca(
         side="buy",
         order_type="market",
         limit_price=None,
+        estimated_price=None,
     )
 
 
@@ -316,6 +317,7 @@ async def test_execution_trader_processes_limit_orders(
         side="sell",
         order_type="limit",
         limit_price=300.0,
+        estimated_price=None,
     )
 
 

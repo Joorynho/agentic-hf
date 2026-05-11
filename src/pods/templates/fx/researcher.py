@@ -66,7 +66,7 @@ class FXResearcher(BasePodAgent):
             f"JSON: {{\"add\": [], \"remove\": [], \"reasoning\": \"...\"}}"
         )
         try:
-            resp = llm_chat([{"role": "user", "content": prompt}], max_tokens=300)
+            resp = llm_chat([{"role": "user", "content": prompt}], max_tokens=300, task="research")
             start, end = resp.find("{"), resp.rfind("}") + 1
             if start >= 0 and end > start:
                 parsed = json.loads(resp[start:end])

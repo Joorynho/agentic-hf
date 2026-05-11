@@ -12,6 +12,7 @@ import json
 import logging
 
 from src.core.models.execution import VerificationResult
+from src.core.thesis_lifecycle import infer_asset_profile, profile_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,24 @@ class ThesisVerifier:
                 )
                 score -= 0.15
 
+        asset_monitor_issues: list[str] = []
+        for t in active_trades:
+            symbol = str(t.get("symbol", "")).upper()
+            _, _, profile = infer_asset_profile(symbol, asset_class, reasoning_lower)
+            if not profile:
+                continue
+            hits, _, _ = profile_coverage(reasoning_lower, profile)
+            min_hits = int(profile.get("min_hits", 2))
+            if hits < min_hits:
+                issue = str(profile.get("issue") or "thesis lacks enough explicit asset-class monitors")
+                if issue not in asset_monitor_issues:
+                    asset_monitor_issues.append(issue)
+
+        has_asset_monitor_failure = bool(asset_monitor_issues)
+        if has_asset_monitor_failure:
+            issues.extend(asset_monitor_issues)
+            score -= min(0.30, 0.15 * len(asset_monitor_issues))
+
         for t in active_trades:
             conv = float(t.get("conviction", 0.5))
             if conv == 0.5:
@@ -110,7 +129,7 @@ class ThesisVerifier:
                 score -= 0.05
 
         score = max(0.0, min(1.0, score))
-        passed = score >= 0.5 and len(issues) <= 1
+        passed = score >= 0.65 and len(issues) <= 1 and not has_asset_monitor_failure
 
         feedback = ""
         if issues:
@@ -167,7 +186,11 @@ class ThesisVerifier:
                 f'{{\"quality_score\": 0.6, \"feedback\": \"one specific improvement\"}}'
             )
 
-            resp = llm_chat([{"role": "user", "content": prompt}], max_tokens=150)
+            resp = llm_chat(
+                [{"role": "user", "content": prompt}],
+                max_tokens=150,
+                task="thesis_verification",
+            )
             start = resp.find("{")
             end = resp.rfind("}") + 1
             if start >= 0 and end > start:

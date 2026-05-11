@@ -202,7 +202,7 @@ def llm_score_batch(items: list[dict], pod_name: str) -> list[dict]:
 
     from src.core.llm import llm_chat
     messages = _build_scoring_prompt(items, pod_name)
-    raw = llm_chat(messages, max_tokens=2000)
+    raw = llm_chat(messages, max_tokens=2000, task="sentiment")
     scores = _parse_scores(raw, len(items))
 
     _CACHE[key] = (now, scores)

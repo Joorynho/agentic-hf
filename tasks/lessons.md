@@ -103,6 +103,11 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 - Always validate entries on load (`e && e.ts && Array.isArray(e.signals)`)
 - Prune stale entries on each update cycle
 
+### Research feed labels must separate display, sources, and scoring
+- Do not label an LLM scoring window as a source count or display limit. A cap such as 25 may mean "items scored per cycle," while the dashboard can still show more headlines from fewer or more sources.
+- Sort and dedupe research feed items by publish timestamp plus URL/text identity before rendering; append order makes an active feed look static.
+- If the feed payload does not explicitly say "LLM-scored," do not claim it in the UI. Use neutral labels like `sentiment` or `raw`, and reserve `LLM Window` for the scoring-budget cap.
+
 ### Capital allocation displays must not use NAV as allocation
 - Assigned capital and current NAV answer different questions. A pod can lose money and still have the same mandate allocation.
 - Governance allocation tiles should use mandate weights against starting/allocated capital; show current NAV as secondary performance context.
@@ -149,9 +154,11 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 ### PM entry theses must be tradeable, not just narrative
 - A thesis is weak if it only says "inflation/geopolitics are bullish" without a trigger, driver decomposition, invalidation, and instrument fit.
 - For gold and precious-metals trades, explicitly check real-yield direction, USD trend, Fed reaction function, positioning/flows, central-bank demand, and geopolitical risk as a conditional catalyst.
+- Treat concrete failures like GLD as regression examples, not as the full product scope. Thesis quality and lifecycle checks must cover all four active pods: equities, FX, crypto, and commodities, with asset-class-specific monitors for each.
 - Never let an LLM assert "negative real rates" unless the real-yield data in the prompt is actually below zero. If the data is missing or mixed, the PM should say that instead of inventing certainty.
 - Geopolitical risk belongs in the thesis, but only as a catalyst/risk-premium argument with second-order effects; it can be bullish or bearish depending on the dominant market response in real yields and the dollar.
 - Open-position detail must preserve the reasoning attached to each fill/expansion so the user can audit why size was added, not only why the first entry happened.
+- Entry theses are live contracts, not static notes. Open positions must be re-reviewed when macro regime, real yields, USD, relevant news, price action, or time-based catalysts change; challenged/broken theses should block adds until the PM writes a fresh expansion thesis or reduces/exits.
 
 ---
 
@@ -190,8 +197,45 @@ Capture patterns from corrections and debugging to prevent repeat mistakes.
 - Set `max_tokens` high enough for the expected output (25 items × ~60 chars each = 1500+ chars; use 2000)
 - Always have a keyword fallback path when LLM parsing fails
 
+### Shared helper renames need startup import checks
+- After renaming helpers used across runtime modules, run a startup-level import check such as importing `SessionManager`, not only narrow unit tests.
+- Unit tests can pass while `run.py` still fails if a stale cross-module import remains in the startup path.
+
+### Live dashboard fixes must account for stale running processes
+- When a UI or execution fix changes Python runtime behavior, verify the live audit payload includes the new fields after restart; a browser refresh alone cannot reload server-side Python modules.
+- Generic execution messages like "Order rejected" are not acceptable as the final diagnostic. Preserve broker `stage`, structured `reason`, and any API payload `message`, and add tests that reject generic reasons when specific broker details exist.
+- If historical performance APIs return firm-level data without pod breakdowns, do not plot missing pod values as zero. Either show firm NAV or skip unavailable pod series so charts remain truthful and readable.
+- If a server restart writes all-cash placeholder NAV rows after a valid pod NAV, fix it in the persistence/read layer, not only in Chart.js. Store/read the last valid NAV so performance pauses instead of showing fake drawdowns.
+- Benchmark series must never silently share a NAV axis at an incompatible scale. If a benchmark is shown on a NAV chart, make it user-toggleable and explicitly rebase it to the visible comparison basis.
+- Chart.js canvases inside flex-column tabs need non-shrinking parent containers and an explicit resize after the hidden tab becomes visible. Otherwise the data can be correct while the graph renders as a tiny unreadable strip.
+- Historical all-cash seed rows can be wrong even when they are at the start of the series, so previous-row collapse detection is not enough. NAV history repair must also detect leading low seed baselines and rebase them to the actual funded pod allocation.
+- Product defaults must match the live run defaults. If `run.py` starts pods with `$1000`, `SessionManager.start_live_session()` and dashboard start endpoints cannot still default to `$100`.
+- Reliability panels should reuse the system of record rather than recomputing their own truth. State health comes from accountants/NavStore/broker reconciliation; decision audit comes from the same event stream that feeds the live dashboard.
+
 ### Risk concentration must be factor-aware, not fixed-bucket
 - Do not treat "gold" and "gold miners" as independent risk buckets with separate full limits; miner ETFs often carry strong gold beta and can amplify the same factor loss.
 - Commodities risk should reason in dynamic exposure themes/factors such as gold beta, oil supply shock, natural gas, industrial metals, rates-sensitive metals, and geopolitical energy risk, not deterministic per-asset quotas.
 - LLM/research agents may discover new tradeable instruments from news, but rule-based risk must normalize them into factors/clusters and enforce capital, gross exposure, and correlation limits before execution.
 - A pod with `$1000` allocated cannot carry more than `$1000` gross exposure unless realized profit increased pod NAV; negative cash from hydration or execution must trigger reduce-only behavior for new buys.
+
+---
+
+## Market Data Integrity
+
+### Crypto symbols need cross-provider normalization
+- Alpaca, Yahoo Finance, and the dashboard can refer to the same crypto pair as `ETH/USD`, `ETHUSD`, `ETH-USD`, or `ETH`.
+- Always normalize and alias-match crypto symbols before reconciling broker positions, price feeds, and local accountants.
+- For Yahoo Finance crypto quotes, use dashed symbols like `ETH-USD`; slash symbols such as `ETH/USD` can fail or return stale/no data.
+- UI should expose quote source/staleness instead of silently showing entry price as current price.
+- Alpaca crypto market data expects slash symbols such as `ETH/USD`; compact or dashed symbols (`ETHUSD`, `ETH-USD`) are invalid for snapshot/latest-trade endpoints.
+- Crypto mark-to-market must not depend on broker position reconciliation succeeding. Fetch crypto market-data quotes independently and let `/api/positions` do a short throttled refresh while returning cached positions on timeout.
+- Position APIs should expose `entry_notional` and `current_notional` separately. UI tables must display current exposure from `qty × current_price`, not blindly trust a generic `notional` field that may represent entry cost in older payloads.
+- New BUY orders should require a fresh, positive price with a source and timestamp before risk/execution. SELL orders can remain reduce-risk even if the quote feed is stale.
+- Pod namespaces need the same last-price/freshness map that accountants use for mark-to-market; otherwise PM/runtime checks and execution can disagree about whether a symbol has live data.
+
+### Diagnostic dashboards must be non-blocking
+- Dashboard health/quality/audit panels should show cached local session state immediately and treat live broker/API reads as an enrichment, not as a prerequisite.
+- Never let a live broker reconciliation call block Operations Health; slow account/position/order reads should time out and return partial diagnostics.
+- Empty diagnostic panels are worse than partial data. If the server endpoint is slow, empty, or unavailable, the frontend should fall back to the local WebSocket/order/position state and clearly label it as a local snapshot.
+- Order lifecycle events need both `local_order_id` and `broker_order_id`; do not overwrite one with the other, because pre-submit pending rows and broker responses have different identities.
+- A decision audit is not enough by itself. Expose the current per-pod stage and reason from PM decision through runtime gates and broker execution so a missing trade has an immediate explanation.

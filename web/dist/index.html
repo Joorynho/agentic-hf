@@ -11,7 +11,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700&family=IBM+Plex+Mono:wght@300;400;500&display=swap" rel="stylesheet">
 
   <!-- Stylesheet -->
-  <link rel="stylesheet" href="styles.css?v=position-thesis-20260501">
+  <link rel="stylesheet" href="styles.css?v=research-feed-v2-20260508">
 
   <!-- Three.js r128 -->
   <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
@@ -101,6 +101,7 @@
       <div class="sub-tab-bar ops-subtab-bar">
         <button type="button" class="sub-tab-btn ops-subtab-btn active" data-opssub="summary" onclick="setOpsSubTab('summary')">Summary</button>
         <button type="button" class="sub-tab-btn ops-subtab-btn" data-opssub="overview" onclick="setOpsSubTab('overview')">Overview</button>
+        <button type="button" class="sub-tab-btn ops-subtab-btn" data-opssub="health" onclick="setOpsSubTab('health')">Health</button>
       </div>
       <div id="ops-subtab-summary" class="ops-subtab-pane">
       <div class="kpi-row">
@@ -204,15 +205,30 @@
         <div class="sec-hdr" style="margin-top:10px"><span class="sec-title">Regime</span></div>
         <div id="regime-overview"></div>
       </div>
+      <div id="ops-subtab-health" class="ops-subtab-pane" style="display:none">
+        <div id="state-health-panel"></div>
+      </div>
     </div>
 
     <!-- PERFORMANCE -->
     <div class="tab-pane" id="tab-performance">
       <div class="chart-timeframe" id="chart-timeframe">
-        <button class="tf-btn" data-tf="5" onclick="setChartTimeframe(5)">5m</button>
-        <button class="tf-btn" data-tf="15" onclick="setChartTimeframe(15)">15m</button>
-        <button class="tf-btn" data-tf="60" onclick="setChartTimeframe(60)">1h</button>
-        <button class="tf-btn active" data-tf="0" onclick="setChartTimeframe(0)">ALL</button>
+        <div class="chart-period-group" aria-label="Performance chart period">
+          <button class="tf-btn active" data-period="all" onclick="setChartPeriod('all')">ALL</button>
+          <button class="tf-btn" data-period="6m" onclick="setChartPeriod('6m')">6M</button>
+          <button class="tf-btn" data-period="3m" onclick="setChartPeriod('3m')">3M</button>
+          <button class="tf-btn" data-period="30d" onclick="setChartPeriod('30d')">30D</button>
+          <button class="tf-btn" data-period="7d" onclick="setChartPeriod('7d')">7D</button>
+          <button class="tf-btn" data-period="24h" onclick="setChartPeriod('24h')">24H</button>
+        </div>
+        <label class="chart-toggle" title="Show or hide the firm NAV line">
+          <input type="checkbox" id="firm-nav-toggle" checked onchange="setFirmNavVisible(this.checked)">
+          <span>Firm NAV</span>
+        </label>
+        <label class="chart-toggle" title="Show or hide S&amp;P 500 benchmark, rebased to the visible chart scale">
+          <input type="checkbox" id="sp-benchmark-toggle" onchange="setSpBenchmarkVisible(this.checked)">
+          <span>S&amp;P 500</span>
+        </label>
         <button class="export-btn" onclick="exportNavHistory()" style="margin-left:auto">CSV</button>
         <button class="chart-expand-btn" onclick="expandNavChart()" title="Expand chart">&#x2922;</button>
       </div>
@@ -230,9 +246,9 @@
         <div class="tbl-wrap">
           <table class="dtbl">
             <thead><tr>
-              <th>Pod</th><th class="r">NAV</th><th class="r">Return</th><th class="r">Daily P&amp;L</th><th class="r">Sharpe</th>
+              <th>Pod</th><th class="r">NAV</th><th class="r">Return</th><th class="r">Today P&amp;L</th><th class="r">Realized Today</th><th class="r">Open P&amp;L</th><th class="r">Sharpe</th>
             </tr></thead>
-            <tbody id="perf-table"><tr><td colspan="5" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
+            <tbody id="perf-table"><tr><td colspan="7" class="empty"><div class="empty-txt">Awaiting data…</div></td></tr></tbody>
           </table>
         </div>
       </div>
@@ -260,6 +276,18 @@
         <div class="kpi"><div class="kpi-lbl">Drawdown</div><div class="kpi-val" id="kpi-dd">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Volatility</div><div class="kpi-val" id="kpi-vol">—</div></div>
         <div class="kpi"><div class="kpi-lbl">Alerts</div><div class="kpi-val" id="kpi-alerts">0</div></div>
+      </div>
+      <div>
+        <div class="sec-hdr">
+          <span class="sec-title">Loss Review / Risk Intervention</span>
+          <div class="sec-actions">
+            <span class="sec-badge" id="loss-review-badge">0 active</span>
+            <button class="mini-btn" onclick="fetchLossReviews()">Refresh</button>
+          </div>
+        </div>
+        <div id="loss-review-panel" class="loss-review-grid">
+          <div class="empty"><div class="empty-txt">No loss reviews yet</div></div>
+        </div>
       </div>
       <div>
         <div class="sec-hdr"><span class="sec-title">Pod Risk Breakdown</span></div>
@@ -298,6 +326,8 @@
       <div class="sub-tab-bar exec-subtab-bar">
         <button type="button" class="sub-tab-btn exec-subtab-btn active" data-execsub="tradelog" onclick="setExecSubTab('tradelog')">Trade Log</button>
         <button type="button" class="sub-tab-btn exec-subtab-btn" data-execsub="quality" onclick="setExecSubTab('quality')">Quality</button>
+        <button type="button" class="sub-tab-btn exec-subtab-btn" data-execsub="broker" onclick="setExecSubTab('broker')">Broker</button>
+        <button type="button" class="sub-tab-btn exec-subtab-btn" data-execsub="audit" onclick="setExecSubTab('audit')">Decision Audit</button>
       </div>
       <div id="exec-subtab-tradelog" class="exec-subtab-pane">
       <div>
@@ -315,31 +345,21 @@
           <table class="dtbl">
             <thead><tr>
               <th>Pod</th><th>Symbol</th><th>Side</th>
-              <th class="r">Qty</th><th class="r">Price</th><th class="r">Status</th>
+              <th class="r">Qty</th><th class="r">Price</th><th class="r">Status</th><th>Stage</th><th>Reason</th>
             </tr></thead>
-            <tbody id="exec-table"><tr><td colspan="6" class="empty"><div class="empty-txt">No trades yet</div></td></tr></tbody>
-          </table>
-        </div>
-      </div>
-      <div>
-        <div class="sec-hdr">
-          <span class="sec-title">Closed Trades</span>
-          <span class="sec-badge" id="ct-badge">0 trades</span>
-        </div>
-        <div class="tbl-wrap">
-          <table class="dtbl">
-            <thead><tr>
-              <th>Pod</th><th>Symbol</th><th class="r">Entry $</th><th class="r">Exit $</th>
-              <th class="r">Qty</th><th class="r">P&amp;L</th><th class="r">Days</th>
-              <th>Entry Date</th><th>Exit Date</th><th>Thesis</th>
-            </tr></thead>
-            <tbody id="ct-table"><tr><td colspan="10" class="empty"><div class="empty-txt">No closed trades yet</div></td></tr></tbody>
+            <tbody id="exec-table"><tr><td colspan="8" class="empty"><div class="empty-txt">No trades yet</div></td></tr></tbody>
           </table>
         </div>
       </div>
       </div>
       <div id="exec-subtab-quality" class="exec-subtab-pane" style="display:none">
         <div id="exec-quality-panel" class="tbl-wrap"></div>
+      </div>
+      <div id="exec-subtab-broker" class="exec-subtab-pane" style="display:none">
+        <div id="broker-reconciliation-panel"></div>
+      </div>
+      <div id="exec-subtab-audit" class="exec-subtab-pane" style="display:none">
+        <div id="decision-audit-panel"></div>
       </div>
     </div>
 
@@ -405,6 +425,7 @@
         <button class="sub-tab-btn" data-subtab="contributing">Contributing</button>
         <button class="sub-tab-btn" data-subtab="macro">Macro Indicators</button>
         <button class="sub-tab-btn" data-subtab="social">News Feed <span id="social-badge" style="font-size:9px;color:var(--cyan);margin-left:3px;"></span></button>
+        <button class="sub-tab-btn" data-subtab="feed-health">Feed Audit</button>
       </div>
 
       <!-- Sub-tab: Current Markets -->
@@ -629,25 +650,66 @@
             <span class="sk-val" id="social-tweet-count" style="color:var(--text-primary);">0</span>
           </div>
           <div class="social-kpi">
+            <span class="sk-label">LLM Window</span>
+            <span class="sk-val" id="social-sources-count" style="color:var(--text-primary);">25</span>
+          </div>
+          <div class="social-kpi">
             <span class="sk-label">Sources</span>
-            <span class="sk-val" id="social-sources-count" style="color:var(--text-primary);">0/25</span>
+            <span class="sk-val" id="social-unique-sources" style="color:var(--text-primary);">0</span>
           </div>
           <div class="social-kpi" style="margin-left:auto;">
             <span class="sk-label">Last Refresh</span>
             <span class="sk-val" id="social-last-refresh" style="font-size:10px;color:var(--text-dim);">—</span>
           </div>
         </div>
+        <div class="social-subbar" id="social-source-breakdown">Waiting for source mix...</div>
 
         <div class="social-feed-container" id="social-feed-container">
           <div class="social-empty" id="social-empty-state">
             <div style="font-size:18px;">Macro News Feed</div>
             <div>Waiting for RSS data...</div>
-            <div style="font-size:9px;margin-top:4px;">25 news sources across all asset classes · Refreshes every 5 min · Showing latest 100</div>
+            <div style="font-size:9px;margin-top:4px;">Dashboard shows latest 100 items; LLM scoring is capped per cycle for cost and latency.</div>
           </div>
         </div>
 
         <div class="social-footer">
-          25 RSS sources: Macro (Yahoo, CNBC, Bloomberg, WSJ, FT, Reuters, ZeroHedge) · FX (ForexLive, DailyFX) · Crypto (CoinDesk, CoinTelegraph, The Block, Decrypt) · Commodities (OilPrice, Kitco, Gold & Energy news) · Central Banks & Geopolitics · Full history stored for agents · Dashboard shows latest 100
+          Feed display keeps the latest 100 deduped items. Research scoring reviews the highest-value 25 items per cycle to control LLM cost and latency.
+        </div>
+      </div>
+
+      <!-- Sub-tab: Research Feed Audit -->
+      <div class="sub-tab-pane" id="subtab-feed-health">
+        <div class="research-feed-audit">
+          <div class="rf-audit-head">
+            <div>
+              <div class="research-header">RESEARCH FEED AUDIT</div>
+              <div class="rf-audit-sub">Persistent feed, source health, routing, and action follow-through.</div>
+            </div>
+            <button class="export-btn" onclick="renderResearchFeedAudit(true)">Refresh</button>
+          </div>
+
+          <div class="kpi-row rf-kpis">
+            <div class="kpi"><div class="kpi-lbl">Status</div><div class="kpi-val" id="rf-status">-</div><div class="kpi-sub" id="rf-last-fetch">last fetch -</div></div>
+            <div class="kpi"><div class="kpi-lbl">Items</div><div class="kpi-val" id="rf-items">0</div><div class="kpi-sub">latest routed</div></div>
+            <div class="kpi"><div class="kpi-lbl">Sources</div><div class="kpi-val" id="rf-sources">0</div><div class="kpi-sub" id="rf-source-errors">0 checks</div></div>
+            <div class="kpi"><div class="kpi-lbl">Needs Review</div><div class="kpi-val" id="rf-review">0</div><div class="kpi-sub">high-urgency unmatched</div></div>
+          </div>
+
+          <div class="sec-hdr">
+            <span class="sec-title">Source Health</span>
+            <span class="sec-badge" id="rf-source-badge">0 sources</span>
+          </div>
+          <div class="tbl-wrap tbl-wrap-scroll" id="research-source-health-panel">
+            <div class="empty-txt">No source health yet</div>
+          </div>
+
+          <div class="sec-hdr">
+            <span class="sec-title">Routed Items</span>
+            <span class="sec-badge" id="rf-item-badge">0 items</span>
+          </div>
+          <div class="research-audit-list" id="research-feed-audit-panel">
+            <div class="empty-txt">No research feed audit yet</div>
+          </div>
         </div>
       </div>
 
@@ -745,8 +807,8 @@
 </div>
 
 <!-- JS modules: order matters (tower → motion → dashboard) -->
-<script src="tower.js"></script>
-<script src="motion.js"></script>
-<script src="dashboard.js?v=position-thesis-20260501"></script>
+  <script src="tower.js?v=perf-attribution-20260508"></script>
+  <script src="motion.js?v=perf-attribution-20260508"></script>
+  <script src="dashboard.js?v=perf-attribution-20260508"></script>
 </body>
 </html>

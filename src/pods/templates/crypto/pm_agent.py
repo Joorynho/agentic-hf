@@ -14,6 +14,7 @@ from src.core.thesis_quality import (
     tradeable_entry_thesis_instruction,
 )
 from src.pods.base.agent import BasePodAgent
+from src.pods.templates.execution_common import execution_feedback_block
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ class CryptoPMAgent(BasePodAgent):
                 [{"role": "system", "content": "You are a crypto PM evaluating a risk-adjusted trade size. Be concise."},
                  {"role": "user", "content": prompt}],
                 max_tokens=150,
+                task="pm_revision",
             )
             decision = extract_json(raw)
             accept = decision.get("accept", True)
@@ -221,6 +223,7 @@ class CryptoPMAgent(BasePodAgent):
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
                 max_tokens=2400,
+                task="article_deep_dive",
             )
             if self._session_logger:
                 self._session_logger.log_reasoning(f"pm:{self._pod_id}", "web_search_response", raw or "")
@@ -273,6 +276,7 @@ class CryptoPMAgent(BasePodAgent):
             raw = llm_chat(
                 [{"role": "system", "content": system}, {"role": "user", "content": enriched}],
                 max_tokens=2400,
+                task="article_deep_dive",
             )
             logger.info("[crypto.pm] Article deep-dive complete (%d articles read)", len(articles))
             if self._session_logger:
@@ -437,6 +441,16 @@ class CryptoPMAgent(BasePodAgent):
             sections.append(f"  Current leverage: {sizing.get('current_leverage', 0):.2f}x")
             sections.append(f"  Max leverage: {sizing.get('max_leverage', 2.0):.1f}x")
             sections.append(f"  Max position size: ${sizing.get('position_limit_notional', 0):,.2f} (15% of NAV — above 8% requires max conviction)")
+            loss_review_text = sizing.get("loss_review_text")
+            if loss_review_text:
+                sections.append("\n## Loss Review / Risk Intervention")
+                sections.append(str(loss_review_text))
+                sections.append("  If reduce-only is active, propose only HOLD or risk-reducing SELLs.")
+            thesis_lifecycle_text = sizing.get("thesis_lifecycle_text")
+            if thesis_lifecycle_text:
+                sections.append("\n## Thesis Lifecycle Review")
+                sections.append(str(thesis_lifecycle_text))
+                sections.append("  Do not add to challenged/broken positions unless you provide a fresh expansion thesis that revalidates the original assumptions against current data.")
             for p in sizing.get("positions_summary", []):
                 sections.append(f"  Position: {p['symbol']} qty={p['qty']:.1f} notional=${p['notional']:,.0f} pnl=${p['unrealized_pnl']:,.2f}")
 
@@ -504,6 +518,10 @@ class CryptoPMAgent(BasePodAgent):
         signal_quality = self._ns.get("signal_quality") or ""
         if signal_quality:
             sections.append(f"\n## Signal Quality\n{signal_quality}")
+
+        execution_feedback = execution_feedback_block(self._ns)
+        if execution_feedback:
+            sections.append(f"\n{execution_feedback}")
 
         perf = self._ns.get("performance_summary")
         if perf:
@@ -603,6 +621,7 @@ class CryptoPMAgent(BasePodAgent):
                     {"role": "user", "content": user_content},
                 ],
                 max_tokens=2400,
+                task="pm_decision",
             )
             decision = extract_json(raw)
 
