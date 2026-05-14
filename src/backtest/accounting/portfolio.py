@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import math
+import json
 from datetime import date, datetime, timezone
 
-from src.core.models.execution import Fill, Position, PositionSnapshot
+from src.core.models.execution import Fill, Position, PositionSnapshot, TakeProfitLevel
 from src.core.models.enums import Side
 
 logger = logging.getLogger(__name__)
@@ -70,12 +71,14 @@ class PortfolioAccountant:
         conviction: float = 0.5,
         stop_loss_pct: float | None = None,
         take_profit_pct: float | None = None,
+        take_profit_levels: list[dict] | None = None,
         exit_when: str = "",
         max_hold_days: int = 0,
         expected_price: float | None = None,
         entry_thesis: str = "",
         entry_macro_regime: str = "",
         thesis_review: dict | None = None,
+        evidence_packet: dict | None = None,
     ) -> None:
         """
         Record an order fill from OrderResult. Updates positions and cost basis.
@@ -109,6 +112,8 @@ class PortfolioAccountant:
         prev_cost = self._cost_basis[symbol]
         new_qty = prev_qty + qty
         fill_entry_thesis = self._coalesce_entry_thesis(entry_thesis, reasoning)
+        normalized_tp_levels = self._normalize_take_profit_levels(take_profit_levels)
+        safe_evidence_packet = self._json_safe(evidence_packet or {})
 
         # Store entry metadata when opening a new position
         if prev_qty == 0 and qty != 0:
@@ -124,13 +129,29 @@ class PortfolioAccountant:
                 "signal_snapshot": signal_snapshot or {},
                 "stop_loss_pct": stop_loss_pct if stop_loss_pct is not None else 0.05,
                 "take_profit_pct": take_profit_pct if take_profit_pct is not None else 0.15,
+                "take_profit_levels": normalized_tp_levels,
+                "take_profit_hits": [],
                 "exit_when": exit_when,
                 "max_hold_days": max_hold_days,
                 "entry_macro_regime": entry_macro_regime,
                 "thesis_status": (thesis_review or {}).get("status", "valid"),
                 "thesis_issues": list((thesis_review or {}).get("issues", [])),
                 "thesis_review": thesis_review or {},
+                "evidence_packet": safe_evidence_packet,
+                "latest_evidence_packet": safe_evidence_packet,
+                "evidence_packets": [safe_evidence_packet] if safe_evidence_packet else [],
             }
+        elif (prev_qty > 0 and qty > 0) or (prev_qty < 0 and qty < 0):
+            meta = self._entry_metadata.setdefault(symbol, {})
+            if normalized_tp_levels and not meta.get("take_profit_levels"):
+                meta["take_profit_levels"] = normalized_tp_levels
+                meta.setdefault("take_profit_hits", [])
+            if safe_evidence_packet:
+                packets = list(meta.get("evidence_packets") or [])
+                packets.append(safe_evidence_packet)
+                meta["evidence_packets"] = packets[-20:]
+                meta["latest_evidence_packet"] = safe_evidence_packet
+                meta.setdefault("evidence_packet", safe_evidence_packet)
 
         # Calculate realized PnL for any position reduction
         if (prev_qty > 0 and qty < 0) or (prev_qty < 0 and qty > 0):
@@ -157,6 +178,8 @@ class PortfolioAccountant:
                 "strategy_tag": entry_meta.get("strategy_tag", ""),
                 "exit_when": entry_meta.get("exit_when", ""),
                 "signal_snapshot": entry_meta.get("signal_snapshot", {}),
+                "entry_evidence_packet": entry_meta.get("evidence_packet", {}),
+                "exit_evidence_packet": safe_evidence_packet,
             })
             logger.info(
                 f"[{self._pod_id}] Closed trade on {symbol}: ${realized:.2f} "
@@ -212,8 +235,10 @@ class PortfolioAccountant:
                 "strategy_tag": strategy_tag,
                 "signal_snapshot": signal_snapshot or {},
                 "conviction": conviction,
+                "take_profit_levels": normalized_tp_levels,
                 "entry_macro_regime": entry_macro_regime,
                 "thesis_review": thesis_review or {},
+                "evidence_packet": safe_evidence_packet,
             }
         )
 
@@ -231,6 +256,57 @@ class PortfolioAccountant:
             if text:
                 return text
         return ""
+
+    @staticmethod
+    def _json_safe(value):
+        """Return a JSON-serializable copy for persisted position metadata."""
+        try:
+            return json.loads(json.dumps(value, default=str))
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _normalize_take_profit_levels(levels: list[dict] | None) -> list[dict]:
+        """Validate, sort, and cap optional tiered take-profit levels."""
+        if not levels:
+            return []
+        normalized: list[dict] = []
+        for idx, raw in enumerate(levels):
+            try:
+                if isinstance(raw, TakeProfitLevel):
+                    level = raw
+                elif isinstance(raw, dict):
+                    level = TakeProfitLevel(**raw)
+                else:
+                    continue
+            except Exception:
+                logger.debug("Skipping malformed take-profit level: %s", raw)
+                continue
+            normalized.append({
+                "trigger_pct": round(float(level.trigger_pct), 6),
+                "close_pct": round(float(level.close_pct), 6),
+                "trail_stop_pct": (
+                    round(float(level.trail_stop_pct), 6)
+                    if level.trail_stop_pct is not None
+                    else None
+                ),
+                "label": level.label or f"TP{idx + 1}",
+            })
+        normalized.sort(key=lambda x: x["trigger_pct"])
+
+        capped: list[dict] = []
+        remaining = 1.0
+        for level in normalized:
+            close_pct = min(float(level["close_pct"]), remaining)
+            if close_pct <= 0.0001:
+                continue
+            item = dict(level)
+            item["close_pct"] = round(close_pct, 6)
+            capped.append(item)
+            remaining -= close_pct
+            if remaining <= 0.0001:
+                break
+        return capped
 
     def append_reasoning(
         self,
@@ -306,11 +382,14 @@ class PortfolioAccountant:
                     entry_date=self._entry_dates.get(symbol, ""),
                     stop_loss_pct=meta.get("stop_loss_pct", 0.05),
                     take_profit_pct=meta.get("take_profit_pct", 0.15),
+                    take_profit_levels=list(meta.get("take_profit_levels", [])),
+                    take_profit_hits=list(meta.get("take_profit_hits", [])),
                     max_hold_days=meta.get("max_hold_days", 0),
                     conviction=meta.get("conviction", 0.0),
                     thesis_status=meta.get("thesis_status", "unknown"),
                     thesis_issues=list(meta.get("thesis_issues", [])),
                     thesis_review=meta.get("thesis_review", {}),
+                    evidence_packet=meta.get("latest_evidence_packet") or meta.get("evidence_packet", {}),
                     price_source=self._last_price_source.get(symbol, ""),
                     price_updated_at=(
                         self._last_price_updated_at[symbol].isoformat()

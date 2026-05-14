@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from src.core.bus.collaboration_runner import CollaborationRunner
 from src.core.bus.event_bus import EventBus
 from src.core.concentration import check_concentration
 from src.core.factor_exposure import compute_factor_report, format_factor_report
+from src.core.instrument_profile import profiles_for_pod
+from src.core.portfolio_construction import review_portfolio_construction
+from src.core.thesis_monitor import monitor_positions
 from src.core.models.allocation import MandateUpdate
 from src.core.models.enums import PodStatus
 from src.agents.thesis_verifier import ThesisVerifier
@@ -23,6 +26,8 @@ from src.core.thesis_lifecycle import (
     review_position_thesis,
 )
 from src.core.trade_outcomes import TradeOutcomeTracker
+from src.agents.investment_committee import InvestmentCommitteeReviewer
+from src.agents.specialists import SpecialistRunner
 from src.pods.base.agent import BasePodAgent
 from src.pods.base.gateway import PodGateway
 from src.pods.base.namespace import PodNamespace
@@ -61,6 +66,8 @@ class PodRuntime:
 
         self._outcome_tracker = TradeOutcomeTracker(pod_id)
         self._signal_scorer = SignalScorer(pod_id)
+        self._specialist_runner = SpecialistRunner()
+        self._committee = InvestmentCommitteeReviewer()
 
         # Agents are injected after construction via set_agents()
         self._researcher: BasePodAgent | None = None
@@ -97,6 +104,400 @@ class PodRuntime:
         self._ns.set("governance_risk_halt", risk_halt)
         self._ns.set("governance_risk_halt_reason", risk_halt_reason)
 
+    def _managed_runtime(self):
+        try:
+            return self._ns.get("managed_runtime")
+        except Exception:
+            return None
+
+    def _managed_start_run(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str,
+        task: str,
+        trigger: str = "",
+        parent_run_id: str | None = None,
+        input_payload=None,
+    ) -> str:
+        managed = self._managed_runtime()
+        if not managed:
+            return ""
+        try:
+            try:
+                from src.core.llm import model_policy_for_task
+
+                model_policy = model_policy_for_task(task)
+            except Exception:
+                model_policy = {}
+            return managed.agent_runs.start_run(
+                agent_id=agent_id,
+                agent_type=agent_type,
+                pod_id=self._pod_id,
+                task=task,
+                trigger=trigger,
+                parent_run_id=parent_run_id,
+                input_payload=input_payload,
+                model_tier=model_policy.get("model_tier", ""),
+                model_selection_reason=model_policy.get("model_selection_reason", ""),
+                budget_mode=model_policy.get("budget_mode", ""),
+            )
+        except Exception as exc:
+            logger.debug("[%s] managed start_run failed for %s: %s", self._pod_id, agent_id, exc)
+            return ""
+
+    def _managed_complete_run(self, run_id: str, output_summary=None, *, status: str = "success", artifact_refs: list[str] | None = None) -> None:
+        if not run_id:
+            return
+        managed = self._managed_runtime()
+        if not managed:
+            return
+        try:
+            managed.agent_runs.complete_run(run_id, output_summary=output_summary, status=status, artifact_refs=artifact_refs)
+        except Exception as exc:
+            logger.debug("[%s] managed complete_run failed for %s: %s", self._pod_id, run_id, exc)
+
+    def _managed_fail_run(self, run_id: str, error, *, status: str = "failed") -> None:
+        if not run_id:
+            return
+        managed = self._managed_runtime()
+        if not managed:
+            return
+        try:
+            managed.agent_runs.fail_run(run_id, error, status=status)
+        except Exception as exc:
+            logger.debug("[%s] managed fail_run failed for %s: %s", self._pod_id, run_id, exc)
+
+    async def _run_agent_stage(self, agent, ctx: dict, *, agent_id: str, agent_type: str, task: str, parent_run_id: str | None = None) -> dict:
+        run_id = self._managed_start_run(
+            agent_id=agent_id,
+            agent_type=agent_type,
+            task=task,
+            trigger="pod_cycle",
+            parent_run_id=parent_run_id,
+            input_payload={"ctx_keys": sorted(ctx.keys())},
+        )
+        try:
+            result = await agent.run_cycle(ctx)
+            self._managed_complete_run(run_id, result)
+            return result or {}
+        except Exception as exc:
+            self._managed_fail_run(run_id, exc)
+            raise
+
+    def _record_managed_artifact(self, kind: str, *, status: str = "fresh", freshness_seconds: float | None = None, source_run_id: str = "", payload_ref: str = "") -> str:
+        managed = self._managed_runtime()
+        if not managed:
+            return ""
+        try:
+            return managed.artifacts.record(
+                kind=kind,
+                owner=self._pod_id,
+                status=status,
+                freshness_seconds=freshness_seconds,
+                source_run_id=source_run_id,
+                payload_ref=payload_ref,
+            )
+        except Exception as exc:
+            logger.debug("[%s] managed artifact failed for %s: %s", self._pod_id, kind, exc)
+            return ""
+
+    def _record_managed_report(
+        self,
+        *,
+        report_type: str,
+        title: str,
+        summary: str,
+        body_markdown: str = "",
+        symbol: str = "",
+        related_run_ids: list[str] | None = None,
+        related_catalyst_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        quality_flags: list[str] | None = None,
+    ) -> str:
+        managed = self._managed_runtime()
+        if not managed:
+            return ""
+        try:
+            return managed.reports.add_report(
+                report_type=report_type,
+                pod_id=self._pod_id,
+                symbol=symbol,
+                related_run_ids=related_run_ids or [],
+                related_catalyst_ids=related_catalyst_ids or [],
+                title=title,
+                summary=summary,
+                body_markdown=body_markdown,
+                tags=tags or [],
+                quality_flags=quality_flags or [],
+            )
+        except Exception as exc:
+            logger.debug("[%s] managed report failed for %s: %s", self._pod_id, report_type, exc)
+            return ""
+
+    def _update_catalyst_lifecycle(
+        self,
+        catalyst_ids: list[str],
+        *,
+        status: str | None = None,
+        linked_run_ids: list[str] | None = None,
+        linked_report_ids: list[str] | None = None,
+        linked_trade_ids: list[str] | None = None,
+    ) -> None:
+        if not catalyst_ids:
+            return
+        try:
+            store = self._ns.get("catalyst_lifecycle_store")
+        except Exception:
+            store = None
+        if not store or not hasattr(store, "update_catalyst_lifecycle"):
+            return
+        for event_id in catalyst_ids:
+            try:
+                store.update_catalyst_lifecycle(
+                    str(event_id),
+                    status=status,
+                    linked_run_ids=linked_run_ids or [],
+                    linked_report_ids=linked_report_ids or [],
+                    linked_trade_ids=linked_trade_ids or [],
+                )
+            except Exception as exc:
+                logger.debug("[%s] catalyst lifecycle update failed for %s: %s", self._pod_id, event_id, exc)
+
+    def _managed_dependency_snapshot(self) -> dict:
+        managed = self._managed_runtime()
+        if not managed:
+            return {"status": "unavailable", "checks": []}
+        checks = [
+            managed.artifacts.check_dependency("research_feed", owner=self._pod_id, hard=False, max_age_seconds=900),
+            managed.artifacts.check_dependency("catalyst_ledger", owner="research", hard=False, max_age_seconds=1800),
+            managed.artifacts.check_dependency("fresh_prices", owner=self._pod_id, hard=False, max_age_seconds=600),
+            managed.artifacts.check_dependency("broker_snapshot", owner="firm", hard=False, max_age_seconds=600),
+            managed.artifacts.check_dependency("specialist_briefs", owner=self._pod_id, hard=False, max_age_seconds=1800),
+        ]
+        degraded = [c for c in checks if not c.get("ok")]
+        return {
+            "status": "degraded" if degraded else "ok",
+            "checks": checks,
+            "degraded_reasons": [c.get("reason") for c in degraded if c.get("reason")],
+        }
+
+    def _hard_dependency_allows_order(self, order: Order) -> tuple[bool, str]:
+        if not self._managed_runtime():
+            return True, ""
+        if getattr(order, "side", None) is None or order.side.value.upper() != "BUY":
+            return True, ""
+        managed = self._managed_runtime()
+        price_max_age = 180 if "/" in order.symbol else 600
+        checks = [
+            managed.artifacts.check_dependency("fresh_prices", owner=self._pod_id, hard=True, max_age_seconds=price_max_age),
+            managed.artifacts.check_dependency("broker_snapshot", owner="firm", hard=True, max_age_seconds=600),
+        ]
+        blockers = [c for c in checks if c.get("action") == "block"]
+        if blockers:
+            return False, "; ".join(c.get("reason") or c.get("kind") or "dependency failed" for c in blockers)
+        return True, ""
+
+    def _run_thesis_monitor(self, ctx: dict, accountant) -> dict[str, dict]:
+        """Run advisory live thesis checks for open positions."""
+        if not accountant:
+            return {}
+        events = ctx.get("foresight_events") or self._ns.get("foresight_events") or []
+        latest_regime = current_regime(ctx.get("features"))
+        try:
+            results = monitor_positions(
+                pod_id=self._pod_id,
+                positions=accountant.current_positions,
+                catalyst_events=events if isinstance(events, list) else [],
+                latest_regime=latest_regime,
+            )
+        except Exception as exc:
+            logger.debug("[%s] thesis monitor skipped: %s", self._pod_id, exc)
+            return {}
+        managed = self._managed_runtime()
+        by_symbol: dict[str, dict] = {}
+        add_blocked: dict[str, dict] = {}
+        for result in results:
+            symbol = str(result.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            if managed:
+                try:
+                    managed.thesis_monitor.add_result(result)
+                except Exception as exc:
+                    logger.debug("[%s] thesis monitor persistence failed for %s: %s", self._pod_id, symbol, exc)
+            by_symbol[symbol] = result
+            if result.get("status") == "ADD_BLOCKED":
+                add_blocked[symbol] = result
+        self._ns.set("thesis_monitor_results", by_symbol)
+        self._ns.set("thesis_add_blocked", add_blocked)
+        ctx["thesis_monitor_results"] = by_symbol
+        if add_blocked:
+            ctx.setdefault("sizing_context", {})["thesis_add_blocked"] = add_blocked
+        return by_symbol
+
+    def _portfolio_construction_review(self, order: Order, accountant, data_quality: dict) -> dict:
+        """Run and persist the advisory portfolio-construction gate."""
+        if not accountant:
+            return {}
+        try:
+            review = review_portfolio_construction(
+                pod_id=self._pod_id,
+                order=order,
+                positions=accountant.current_positions,
+                nav=float(getattr(accountant, "nav", 0.0) or 0.0),
+                cash=float(getattr(accountant, "cash", getattr(accountant, "_cash", 0.0)) or 0.0),
+                dynamic_profiles=self._ns.get("factor_profiles"),
+                fallback_price=float(data_quality.get("price") or 0.0),
+            )
+            row = review.model_dump(mode="json")
+        except Exception as exc:
+            logger.debug("[%s] portfolio construction review skipped for %s: %s", self._pod_id, order.symbol, exc)
+            return {}
+
+        managed = self._managed_runtime()
+        if managed:
+            try:
+                managed.portfolio_construction.add_review(row)
+            except Exception as exc:
+                logger.debug("[%s] portfolio construction persistence failed for %s: %s", self._pod_id, order.symbol, exc)
+        self._ns.set("last_portfolio_construction_review", row)
+        by_symbol = dict(self._ns.get("portfolio_construction_reviews_by_symbol") or {})
+        by_symbol[order.symbol.upper()] = row
+        self._ns.set("portfolio_construction_reviews_by_symbol", by_symbol)
+        history = list(self._ns.get("portfolio_construction_history") or [])
+        history.insert(0, row)
+        self._ns.set("portfolio_construction_history", history[:100])
+        return row
+
+    def _apply_portfolio_construction_review(self, order: Order, accountant, data_quality: dict) -> tuple[Order | None, dict]:
+        review = self._portfolio_construction_review(order, accountant, data_quality)
+        if not review:
+            return order, {}
+
+        action = str(review.get("action") or "APPROVE_SIZE").upper()
+        if action in {"SKIP_DUPLICATIVE", "REQUEST_PM_REVISION"}:
+            return None, review
+
+        if action in {"DOWNSIZE", "TRIM_TO_FUND"}:
+            price = float(data_quality.get("price") or order.limit_price or 0.0)
+            recommended = float(review.get("recommended_notional") or 0.0)
+            if recommended <= 0 or price <= 0:
+                return None, review
+            adjusted_qty = min(float(order.quantity), recommended / price)
+            if adjusted_qty <= 0:
+                return None, review
+            if adjusted_qty < float(order.quantity):
+                original_qty = float(order.quantity)
+                adjusted_qty = round(adjusted_qty, 8)
+                review["adjusted_quantity"] = adjusted_qty
+                order = order.model_copy(update={"quantity": adjusted_qty})
+                logger.info(
+                    "[%s] Portfolio construction %s %s resized %.6f -> %.6f",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    original_qty,
+                    adjusted_qty,
+                )
+        return order, review
+
+    def _record_decision_snapshots(self, ctx: dict, accountant, pm_run_id: str, thesis_gate_result: dict) -> list[str]:
+        """Persist sanitized final PM decision snapshots after revisions finalize."""
+        managed = self._managed_runtime()
+        if not managed:
+            return []
+        pm_decision = self._ns.get("last_pm_decision") or {}
+        features = ctx.get("features") if isinstance(ctx.get("features"), dict) else {}
+        trades = [
+            t for t in (pm_decision.get("trades") or [])
+            if isinstance(t, dict) and str(t.get("action", "HOLD")).upper() != "HOLD"
+        ]
+        if not trades:
+            trades = [{"action": "HOLD", "symbol": "", "thesis_fields": pm_decision.get("thesis_fields", {})}]
+        snapshots: list[str] = []
+        events = ctx.get("foresight_events") or pm_decision.get("foresight_events") or []
+        specialist_briefs = ctx.get("specialist_briefs") or self._ns.get("specialist_briefs") or []
+        artifact_status = ctx.get("managed_dependencies") or self._managed_dependency_snapshot()
+        committee_history = self._ns.get("committee_reviews_by_symbol") or {}
+        position_state_all = {}
+        if accountant:
+            for sym, pos in accountant.current_positions.items():
+                position_state_all[str(sym).upper()] = {
+                    "qty": getattr(pos, "qty", 0.0),
+                    "current_price": getattr(pos, "current_price", 0.0),
+                    "avg_entry": getattr(pos, "avg_entry", getattr(pos, "avg_cost", 0.0)),
+                    "unrealized_pnl": getattr(pos, "unrealized_pnl", 0.0),
+                }
+        report_ids: list[str] = []
+        report_id = self._record_managed_report(
+            report_type="pm_decision",
+            title=f"{self._pod_id.upper()} final PM decision",
+            summary=str(pm_decision.get("action_summary") or pm_decision.get("reasoning") or "Final PM decision")[:1000],
+            body_markdown=json.dumps(pm_decision, default=str, indent=2)[:8000],
+            related_run_ids=[pm_run_id] if pm_run_id else [],
+            related_catalyst_ids=list(pm_decision.get("catalyst_ids") or []),
+            tags=["pm_decision", "final"],
+            quality_flags=[] if thesis_gate_result.get("passed", True) else ["thesis_gate_failed"],
+        )
+        if report_id:
+            report_ids.append(report_id)
+        for trade in trades:
+            symbol = str(trade.get("symbol") or "").upper()
+            catalyst_ids = list(dict.fromkeys(str(x) for x in (
+                trade.get("catalyst_ids") or pm_decision.get("catalyst_ids") or []
+            ) if x))
+            catalyst_state = []
+            for event in events if isinstance(events, list) else []:
+                if not isinstance(event, dict):
+                    continue
+                if catalyst_ids and event.get("event_id") not in catalyst_ids:
+                    continue
+                catalyst_state.append({
+                    "event_id": event.get("event_id"),
+                    "thread_id": event.get("thread_id"),
+                    "status": event.get("status"),
+                    "title": event.get("title"),
+                    "factors": event.get("factors", []),
+                    "materiality_score": event.get("materiality_score"),
+                })
+            price = None
+            if symbol and accountant and symbol in accountant.current_positions:
+                price = float(getattr(accountant.current_positions[symbol], "current_price", 0.0) or 0.0)
+            elif ctx.get("bar") is not None:
+                price = float(getattr(ctx["bar"], "close", 0.0) or 0.0)
+            snapshot_id = managed.decisions.add_snapshot({
+                "pod_id": self._pod_id,
+                "decision_id": str(pm_decision.get("decision_id") or pm_run_id or ""),
+                "symbol": symbol,
+                "side": str(trade.get("action") or "HOLD").upper(),
+                "status": "active",
+                "decision_horizon": str(trade.get("timeframe") or trade.get("horizon") or "days"),
+                "price_at_decision": price,
+                "position_state": position_state_all.get(symbol, {}) if symbol else position_state_all,
+                "catalyst_ids": catalyst_ids,
+                "catalyst_state": catalyst_state,
+                "signal_features": {
+                    "macro_outlook": features.get("macro_outlook"),
+                    "regime": features.get("regime"),
+                    "top_scores": features.get("scores") or features.get("signal_scores"),
+                },
+                "specialist_briefs": specialist_briefs if isinstance(specialist_briefs, list) else [],
+                "committee_review": committee_history.get(symbol, {}) if isinstance(committee_history, dict) else {},
+                "thesis_fields": trade.get("thesis_fields") or pm_decision.get("thesis_fields") or {},
+                "risk_state": {
+                    "thesis_gate": thesis_gate_result,
+                    "loss_review": self._ns.get("loss_review_restriction") or {},
+                    "broker_guard": self._ns.get("broker_trade_guard") or {},
+                },
+                "artifact_status": artifact_status,
+                "model_trace_refs": [str((pm_decision.get("llm") or {}).get("model") or "")],
+                "report_refs": report_ids,
+            })
+            snapshots.append(snapshot_id)
+        self._ns.set("last_decision_snapshot_ids", snapshots)
+        return snapshots
+
     async def run_cycle(self, bar: Bar, skip_researcher: bool = False) -> None:
         """Run one full agent cycle for a single bar.
 
@@ -114,12 +515,31 @@ class PodRuntime:
         ctx: dict = {"bar": bar}
 
         if not skip_researcher:
-            research_out = await self._researcher.run_cycle(ctx)  # type: ignore[union-attr]
+            research_out = await self._run_agent_stage(
+                self._researcher,
+                ctx,
+                agent_id=f"{self._pod_id}.researcher",
+                agent_type="researcher",
+                task="research_cycle",
+            )  # type: ignore[arg-type]
             ctx.update(research_out)
 
         # 2. Signal
-        signal_out = await self._signal.run_cycle(ctx)  # type: ignore[union-attr]
+        signal_out = await self._run_agent_stage(
+            self._signal,
+            ctx,
+            agent_id=f"{self._pod_id}.signal",
+            agent_type="signal",
+            task="signal_generation",
+        )  # type: ignore[arg-type]
         ctx.update(signal_out)
+        self._inject_foresight_context(ctx)
+        ctx["managed_dependencies"] = self._managed_dependency_snapshot()
+        try:
+            ctx["instrument_profiles"] = profiles_for_pod(self._pod_id, self._ns.get("factor_profiles"))
+        except Exception as exc:
+            logger.debug("[%s] instrument profile injection skipped: %s", self._pod_id, exc)
+            ctx["instrument_profiles"] = []
 
         # Inject sizing context for PM (LLM-informed position sizing)
         accountant = self._ns.get("accountant")
@@ -196,6 +616,26 @@ class PodRuntime:
         if firm_memo:
             ctx["firm_memo"] = firm_memo
 
+        managed = self._managed_runtime()
+        if managed:
+            try:
+                prior_reports = managed.reports.list_reports(
+                    limit=12,
+                    pod_id=self._pod_id,
+                )
+                ctx["prior_reports"] = prior_reports
+                self._ns.set("prior_reports", prior_reports)
+            except Exception:
+                ctx["prior_reports"] = []
+
+        evidence_review_text = self._ns.get("evidence_review_text")
+        evidence_trade_guard = self._ns.get("evidence_trade_guard") or {}
+        if evidence_review_text:
+            ctx["evidence_review_text"] = evidence_review_text
+            if "sizing_context" in ctx:
+                ctx["sizing_context"]["evidence_review_text"] = evidence_review_text
+                ctx["sizing_context"]["evidence_trade_guard"] = evidence_trade_guard
+
         thesis_reviews = self._review_open_position_theses(ctx, accountant)
         if thesis_reviews:
             thesis_text = format_thesis_reviews_for_prompt(thesis_reviews)
@@ -205,9 +645,65 @@ class PodRuntime:
                 ctx["sizing_context"]["thesis_lifecycle_reviews"] = thesis_reviews
                 ctx["sizing_context"]["thesis_lifecycle_text"] = thesis_text
 
+        thesis_monitor_results = self._run_thesis_monitor(ctx, accountant)
+        if thesis_monitor_results and "sizing_context" in ctx:
+            ctx["sizing_context"]["thesis_monitor_results"] = thesis_monitor_results
+
         # 3. PM (with Signal↔PM challenge, max 5 iter — handled inside pm.run_cycle)
-        pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
+        pm_run_id = self._managed_start_run(
+            agent_id=f"{self._pod_id}.pm",
+            agent_type="pm",
+            task="pm_decision",
+            trigger="pod_cycle",
+            input_payload={"ctx_keys": sorted(ctx.keys())},
+        )
+        try:
+            pm_out = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
+            self._managed_complete_run(pm_run_id, pm_out)
+        except Exception as exc:
+            self._managed_fail_run(pm_run_id, exc)
+            raise
+        ctx["pm_run_id"] = pm_run_id
         ctx.update(pm_out)
+        pm_out = await self._maybe_run_specialist_round(ctx, pm_out, parent_run_id=pm_run_id)
+        if pm_out:
+            ctx.update(pm_out)
+        _pm_report = self._ns.get("last_pm_decision") or {}
+        if _pm_report:
+            _catalyst_ids = list(_pm_report.get("catalyst_ids") or [])
+            for _trade in _pm_report.get("trades", []) or []:
+                if isinstance(_trade, dict):
+                    _catalyst_ids.extend(str(x) for x in (_trade.get("catalyst_ids") or []) if x)
+            _pm_report_id = self._record_managed_report(
+                report_type="pm_decision",
+                title=f"{self._pod_id.upper()} PM decision",
+                summary=str(_pm_report.get("action_summary") or _pm_report.get("reasoning") or "PM decision")[:1000],
+                body_markdown=json.dumps(_pm_report, default=str, indent=2)[:8000],
+                related_run_ids=[pm_run_id] if pm_run_id else [],
+                related_catalyst_ids=list(dict.fromkeys(_catalyst_ids)),
+                tags=["pm_decision"],
+                quality_flags=[],
+            )
+            _unique_catalysts = list(dict.fromkeys(str(x) for x in _catalyst_ids if x))
+            if _unique_catalysts:
+                self._update_catalyst_lifecycle(
+                    _unique_catalysts,
+                    status="acted_on" if _pm_report.get("trades") else "active",
+                    linked_run_ids=[pm_run_id] if pm_run_id else [],
+                    linked_report_ids=[_pm_report_id] if _pm_report_id else [],
+                )
+            _ignored = [
+                str(item.get("event_id"))
+                for item in (_pm_report.get("ignored_catalysts") or [])
+                if isinstance(item, dict) and item.get("event_id")
+            ]
+            if _ignored:
+                self._update_catalyst_lifecycle(
+                    _ignored,
+                    status="ignored",
+                    linked_run_ids=[pm_run_id] if pm_run_id else [],
+                    linked_report_ids=[_pm_report_id] if _pm_report_id else [],
+                )
 
         # 3.1 Thesis verification: evaluate PM reasoning quality, request revision if weak
         thesis_gate_result = {"passed": True, "quality_score": 1.0, "feedback": ""}
@@ -221,7 +717,37 @@ class PodRuntime:
                 _revision_occurred = False
                 _last_result = None
                 for _round in range(2):
-                    _result = await _verifier.verify_with_llm(_pm_decision, self._pod_id)
+                    thesis_run_id = self._managed_start_run(
+                        agent_id=f"{self._pod_id}.thesis_verifier",
+                        agent_type="thesis_verifier",
+                        task="thesis_verification",
+                        trigger=f"round:{_round + 1}",
+                        parent_run_id=pm_run_id,
+                        input_payload={"pod_id": self._pod_id, "active_trade_count": len(_active)},
+                    )
+                    try:
+                        _result = await _verifier.verify_with_llm(_pm_decision, self._pod_id)
+                        self._managed_complete_run(
+                            thesis_run_id,
+                            {
+                                "passed": _result.passed,
+                                "quality_score": _result.quality_score,
+                                "feedback": _result.feedback[:500],
+                            },
+                        )
+                        self._record_managed_report(
+                            report_type="thesis_review",
+                            title=f"{self._pod_id.upper()} thesis verification",
+                            summary=f"passed={_result.passed}, score={_result.quality_score:.2f}",
+                            body_markdown=str(_result.feedback or ""),
+                            related_run_ids=[thesis_run_id] if thesis_run_id else [],
+                            related_catalyst_ids=list(_pm_decision.get("catalyst_ids") or []),
+                            tags=["thesis_verification"],
+                            quality_flags=[] if _result.passed else ["thesis_gate_failed"],
+                        )
+                    except Exception as exc:
+                        self._managed_fail_run(thesis_run_id, exc)
+                        raise
                     _last_result = _result
                     if _result.passed:
                         if _revision_occurred:
@@ -300,6 +826,7 @@ class PodRuntime:
         except Exception as _e:
             logger.debug("[%s] Thesis verification skipped: %s", self._pod_id, _e)
         self._ns.set("thesis_gate_result", thesis_gate_result)
+        self._record_decision_snapshots(ctx, accountant, pm_run_id, thesis_gate_result)
 
         # Emit pod macro view for cross-pod intelligence
         features = ctx.get("features", {})
@@ -316,20 +843,7 @@ class PodRuntime:
         self._log_pm_reasoning(last_pm)
 
         # --- Collect ALL orders from PM (primary + additional) ---
-        all_orders: list[Order] = []
-        primary_order: Order | None = ctx.get("order")
-        if primary_order is not None:
-            all_orders.append(primary_order)
-
-        # Retrieve additional orders stored by PM (orders 2 & 3)
-        additional_raw = self._ns.get("pm_additional_orders") or []
-        for raw in additional_raw:
-            try:
-                all_orders.append(Order(**raw))
-            except Exception as e:
-                logger.warning("[%s] Skipping malformed additional order: %s", self._pod_id, e)
-        # Clear so they don't leak into next cycle
-        self._ns.set("pm_additional_orders", [])
+        all_orders: list[Order] = self._orders_from_pm_context(ctx)
 
         # Universe boundary enforcement: reject trades for symbols that belong
         # exclusively to another pod's seed universe (prevents cross-pod contamination).
@@ -357,7 +871,13 @@ class PodRuntime:
 
         if not valid_orders:
             # No trade proposed — still run Ops
-            await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
+            await self._run_agent_stage(
+                self._ops,
+                ctx,
+                agent_id=f"{self._pod_id}.ops",
+                agent_type="ops",
+                task="ops_heartbeat",
+            )  # type: ignore[arg-type]
             return
 
         # --- Process each order through risk review + execution ---
@@ -365,6 +885,7 @@ class PodRuntime:
         pm_trades = last_pm.get("trades", [])
         executed_count = 0
         rejected_count = 0
+        committee_revision_used = False
 
         for order in valid_orders:
             # Find matching PM trade metadata for this specific order
@@ -374,6 +895,66 @@ class PodRuntime:
             )
 
             trade_reasoning = self._entry_thesis_for_order(order, matching_trade, last_pm)
+            dependency_ok, dependency_reason = self._hard_dependency_allows_order(order)
+            if not dependency_ok:
+                logger.warning(
+                    "[%s] Managed dependency gate blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    dependency_reason,
+                )
+                self._record_trade_block("dependency", order, dependency_reason)
+                rejected_count += 1
+                continue
+
+            allowed_by_execution_cooldown, execution_cooldown_reason = self._execution_cooldown_allows_order(order, accountant)
+            if not allowed_by_execution_cooldown:
+                logger.warning(
+                    "[%s] Execution cooldown blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    execution_cooldown_reason,
+                )
+                self._record_trade_block("execution_cooldown", order, execution_cooldown_reason)
+                rejected_count += 1
+                continue
+
+            allowed_by_broker_guard, broker_guard_reason = self._broker_guard_allows_order(order, accountant)
+            if not allowed_by_broker_guard:
+                logger.warning(
+                    "[%s] Broker guard blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    broker_guard_reason,
+                )
+                self._record_trade_block("broker_guard", order, broker_guard_reason)
+                try:
+                    from src.core.models.messages import AgentMessage
+
+                    await self._bus.publish("agent.activity", AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{self._pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": self._pod_id,
+                            "action": "broker_guard_blocked",
+                            "summary": (
+                                f"{self._pod_id.upper()} broker guard blocked "
+                                f"{order.side.value.upper()} {order.symbol}"
+                            ),
+                            "detail": broker_guard_reason[:500],
+                        },
+                    ), publisher_id=f"{self._pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[%s] Failed to publish broker guard event: %s", self._pod_id, exc)
+                rejected_count += 1
+                continue
 
             allowed_by_loss_review, loss_review_reason = self._loss_review_allows_order(order, accountant)
             if not allowed_by_loss_review:
@@ -410,19 +991,6 @@ class PodRuntime:
                 rejected_count += 1
                 continue
 
-            if order.side.value.upper() == "BUY" and not thesis_gate_result.get("passed", True):
-                logger.warning(
-                    "[%s] Thesis quality gate blocked BUY %s: %s",
-                    self._pod_id, order.symbol, thesis_gate_result.get("feedback", ""),
-                )
-                self._record_trade_block(
-                    "thesis_gate",
-                    order,
-                    thesis_gate_result.get("feedback", "") or "Entry thesis failed verification",
-                )
-                rejected_count += 1
-                continue
-
             existing_review = thesis_reviews.get(order.symbol.upper()) if thesis_reviews else None
             existing_position = accountant.current_positions.get(order.symbol) if accountant else None
             is_expansion = (
@@ -432,6 +1000,105 @@ class PodRuntime:
                     or (order.side.value.upper() == "SELL" and existing_position.qty < 0)
                 )
             )
+            allowed_by_evidence_guard, evidence_guard_reason = self._evidence_guard_allows_order(
+                order=order,
+                accountant=accountant,
+                trade_reasoning=trade_reasoning,
+                thesis_review=existing_review,
+            )
+            if not allowed_by_evidence_guard:
+                logger.warning(
+                    "[%s] Evidence review guard blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    evidence_guard_reason,
+                )
+                self._record_trade_block("evidence_review", order, evidence_guard_reason)
+                try:
+                    from src.core.models.messages import AgentMessage
+
+                    await self._bus.publish("agent.activity", AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{self._pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": self._pod_id,
+                            "symbol": order.symbol,
+                            "action": "evidence_review_blocked",
+                            "status": "BLOCKED",
+                            "summary": (
+                                f"{self._pod_id.upper()} evidence guard blocked "
+                                f"{order.side.value.upper()} {order.symbol}"
+                            ),
+                            "detail": evidence_guard_reason[:700],
+                            "reason": evidence_guard_reason,
+                        },
+                    ), publisher_id=f"{self._pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[%s] Failed to publish evidence guard block: %s", self._pod_id, exc)
+                rejected_count += 1
+                continue
+
+            quality_gate = self._pre_trade_quality_gate(
+                order=order,
+                matching_trade=matching_trade,
+                pm_decision=last_pm,
+                thesis_gate_result=thesis_gate_result,
+                trade_reasoning=trade_reasoning,
+            )
+            self._record_quality_gate_result(quality_gate)
+            if quality_gate.get("action") == "block":
+                logger.warning(
+                    "[%s] Pre-trade quality gate blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    quality_gate.get("reason", ""),
+                )
+                self._record_trade_block(
+                    "quality_gate",
+                    order,
+                    quality_gate.get("reason", "") or "Pre-trade quality gate blocked the order",
+                )
+                rejected_count += 1
+                continue
+            if quality_gate.get("action") == "warn":
+                logger.info(
+                    "[%s] Pre-trade quality gate warning for %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    quality_gate.get("reason", ""),
+                )
+                try:
+                    from src.core.models.messages import AgentMessage
+
+                    await self._bus.publish("agent.activity", AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{self._pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{self._pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": self._pod_id,
+                            "symbol": order.symbol,
+                            "action": "quality_gate_warning",
+                            "summary": (
+                                f"{self._pod_id.upper()} quality gate warned on "
+                                f"{order.side.value.upper()} {order.symbol}"
+                            ),
+                            "detail": quality_gate.get("reason", "")[:500],
+                            "status": "WARN",
+                        },
+                    ), publisher_id=f"{self._pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[%s] Failed to publish quality gate warning: %s", self._pod_id, exc)
+
             if (
                 is_expansion
             ):
@@ -486,6 +1153,161 @@ class PodRuntime:
                 rejected_count += 1
                 continue
 
+            monitor_block = (self._ns.get("thesis_add_blocked") or {}).get(order.symbol.upper())
+            if is_expansion and monitor_block:
+                reason = (
+                    monitor_block.get("reason")
+                    or "; ".join(monitor_block.get("triggers") or [])
+                    or "Live thesis monitor blocks expansion until the thesis is refreshed"
+                )
+                logger.warning("[%s] Thesis monitor blocked add to %s: %s", self._pod_id, order.symbol, reason)
+                self._record_trade_block("thesis_monitor", order, reason)
+                rejected_count += 1
+                continue
+
+            original_order = order
+            order, portfolio_construction_review = self._apply_portfolio_construction_review(order, accountant, data_quality)
+            if order is None:
+                reason = (
+                    portfolio_construction_review.get("reason")
+                    or f"Portfolio construction {portfolio_construction_review.get('action', 'review')} blocked the trade"
+                )
+                self._record_trade_block("portfolio_construction", original_order, reason)
+                rejected_count += 1
+                continue
+
+            committee_review = await self._committee_review_order(
+                order=order,
+                accountant=accountant,
+                matching_trade=matching_trade,
+                pm_decision=last_pm,
+                trade_reasoning=trade_reasoning,
+                thesis_gate_result=thesis_gate_result,
+                quality_gate=quality_gate,
+                ctx=ctx,
+            )
+            if committee_review and committee_review.get("decision") == "REVISE" and not committee_revision_used:
+                committee_revision_used = True
+                revised_orders = await self._run_committee_revision_round(ctx, committee_review)
+                replacement = self._find_revised_order(order, revised_orders)
+                if replacement is None:
+                    reason = (
+                        committee_review.get("reason")
+                        or "Investment committee requested a PM revision, but no revised order was submitted."
+                    )
+                    self._record_trade_block("committee_review", order, reason)
+                    rejected_count += 1
+                    continue
+
+                order = replacement
+                last_pm = self._ns.get("last_pm_decision") or last_pm
+                pm_trades = last_pm.get("trades", [])
+                matching_trade = next(
+                    (t for t in pm_trades if isinstance(t, dict) and t.get("symbol") == order.symbol),
+                    {},
+                )
+                trade_reasoning = self._entry_thesis_for_order(order, matching_trade, last_pm)
+                existing_position = accountant.current_positions.get(order.symbol) if accountant else None
+                is_expansion = (
+                    existing_position is not None
+                    and (
+                        (order.side.value.upper() == "BUY" and existing_position.qty > 0)
+                        or (order.side.value.upper() == "SELL" and existing_position.qty < 0)
+                    )
+                )
+                existing_review = thesis_reviews.get(order.symbol.upper()) if thesis_reviews else None
+                quality_gate = self._pre_trade_quality_gate(
+                    order=order,
+                    matching_trade=matching_trade,
+                    pm_decision=last_pm,
+                    thesis_gate_result=thesis_gate_result,
+                    trade_reasoning=trade_reasoning,
+                )
+                self._record_quality_gate_result(quality_gate)
+                if quality_gate.get("action") == "block":
+                    self._record_trade_block(
+                        "quality_gate",
+                        order,
+                        quality_gate.get("reason", "") or "Pre-trade quality gate blocked revised order",
+                    )
+                    rejected_count += 1
+                    continue
+                data_quality = self._pre_trade_data_quality(order, accountant, ctx)
+                self._ns.set("last_data_quality_check", data_quality)
+                if not data_quality.get("passed", False):
+                    self._record_data_quality_failure(data_quality)
+                    self._record_trade_block(
+                        "data_quality",
+                        order,
+                        "; ".join(data_quality.get("issues", [])) or "Market data quality gate failed",
+                    )
+                    rejected_count += 1
+                    continue
+                monitor_block = (self._ns.get("thesis_add_blocked") or {}).get(order.symbol.upper())
+                if is_expansion and monitor_block:
+                    reason = (
+                        monitor_block.get("reason")
+                        or "; ".join(monitor_block.get("triggers") or [])
+                        or "Live thesis monitor blocks expansion until the thesis is refreshed"
+                    )
+                    self._record_trade_block("thesis_monitor", order, reason)
+                    rejected_count += 1
+                    continue
+                order, portfolio_construction_review = self._apply_portfolio_construction_review(order, accountant, data_quality)
+                if order is None:
+                    reason = (
+                        portfolio_construction_review.get("reason")
+                        or f"Portfolio construction {portfolio_construction_review.get('action', 'review')} blocked revised trade"
+                    )
+                    self._record_trade_block("portfolio_construction", replacement, reason)
+                    rejected_count += 1
+                    continue
+                committee_review = await self._committee_review_order(
+                    order=order,
+                    accountant=accountant,
+                    matching_trade=matching_trade,
+                    pm_decision=last_pm,
+                    trade_reasoning=trade_reasoning,
+                    thesis_gate_result=thesis_gate_result,
+                    quality_gate=quality_gate,
+                    ctx=ctx,
+                )
+
+            if committee_review and committee_review.get("decision") in {"REVISE", "REJECT"}:
+                reason = committee_review.get("reason") or f"IC {committee_review.get('decision')} blocked the trade"
+                logger.warning(
+                    "[%s] Investment committee blocked %s %s: %s",
+                    self._pod_id,
+                    order.side.value.upper(),
+                    order.symbol,
+                    reason,
+                )
+                self._record_trade_block("committee_review", order, reason)
+                rejected_count += 1
+                continue
+
+            entry_macro_regime = current_regime(ctx.get("features"))
+            thesis_review = existing_review or {
+                "symbol": order.symbol.upper(),
+                "status": "valid",
+                "score": thesis_gate_result.get("quality_score", 1.0),
+                "issues": [],
+                "reviewed_at": datetime.utcnow().isoformat(),
+            }
+            evidence_packet = self._build_trade_evidence_packet(
+                order=order,
+                matching_trade=matching_trade,
+                pm_decision=last_pm,
+                ctx=ctx,
+                accountant=accountant,
+                trade_reasoning=trade_reasoning,
+                thesis_gate_result=thesis_gate_result,
+                quality_gate=quality_gate,
+                data_quality=data_quality,
+                thesis_review=thesis_review,
+                entry_macro_regime=entry_macro_regime,
+            )
+
             # Set per-order metadata so exec trader can attach it to fills
             self._ns.set("pm_trade_metadata", {
                 "entry_thesis": trade_reasoning,
@@ -495,16 +1317,12 @@ class PodRuntime:
                 "signal_snapshot": last_pm.get("signal_snapshot", {}),
                 "stop_loss_pct": matching_trade.get("stop_loss_pct"),
                 "take_profit_pct": matching_trade.get("take_profit_pct"),
+                "take_profit_levels": matching_trade.get("take_profit_levels", []),
                 "exit_when": matching_trade.get("exit_when", ""),
                 "max_hold_days": matching_trade.get("max_hold_days", 0),
-                "entry_macro_regime": current_regime(ctx.get("features")),
-                "thesis_review": existing_review or {
-                    "symbol": order.symbol.upper(),
-                    "status": "valid",
-                    "score": thesis_gate_result.get("quality_score", 1.0),
-                    "issues": [],
-                    "reviewed_at": datetime.utcnow().isoformat(),
-                },
+                "entry_macro_regime": entry_macro_regime,
+                "thesis_review": thesis_review,
+                "evidence_packet": evidence_packet,
             })
 
             # Concentration guard: block firm-level sector overconcentration on BUY orders
@@ -526,7 +1344,26 @@ class PodRuntime:
 
             # 4. Risk sign-off loop (PM↔Risk deliberation per order)
             self._ns.set("last_risk_rejection_reason", None)
-            approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
+            risk_run_id = self._managed_start_run(
+                agent_id=f"{self._pod_id}.risk",
+                agent_type="risk",
+                task="risk_signoff",
+                trigger="pm_order",
+                input_payload={"symbol": order.symbol, "side": order.side.value, "qty": order.quantity},
+            )
+            try:
+                approved_order, exit_orders = await self._run_risk_loop_with_exits(order)
+                self._managed_complete_run(
+                    risk_run_id,
+                    {
+                        "approved": approved_order is not None,
+                        "exit_orders": len(exit_orders or []),
+                        "reason": self._ns.get("last_risk_rejection_reason") or "",
+                    },
+                )
+            except Exception as exc:
+                self._managed_fail_run(risk_run_id, exc)
+                raise
 
             # Execute exit orders first (stop-loss / take-profit)
             if exit_orders:
@@ -566,7 +1403,31 @@ class PodRuntime:
             exec_ctx["risk_halt_reason"] = self._ns.get("governance_risk_halt_reason")
             exec_ctx["drawdown_halt"] = self._ns.get("drawdown_halt", False)
             exec_ctx["drawdown_sizing_mult"] = float(self._ns.get("drawdown_sizing_mult", 1.0))
-            await self._exec_trader.run_cycle(exec_ctx)  # type: ignore[union-attr]
+            exec_run_id = self._managed_start_run(
+                agent_id=f"{self._pod_id}.exec_trader",
+                agent_type="execution",
+                task="execution_submit",
+                trigger="risk_approved",
+                input_payload={"symbol": approved_order.symbol, "side": approved_order.side.value, "qty": approved_order.quantity},
+            )
+            try:
+                await self._exec_trader.run_cycle(exec_ctx)  # type: ignore[union-attr]
+                last_order_update = self._ns.get("last_order") or {"symbol": approved_order.symbol}
+                self._managed_complete_run(exec_run_id, last_order_update)
+                trade_ids = []
+                if isinstance(last_order_update, dict):
+                    for key in ("order_id", "broker_order_id", "local_order_id"):
+                        if last_order_update.get(key):
+                            trade_ids.append(str(last_order_update.get(key)))
+                self._update_decision_snapshot_order_status(approved_order, last_order_update)
+                self._update_catalyst_lifecycle(
+                    list(matching_trade.get("catalyst_ids") or last_pm.get("catalyst_ids") or []),
+                    linked_run_ids=[exec_run_id] if exec_run_id else [],
+                    linked_trade_ids=trade_ids,
+                )
+            except Exception as exc:
+                self._managed_fail_run(exec_run_id, exc)
+                raise
             executed_count += 1
 
         if executed_count + rejected_count > 1:
@@ -574,7 +1435,361 @@ class PodRuntime:
                         self._pod_id, executed_count, rejected_count, len(valid_orders))
 
         # 6. Ops
-        await self._ops.run_cycle(ctx)  # type: ignore[union-attr]
+        await self._run_agent_stage(
+            self._ops,
+            ctx,
+            agent_id=f"{self._pod_id}.ops",
+            agent_type="ops",
+            task="ops_heartbeat",
+        )  # type: ignore[arg-type]
+
+    def _inject_foresight_context(self, ctx: dict) -> None:
+        """Attach advisory catalyst events to signal features and PM context."""
+        events = self._ns.get("foresight_events") or self._ns.get("catalyst_events") or []
+        if not isinstance(events, list):
+            events = []
+        if not events:
+            return
+        features = ctx.setdefault("features", {})
+        if isinstance(features, dict):
+            features["foresight_events"] = events[:10]
+            features["catalyst_events"] = events[:10]
+        ctx["foresight_events"] = events[:10]
+        text = self._ns.get("foresight_text")
+        if text:
+            ctx["foresight_text"] = text
+            if "sizing_context" in ctx and isinstance(ctx["sizing_context"], dict):
+                ctx["sizing_context"]["foresight_text"] = text
+
+    def _orders_from_pm_context(self, ctx: dict) -> list[Order]:
+        """Collect primary and additional PM orders, then clear transient extras."""
+        orders: list[Order] = []
+        primary_order: Order | None = ctx.get("order")
+        if primary_order is not None:
+            orders.append(primary_order)
+
+        additional_raw = self._ns.get("pm_additional_orders") or []
+        for raw in additional_raw:
+            try:
+                orders.append(Order(**raw))
+            except Exception as e:
+                logger.warning("[%s] Skipping malformed additional order: %s", self._pod_id, e)
+        self._ns.set("pm_additional_orders", [])
+        return orders
+
+    async def _maybe_run_specialist_round(self, ctx: dict, pm_out: dict, parent_run_id: str | None = None) -> dict:
+        """Run at most one PM-requested specialist round, then ask PM for final decision."""
+        last_pm = self._ns.get("last_pm_decision") or {}
+        requests = last_pm.get("analyst_requests") or []
+        if not isinstance(requests, list) or not requests:
+            return pm_out
+        managed = self._managed_runtime()
+        if managed:
+            try:
+                budget = managed.budgets.summary(limit=500).get("today", {})
+                if budget.get("degraded") and len(requests) > 1:
+                    await self._publish_activity(
+                        action="budget_degraded_specialists",
+                        summary=f"{self._pod_id.upper()} specialist requests reduced by budget policy",
+                        detail=budget.get("degraded_reason", "")[:500],
+                        status="DEGRADED",
+                    )
+                    requests = requests[:1]
+            except Exception:
+                pass
+
+        run_id = self._managed_start_run(
+            agent_id=f"{self._pod_id}.specialists",
+            agent_type="specialist",
+            task="specialist_briefs",
+            trigger="pm_request",
+            parent_run_id=parent_run_id,
+            input_payload={"request_count": len(requests), "types": [r.get("type") for r in requests if isinstance(r, dict)]},
+        )
+        try:
+            briefs = await self._specialist_runner.run_requests(
+                pod_id=self._pod_id,
+                requests=requests,
+                context=ctx,
+            )
+            artifact_id = self._record_managed_artifact(
+                "specialist_briefs",
+                status="fresh" if briefs else "degraded",
+                freshness_seconds=1800,
+                source_run_id=run_id,
+                payload_ref="/api/specialist-briefs",
+            )
+            self._managed_complete_run(run_id, {"brief_count": len(briefs or [])}, artifact_refs=[artifact_id] if artifact_id else [])
+        except Exception as exc:
+            self._record_managed_artifact(
+                "specialist_briefs",
+                status="failed",
+                freshness_seconds=300,
+                source_run_id=run_id,
+                payload_ref="/api/specialist-briefs",
+            )
+            self._managed_fail_run(run_id, exc)
+            raise
+        self._record_specialist_round(requests, briefs)
+        for brief in briefs or []:
+            if isinstance(brief, dict):
+                _brief_catalysts = [str(x) for x in brief.get("related_catalyst_ids", [])] if isinstance(brief.get("related_catalyst_ids"), list) else []
+                _brief_report_id = self._record_managed_report(
+                    report_type="specialist_brief",
+                    title=f"{self._pod_id.upper()} {brief.get('type', 'specialist')} brief",
+                    summary=str(brief.get("conclusion") or brief.get("summary") or "")[:1000],
+                    body_markdown=json.dumps(brief, default=str, indent=2)[:8000],
+                    symbol=str(brief.get("symbol") or ""),
+                    related_run_ids=[run_id] if run_id else [],
+                    related_catalyst_ids=_brief_catalysts,
+                    tags=["specialist", str(brief.get("type") or "")],
+                )
+                self._update_catalyst_lifecycle(
+                    _brief_catalysts,
+                    linked_run_ids=[run_id] if run_id else [],
+                    linked_report_ids=[_brief_report_id] if _brief_report_id else [],
+                )
+        await self._publish_activity(
+            action="specialist_request",
+            summary=f"{self._pod_id.upper()} PM requested {min(len(requests), 3)} specialist brief(s)",
+            detail=json.dumps(requests[:3], default=str)[:900],
+            status="REQUESTED",
+        )
+        if not briefs:
+            return pm_out
+
+        features = ctx.setdefault("features", {})
+        if isinstance(features, dict):
+            features["specialist_briefs"] = briefs
+        ctx["specialist_briefs"] = briefs
+        self._ns.set("specialist_briefs", briefs)
+        await self._publish_activity(
+            action="specialist_brief",
+            summary=f"{self._pod_id.upper()} received {len(briefs)} specialist brief(s)",
+            detail=json.dumps(briefs[:3], default=str)[:1200],
+            status="INFO",
+        )
+
+        try:
+            final_pm_run_id = self._managed_start_run(
+                agent_id=f"{self._pod_id}.pm",
+                agent_type="pm",
+                task="pm_final_after_specialists",
+                trigger="specialist_briefs",
+                parent_run_id=run_id,
+                input_payload={"brief_count": len(briefs)},
+            )
+            revised = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
+            self._managed_complete_run(final_pm_run_id, revised)
+            if revised:
+                ctx.update(revised)
+                await self._publish_activity(
+                    action="specialist_final_decision",
+                    summary=f"{self._pod_id.upper()} PM revised after {len(briefs)} specialist brief(s)",
+                    detail=(self._ns.get("last_pm_decision") or {}).get("reasoning", "")[:700],
+                    status="INFO",
+                )
+                return revised
+        except Exception as exc:
+            self._managed_fail_run(locals().get("final_pm_run_id", ""), exc)
+            logger.warning("[%s] PM specialist final decision failed: %s", self._pod_id, exc)
+        return pm_out
+
+    def _record_specialist_round(self, requests: list, briefs: list[dict]) -> None:
+        now = datetime.now(timezone.utc).isoformat()
+        request_rows = []
+        for req in requests[:6]:
+            if isinstance(req, dict):
+                request_rows.append({**req, "pod_id": self._pod_id, "created_at": now})
+        history = list(self._ns.get("specialist_request_history") or [])
+        history = request_rows + history
+        self._ns.set("specialist_request_history", history[:100])
+
+        brief_history = list(self._ns.get("specialist_brief_history") or [])
+        brief_history = list(briefs or []) + brief_history
+        self._ns.set("specialist_brief_history", brief_history[:100])
+        for req in request_rows:
+            try:
+                req["action"] = "specialist_request"
+                req["status"] = "REQUESTED"
+            except Exception:
+                pass
+        if briefs:
+            for brief in briefs:
+                try:
+                    brief["pod_id"] = brief.get("pod_id") or self._pod_id
+                except Exception:
+                    pass
+
+    async def _committee_review_order(
+        self,
+        *,
+        order: Order,
+        accountant,
+        matching_trade: dict,
+        pm_decision: dict,
+        trade_reasoning: str,
+        thesis_gate_result: dict,
+        quality_gate: dict,
+        ctx: dict,
+    ) -> dict | None:
+        should_review, triggers = self._committee.should_review(
+            order=order,
+            accountant=accountant,
+            matching_trade=matching_trade,
+            pm_decision=pm_decision,
+            thesis_gate_result=thesis_gate_result,
+            quality_gate=quality_gate,
+        )
+        if not should_review:
+            return None
+
+        dependency_snapshot = self._managed_dependency_snapshot()
+        ctx["ic_dependency_snapshot"] = dependency_snapshot
+        run_id = self._managed_start_run(
+            agent_id=f"{self._pod_id}.investment_committee",
+            agent_type="investment_committee",
+            task="committee_review",
+            trigger="risk_increasing_trade",
+            parent_run_id=ctx.get("pm_run_id") or None,
+            input_payload={"symbol": order.symbol, "side": order.side.value, "triggers": triggers},
+        )
+        try:
+            review = await self._committee.review(
+                pod_id=self._pod_id,
+                order=order,
+                accountant=accountant,
+                matching_trade=matching_trade,
+                pm_decision=pm_decision,
+                trade_reasoning=trade_reasoning,
+                thesis_gate_result=thesis_gate_result,
+                quality_gate=quality_gate,
+                ctx=ctx,
+                triggers=triggers,
+            )
+            self._managed_complete_run(run_id, review.model_dump(mode="json"))
+        except Exception as exc:
+            self._managed_fail_run(run_id, exc)
+            raise
+        row = review.model_dump(mode="json")
+        row["triggers"] = triggers
+        row["dependencies"] = dependency_snapshot
+        self._record_committee_review(row)
+        artifact_id = self._record_managed_artifact(
+            "committee_review",
+            status="fresh",
+            freshness_seconds=1800,
+            source_run_id=run_id,
+            payload_ref="/api/committee-reviews",
+        )
+        _ic_catalysts = list(pm_decision.get("catalyst_ids") or [])
+        _ic_report_id = self._record_managed_report(
+            report_type="committee_review",
+            title=f"{self._pod_id.upper()} IC {row.get('decision')} {order.symbol}",
+            summary=str(row.get("reason") or "")[:1000],
+            body_markdown=json.dumps(row, default=str, indent=2)[:8000],
+            symbol=order.symbol,
+            related_run_ids=[run_id] if run_id else [],
+            related_catalyst_ids=_ic_catalysts,
+            tags=["committee_review", row.get("decision", "")],
+            quality_flags=["degraded_dependencies"] if dependency_snapshot.get("status") == "degraded" else [],
+        )
+        self._update_catalyst_lifecycle(
+            [str(x) for x in _ic_catalysts if x],
+            linked_run_ids=[run_id] if run_id else [],
+            linked_report_ids=[_ic_report_id] if _ic_report_id else [],
+        )
+        if artifact_id:
+            self._managed_complete_run(run_id, row, artifact_refs=[artifact_id])
+        await self._publish_activity(
+            action="committee_review",
+            summary=(
+                f"{self._pod_id.upper()} IC {row['decision']} "
+                f"{order.side.value.upper()} {order.symbol}"
+            ),
+            detail=row.get("reason", "")[:900],
+            status=row.get("decision", "INFO"),
+            symbol=order.symbol,
+            reason=row.get("reason", ""),
+        )
+        return row
+
+    def _record_committee_review(self, review: dict) -> None:
+        self._ns.set("last_committee_review", review)
+        by_symbol = dict(self._ns.get("committee_reviews_by_symbol") or {})
+        by_symbol[str(review.get("symbol") or "").upper()] = review
+        self._ns.set("committee_reviews_by_symbol", by_symbol)
+        history = list(self._ns.get("committee_review_history") or [])
+        history.insert(0, review)
+        self._ns.set("committee_review_history", history[:100])
+
+    async def _run_committee_revision_round(self, ctx: dict, review: dict) -> list[Order]:
+        feedback = review.get("reason") or "Investment committee requested a stronger trade thesis."
+        self._ns.set("thesis_revision_feedback", {
+            "feedback": (
+                "Investment Committee requested revision before risk/execution: "
+                + str(feedback)
+            ),
+            "round": "IC",
+        })
+        try:
+            await self._publish_activity(
+                action="committee_revision_requested",
+                summary=f"{self._pod_id.upper()} IC requested PM revision",
+                detail=str(feedback)[:900],
+                status="REVISE",
+                symbol=review.get("symbol", ""),
+                reason=str(feedback),
+            )
+            revised = await self._pm.run_cycle(ctx)  # type: ignore[union-attr]
+            if revised:
+                ctx.update(revised)
+            return self._orders_from_pm_context(ctx)
+        except Exception as exc:
+            logger.warning("[%s] IC revision round failed: %s", self._pod_id, exc)
+            return []
+        finally:
+            self._ns.set("thesis_revision_feedback", None)
+
+    @staticmethod
+    def _find_revised_order(original: Order, revised_orders: list[Order]) -> Order | None:
+        for order in revised_orders:
+            if order.symbol.upper() == original.symbol.upper() and order.side == original.side:
+                return order
+        return None
+
+    async def _publish_activity(
+        self,
+        *,
+        action: str,
+        summary: str,
+        detail: str = "",
+        status: str = "INFO",
+        symbol: str = "",
+        reason: str = "",
+    ) -> None:
+        try:
+            from src.core.models.messages import AgentMessage
+
+            await self._bus.publish("agent.activity", AgentMessage(
+                timestamp=datetime.now(timezone.utc),
+                sender=f"{self._pod_id}.runtime",
+                recipient="dashboard",
+                topic="agent.activity",
+                payload={
+                    "agent_id": f"{self._pod_id}_runtime",
+                    "agent_role": "Runtime",
+                    "pod_id": self._pod_id,
+                    "symbol": symbol,
+                    "action": action,
+                    "summary": summary[:500],
+                    "detail": detail[:1200],
+                    "status": status,
+                    "reason": reason,
+                },
+            ), publisher_id=f"{self._pod_id}.runtime")
+        except Exception as exc:
+            logger.debug("[%s] Failed to publish %s activity: %s", self._pod_id, action, exc)
 
     @staticmethod
     def _parse_timestamp(value) -> datetime | None:
@@ -660,6 +1875,101 @@ class PodRuntime:
                 return qty > abs(existing_qty)
         return True
 
+    def _execution_cooldown_allows_order(self, order: Order, accountant) -> tuple[bool, str]:
+        """Block new risk after repeated recent execution failures."""
+        feedback = self._ns.get("execution_feedback") or []
+        if not isinstance(feedback, list):
+            feedback = []
+
+        now = datetime.now(timezone.utc)
+        window_start = now - timedelta(minutes=30)
+        recent: list[dict] = []
+        symbol_recent: list[dict] = []
+        order_aliases = self._order_symbol_aliases(order.symbol)
+
+        for item in feedback:
+            if not isinstance(item, dict):
+                continue
+            ts = self._parse_timestamp(item.get("timestamp"))
+            if ts is not None and ts < window_start:
+                continue
+            recent.append(item)
+            item_aliases = self._order_symbol_aliases(str(item.get("symbol") or ""))
+            if order_aliases & item_aliases:
+                symbol_recent.append(item)
+
+        active = len(recent) >= 3 or len(symbol_recent) >= 2
+        reason = ""
+        if len(symbol_recent) >= 2:
+            reason = (
+                f"{order.symbol} has {len(symbol_recent)} broker/execution rejection(s) "
+                "in the last 30 minutes"
+            )
+        elif len(recent) >= 3:
+            reason = (
+                f"{self._pod_id} has {len(recent)} broker/execution rejection(s) "
+                "in the last 30 minutes"
+            )
+
+        self._ns.set("execution_cooldown", {
+            "active": active,
+            "mode": "reduce_only" if active else "normal",
+            "symbol": order.symbol,
+            "pod_rejections_30m": len(recent),
+            "symbol_rejections_30m": len(symbol_recent),
+            "reason": reason,
+            "updated_at": now.isoformat(),
+        })
+
+        if active and self._order_increases_risk(order, accountant):
+            return False, reason + ". New risk is paused until the broker issue is fixed or the cooldown clears."
+        return True, ""
+
+    @staticmethod
+    def _order_symbol_aliases(symbol: str) -> set[str]:
+        raw = str(symbol or "").upper()
+        return {
+            raw,
+            raw.replace("/", ""),
+            raw.replace("/", "-"),
+        }
+
+    def _broker_guard_allows_order(self, order: Order, accountant) -> tuple[bool, str]:
+        """Block trades when reconciliation says local/broker state is unsafe."""
+        guard = self._ns.get("broker_trade_guard") or {}
+        if not isinstance(guard, dict):
+            return True, ""
+
+        if guard.get("status") == "OK":
+            return True, ""
+
+        aliases = self._order_symbol_aliases(order.symbol)
+        symbol_blocks = guard.get("blocked_symbols") or {}
+        matching_block = None
+        if isinstance(symbol_blocks, dict):
+            for symbol, block in symbol_blocks.items():
+                block_aliases = self._order_symbol_aliases(symbol)
+                if aliases & block_aliases:
+                    matching_block = block if isinstance(block, dict) else {"reason": str(block)}
+                    break
+
+        if matching_block:
+            reason = str(matching_block.get("reason") or "Broker reconciliation has not cleared this symbol")
+            if matching_block.get("block_all_orders"):
+                return False, reason
+            if self._order_increases_risk(order, accountant):
+                return False, reason + ". New risk is blocked until broker/local state reconciles."
+            return True, ""
+
+        if guard.get("global_block_new_risk") and self._order_increases_risk(order, accountant):
+            reason = str(
+                guard.get("global_reason")
+                or "Broker reconciliation is unavailable or incomplete"
+            )
+            return False, reason + ". New risk is blocked; reductions remain allowed."
+
+        return True, ""
+
     def _loss_review_allows_order(self, order: Order, accountant) -> tuple[bool, str]:
         restriction = self._ns.get("loss_review_restriction") or {}
         if not restriction:
@@ -671,6 +1981,281 @@ class PodRuntime:
             return True, ""
         reason = restriction.get("reason") or "Pod is in reduce-only loss-review mode"
         return False, f"{reason}. New risk-increasing orders are blocked; reductions remain allowed."
+
+    def _evidence_guard_allows_order(
+        self,
+        *,
+        order: Order,
+        accountant,
+        trade_reasoning: str,
+        thesis_review: dict | None,
+    ) -> tuple[bool, str]:
+        """Enforce evidence/thesis review controls on risk-increasing orders."""
+        guard = self._ns.get("evidence_trade_guard") or {}
+        if not isinstance(guard, dict):
+            return True, ""
+
+        blocked_symbols = guard.get("blocked_symbols") or {}
+        if not isinstance(blocked_symbols, dict) or not blocked_symbols:
+            return True, ""
+
+        aliases = self._order_symbol_aliases(order.symbol)
+        matching_block = None
+        for symbol, block in blocked_symbols.items():
+            if aliases & self._order_symbol_aliases(symbol):
+                matching_block = block if isinstance(block, dict) else {"reason": str(block)}
+                break
+        if not matching_block:
+            return True, ""
+
+        if matching_block.get("block_all_orders"):
+            return False, str(matching_block.get("reason") or "Evidence review guard blocked this symbol")
+
+        if not self._order_increases_risk(order, accountant):
+            return True, ""
+
+        status = str(matching_block.get("status") or "REVIEW").upper()
+        reason = str(matching_block.get("reason") or "Evidence/thesis review is required")
+
+        if status == "URGENT" or matching_block.get("mode") == "reduce_only":
+            return (
+                False,
+                reason + ". Symbol is reduce-only until evidence/thesis review clears; reductions remain allowed.",
+            )
+
+        if status == "REVIEW" or matching_block.get("requires_thesis_refresh"):
+            fresh_ok, fresh_reason = expansion_thesis_is_fresh(trade_reasoning, thesis_review)
+            if fresh_ok and matching_block.get("allow_add_after_refresh"):
+                refresh = {
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "pod_id": self._pod_id,
+                    "symbol": order.symbol,
+                    "status": "REFRESHED",
+                    "reason": "PM supplied a fresh expansion thesis against the evidence review guard.",
+                    "guard_reason": reason,
+                }
+                history = list(self._ns.get("evidence_refresh_history") or [])
+                history.insert(0, refresh)
+                self._ns.set("evidence_refresh_history", history[:50])
+                self._ns.set("last_evidence_refresh", refresh)
+                return True, ""
+            return (
+                False,
+                reason
+                + ". Add/scale-up is blocked until the PM supplies a fresh expansion thesis "
+                + "that revalidates the idea against current regime/news/evidence."
+                + (f" {fresh_reason}" if fresh_reason else ""),
+            )
+
+        return True, ""
+
+    @staticmethod
+    def _reasoning_has_tradeable_sections(reasoning: str) -> tuple[int, list[str]]:
+        text = str(reasoning or "").lower()
+        labels = {
+            "thesis": ("thesis:", "thesis -", "long thesis", "short thesis"),
+            "entry": ("entry:", "entry condition", "entry trigger", "buy on", "sell on"),
+            "invalidation": ("invalidation:", "invalidated", "invalidates", "exit if", "wrong if"),
+            "risk": ("risk:", "risk is", "risk:", "downside", "stop"),
+        }
+        missing = []
+        hits = 0
+        for name, needles in labels.items():
+            if any(n in text for n in needles):
+                hits += 1
+            else:
+                missing.append(name)
+        return hits, missing
+
+    @staticmethod
+    def _reasoning_evidence_warnings(reasoning: str) -> list[str]:
+        """Return non-blocking evidence-quality warnings for a proposed entry thesis."""
+        text = str(reasoning or "").lower()
+        warnings: list[str] = []
+
+        evidence_groups = {
+            "facts": ("facts:", "verified facts:", "data facts:"),
+            "assumptions": ("assumptions:", "unproven assumptions:"),
+            "valuation/evidence": ("valuation/evidence:", "valuation:", "evidence:", "relative value:"),
+            "why now": ("why now:", "why-now:", "timing:", "catalyst window:"),
+            "timeframe": ("timeframe:", "holding period:", "hold period:", "max_hold_days"),
+        }
+        evidence_hits = sum(1 for needles in evidence_groups.values() if any(n in text for n in needles))
+        if evidence_hits < 2:
+            warnings.append(
+                "Entry thesis should separate facts from assumptions and include why-now/timeframe evidence."
+            )
+
+        valuation_terms = (
+            "undervalued",
+            "overvalued",
+            "cheap",
+            "expensive",
+            "discount",
+            "mispriced",
+            "underpriced",
+            "relative value",
+        )
+        valuation_evidence = (
+            "valuation",
+            "multiple",
+            "p/e",
+            "earnings",
+            "revenue",
+            "rate differential",
+            "carry",
+            "real yield",
+            "tvl",
+            "fdv",
+            "market cap",
+            "protocol fees",
+            "fee revenue",
+            "stablecoin",
+            "dex volume",
+            "active address",
+            "funding",
+            "open interest",
+            "inventory",
+            "supply",
+            "demand",
+        )
+        if any(t in text for t in valuation_terms) and not any(t in text for t in valuation_evidence):
+            warnings.append(
+                "Valuation or relative-value claim needs a supporting metric or should be framed as an assumption."
+            )
+
+        eth_fee_claim = (
+            ("ethereum" in text or " eth" in text or "eth/" in text)
+            and ("gas fee" in text or "gas fees" in text or "ethereum fee" in text)
+            and any(t in text for t in ("high", "elevated", "expensive", "push", "leaving", "migrat"))
+        )
+        if eth_fee_claim and not any(t in text for t in ("gwei", "base fee", "fee data", "gas data")):
+            warnings.append(
+                "Ethereum gas-fee migration claim needs current gas-fee evidence or should be framed as an assumption."
+            )
+
+        return warnings
+
+    def _pre_trade_quality_gate(
+        self,
+        *,
+        order: Order,
+        matching_trade: dict,
+        pm_decision: dict,
+        thesis_gate_result: dict,
+        trade_reasoning: str,
+    ) -> dict:
+        """Graduated trade-quality gate.
+
+        This is intentionally not a binary "perfect thesis or no trade" rule.
+        It blocks only missing/critical cases and records warnings for decisions
+        that should be improved but are still tradeable.
+        """
+        side = order.side.value.upper()
+        score = float(thesis_gate_result.get("quality_score", 1.0) or 0.0)
+        passed = bool(thesis_gate_result.get("passed", True))
+        issues: list[str] = []
+        warnings: list[str] = []
+        reasoning = str(trade_reasoning or matching_trade.get("reasoning") or pm_decision.get("reasoning") or "").strip()
+        thesis_fields = (
+            matching_trade.get("thesis_fields")
+            if isinstance(matching_trade.get("thesis_fields"), dict)
+            else pm_decision.get("thesis_fields")
+            if isinstance(pm_decision.get("thesis_fields"), dict)
+            else {}
+        )
+
+        if side != "BUY":
+            action = "pass"
+            reason = "Risk-reducing or exit trade; quality gate records context but does not block sells."
+        else:
+            if not reasoning:
+                issues.append("No entry thesis or PM reasoning was captured for the proposed BUY.")
+            elif len(reasoning) < 80:
+                warnings.append("Entry reasoning is brief; trade allowed but PM should provide more detail next cycle.")
+
+            section_hits, missing_sections = self._reasoning_has_tradeable_sections(reasoning)
+            if section_hits < 2:
+                warnings.append(
+                    "Reasoning lacks several tradeable sections: "
+                    + ", ".join(missing_sections)
+                    + "."
+                )
+            warnings.extend(self._reasoning_evidence_warnings(reasoning))
+            required_thesis_fields = [
+                "current_price",
+                "facts_checked",
+                "assumptions",
+                "why_now",
+                "timeframe",
+                "invalidation",
+                "stop_take_profit_logic",
+            ]
+            missing_structured = [
+                field for field in required_thesis_fields
+                if not thesis_fields.get(field)
+            ]
+            if missing_structured:
+                warnings.append(
+                    "Structured thesis fields missing: "
+                    + ", ".join(missing_structured)
+                    + "."
+                )
+            catalyst_ids = matching_trade.get("catalyst_ids") or pm_decision.get("catalyst_ids") or []
+            catalyst_reasoning = matching_trade.get("catalyst_reasoning") or pm_decision.get("catalyst_reasoning") or ""
+            if not catalyst_ids and not catalyst_reasoning:
+                warnings.append("BUY thesis should link to a catalyst or explicitly say why it is not catalyst-driven.")
+
+            conviction = float(getattr(order, "conviction", 0.5) or 0.0)
+            if conviction == 0.5:
+                warnings.append("Conviction is still the neutral default 0.50.")
+            elif conviction < 0.15:
+                issues.append(f"Conviction is too low for a new BUY ({conviction:.2f}).")
+
+            if not passed:
+                feedback = str(thesis_gate_result.get("feedback") or "").strip()
+                if score < 0.35:
+                    issues.append(
+                        "Thesis verifier score is critically low "
+                        f"({score:.2f}). {feedback}".strip()
+                    )
+                else:
+                    warnings.append(
+                        "Thesis verifier requested improvement "
+                        f"(score={score:.2f}). {feedback}".strip()
+                    )
+
+            if issues:
+                action = "block"
+                reason = " ".join(issues)
+            elif warnings:
+                action = "warn"
+                reason = " ".join(warnings)
+            else:
+                action = "pass"
+                reason = "Pre-trade quality checks passed."
+
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pod_id": self._pod_id,
+            "symbol": order.symbol,
+            "side": side,
+            "action": action,
+            "status": action.upper(),
+            "quality_score": round(score, 3),
+            "thesis_passed": passed,
+            "reason": reason,
+            "issues": issues,
+            "warnings": warnings,
+            "thesis_fields": thesis_fields,
+            "llm": (pm_decision or {}).get("llm", {}),
+        }
+
+    def _record_quality_gate_result(self, gate: dict) -> None:
+        self._ns.set("last_quality_gate", gate)
+        results = list(self._ns.get("quality_gate_history") or [])
+        results.insert(0, dict(gate))
+        self._ns.set("quality_gate_history", results[:50])
 
     def _pre_trade_data_quality(self, order: Order, accountant, ctx: dict) -> dict:
         """Block new risk-increasing trades when market data is missing or stale."""
@@ -733,6 +2318,253 @@ class PodRuntime:
         result["passed"] = not issues
         return result
 
+    def _build_trade_evidence_packet(
+        self,
+        *,
+        order: Order,
+        matching_trade: dict,
+        pm_decision: dict,
+        ctx: dict,
+        accountant,
+        trade_reasoning: str,
+        thesis_gate_result: dict,
+        quality_gate: dict,
+        data_quality: dict,
+        thesis_review: dict,
+        entry_macro_regime: str,
+    ) -> dict:
+        """Build a compact audit packet for the decision that led to a fill."""
+        features = ctx.get("features") or {}
+        regime = features.get("regime") if isinstance(features.get("regime"), dict) else {}
+        current_pos = None
+        try:
+            current_pos = accountant.current_positions.get(order.symbol) if accountant else None
+        except Exception:
+            current_pos = None
+
+        sizing_context = ctx.get("sizing_context") or self._ns.get("sizing_context") or {}
+        broker_guard = self._ns.get("broker_trade_guard") or {}
+        loss_review = self._ns.get("loss_review_restriction") or {}
+        execution_cooldown = self._ns.get("execution_cooldown") or {}
+        evidence_guard = self._ns.get("evidence_trade_guard") or {}
+        committee_reviews = self._ns.get("committee_reviews_by_symbol") or {}
+        committee_review = {}
+        if isinstance(committee_reviews, dict):
+            committee_review = committee_reviews.get(order.symbol.upper()) or {}
+        portfolio_reviews = self._ns.get("portfolio_construction_reviews_by_symbol") or {}
+        portfolio_construction_review = {}
+        if isinstance(portfolio_reviews, dict):
+            portfolio_construction_review = portfolio_reviews.get(order.symbol.upper()) or {}
+        catalyst_ids = (
+            matching_trade.get("catalyst_ids")
+            or pm_decision.get("catalyst_ids")
+            or []
+        )
+        catalyst_ids = [str(x) for x in catalyst_ids] if isinstance(catalyst_ids, list) else []
+        available_catalysts = (
+            ctx.get("foresight_events")
+            or (features.get("foresight_events") if isinstance(features, dict) else [])
+            or pm_decision.get("foresight_events")
+            or []
+        )
+        catalyst_refs = []
+        for event in (available_catalysts if isinstance(available_catalysts, list) else []):
+            if not isinstance(event, dict):
+                continue
+            if catalyst_ids and event.get("event_id") not in catalyst_ids:
+                continue
+            catalyst_refs.append({
+                "event_id": event.get("event_id"),
+                "title": event.get("title"),
+                "summary": event.get("summary"),
+                "direction": event.get("direction"),
+                "impact_score": event.get("impact_score"),
+                "confidence": event.get("confidence"),
+                "source_refs": event.get("source_refs", []),
+            })
+            if len(catalyst_refs) >= 6:
+                break
+        evidence_blocks = evidence_guard.get("blocked_symbols", {}) if isinstance(evidence_guard, dict) else {}
+        evidence_block = None
+        for _symbol, _block in (evidence_blocks.items() if isinstance(evidence_blocks, dict) else []):
+            if self._order_symbol_aliases(order.symbol) & self._order_symbol_aliases(_symbol):
+                evidence_block = _block if isinstance(_block, dict) else {"reason": str(_block)}
+                break
+
+        checks = [
+            {
+                "name": "thesis_verifier",
+                "status": "PASS" if thesis_gate_result.get("passed", True) else "WARN",
+                "score": thesis_gate_result.get("quality_score"),
+                "detail": thesis_gate_result.get("feedback", ""),
+            },
+            {
+                "name": "pre_trade_quality",
+                "status": str(quality_gate.get("status") or quality_gate.get("action") or "PASS").upper(),
+                "score": quality_gate.get("quality_score"),
+                "detail": quality_gate.get("reason", ""),
+                "warnings": list(quality_gate.get("warnings") or []),
+                "issues": list(quality_gate.get("issues") or []),
+            },
+            {
+                "name": "market_data",
+                "status": "PASS" if data_quality.get("passed", False) else "BLOCK",
+                "detail": "; ".join(data_quality.get("issues") or []) or "Market data freshness check passed.",
+                "price": data_quality.get("price"),
+                "source": data_quality.get("price_source", ""),
+                "price_age_seconds": data_quality.get("price_age_seconds"),
+            },
+            {
+                "name": "thesis_lifecycle",
+                "status": str(thesis_review.get("status") or "valid").upper(),
+                "score": thesis_review.get("score"),
+                "detail": "; ".join(thesis_review.get("issues") or []) or "Open thesis lifecycle check recorded.",
+                "block_adds": bool(thesis_review.get("block_adds", False)),
+            },
+            {
+                "name": "broker_reconciliation",
+                "status": str(broker_guard.get("status") or "NOT_CHECKED").upper(),
+                "detail": broker_guard.get("global_reason") or broker_guard.get("reason", ""),
+            },
+            {
+                "name": "loss_review",
+                "status": "REDUCE_ONLY" if loss_review.get("block_new_risk") or loss_review.get("mode") == "reduce_only" else "PASS",
+                "detail": loss_review.get("reason", ""),
+            },
+            {
+                "name": "execution_cooldown",
+                "status": "ACTIVE" if execution_cooldown.get("active") else "PASS",
+                "detail": execution_cooldown.get("reason", ""),
+            },
+            {
+                "name": "evidence_review",
+                "status": str((evidence_block or {}).get("status") or evidence_guard.get("status") or "OK").upper(),
+                "detail": (evidence_block or {}).get("reason", ""),
+                "requires_thesis_refresh": bool((evidence_block or {}).get("requires_thesis_refresh", False)),
+            },
+            {
+                "name": "committee_review",
+                "status": str(committee_review.get("decision") or "NOT_REQUIRED").upper(),
+                "detail": committee_review.get("reason", ""),
+                "confidence": committee_review.get("confidence"),
+            },
+            {
+                "name": "portfolio_construction",
+                "status": str(portfolio_construction_review.get("action") or "NOT_RUN").upper(),
+                "detail": portfolio_construction_review.get("reason", ""),
+                "confidence": portfolio_construction_review.get("confidence"),
+            },
+        ]
+
+        missing_evidence: list[str] = []
+        missing_evidence.extend(str(x) for x in quality_gate.get("warnings") or [])
+        missing_evidence.extend(str(x) for x in quality_gate.get("issues") or [])
+        missing_evidence.extend(str(x) for x in data_quality.get("issues") or [])
+        if not thesis_gate_result.get("passed", True) and thesis_gate_result.get("feedback"):
+            missing_evidence.append(str(thesis_gate_result.get("feedback")))
+        missing_evidence.extend(str(x) for x in thesis_review.get("issues") or [])
+
+        packet = {
+            "version": 1,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "pod_id": self._pod_id,
+            "symbol": order.symbol,
+            "trade": {
+                "side": order.side.value.upper(),
+                "qty": order.quantity,
+                "conviction": order.conviction,
+                "strategy_tag": order.strategy_tag,
+                "entry_thesis": trade_reasoning,
+                "stop_loss_pct": matching_trade.get("stop_loss_pct"),
+                "take_profit_pct": matching_trade.get("take_profit_pct"),
+                "take_profit_levels": matching_trade.get("take_profit_levels", []),
+                "exit_when": matching_trade.get("exit_when", ""),
+                "max_hold_days": matching_trade.get("max_hold_days", 0),
+            },
+            "market_context": {
+                "price": data_quality.get("price"),
+                "price_source": data_quality.get("price_source", ""),
+                "price_updated_at": data_quality.get("price_updated_at", ""),
+                "price_age_seconds": data_quality.get("price_age_seconds"),
+                "macro_regime": entry_macro_regime or regime.get("label") or regime.get("regime", ""),
+                "macro_outlook": (
+                    features.get("macro_outlook")
+                    or features.get("liquidity_outlook")
+                    or features.get("outlook")
+                    or ""
+                ),
+                "macro_score": features.get("macro_score") or regime.get("macro_score"),
+                "fred": self._compact_metric_dict(features.get("fred_indicators") or {}, 12),
+            },
+            "position_context": {
+                "existing_qty": getattr(current_pos, "qty", 0.0) if current_pos is not None else 0.0,
+                "existing_notional": getattr(current_pos, "notional", 0.0) if current_pos is not None else 0.0,
+                "nav": sizing_context.get("nav"),
+                "cash": sizing_context.get("cash"),
+                "invested": sizing_context.get("invested"),
+            },
+            "evidence": {
+                "pm_action_summary": pm_decision.get("action_summary", ""),
+                "pm_llm": pm_decision.get("llm", {}),
+                "signal_snapshot": pm_decision.get("signal_snapshot", {}),
+                "top_news": self._compact_evidence_items(features.get("news_headlines") or [], 5),
+                "top_prediction_markets": self._compact_evidence_items(features.get("polymarket_predictions") or [], 5),
+                "catalyst_ids": catalyst_ids,
+                "catalyst_reasoning": matching_trade.get("catalyst_reasoning") or pm_decision.get("catalyst_reasoning", ""),
+                "catalysts": catalyst_refs,
+                "specialist_briefs": ctx.get("specialist_briefs") or features.get("specialist_briefs") or self._ns.get("specialist_briefs") or [],
+                "committee_review": committee_review,
+                "portfolio_construction_review": portfolio_construction_review,
+                "thesis_fields": matching_trade.get("thesis_fields") or pm_decision.get("thesis_fields") or {},
+            },
+            "checks": checks,
+            "missing_evidence": missing_evidence[:12],
+            "review_triggers": list(thesis_review.get("monitors") or []),
+            "invalidation": matching_trade.get("exit_when", "") or "; ".join(thesis_review.get("issues") or []),
+        }
+        return self._json_safe(packet)
+
+    @staticmethod
+    def _compact_metric_dict(values: dict, limit: int = 10) -> dict:
+        if not isinstance(values, dict):
+            return {}
+        out = {}
+        for key, value in list(values.items())[:limit]:
+            if isinstance(value, (int, float, str, bool)) or value is None:
+                out[str(key)] = value
+            elif isinstance(value, dict):
+                out[str(key)] = {
+                    str(k): v for k, v in list(value.items())[:4]
+                    if isinstance(v, (int, float, str, bool)) or v is None
+                }
+        return out
+
+    @staticmethod
+    def _compact_evidence_items(items, limit: int = 5) -> list:
+        if not isinstance(items, list):
+            return []
+        out = []
+        for item in items[:limit]:
+            if isinstance(item, str):
+                out.append({"text": item[:280]})
+            elif isinstance(item, dict):
+                out.append({
+                    "title": str(item.get("title") or item.get("headline") or item.get("question") or item.get("market") or "")[:220],
+                    "source": str(item.get("source") or item.get("url") or "")[:160],
+                    "sentiment": item.get("sentiment"),
+                    "relevancy": item.get("relevancy"),
+                    "impact": item.get("impact"),
+                    "probability": item.get("probability") or item.get("implied_prob"),
+                })
+        return out
+
+    @staticmethod
+    def _json_safe(value):
+        try:
+            return json.loads(json.dumps(value, default=str))
+        except Exception:
+            return {}
+
     def _record_data_quality_failure(self, failure: dict) -> None:
         failures = list(self._ns.get("data_quality_failures") or [])
         failures.insert(0, dict(failure))
@@ -755,6 +2587,60 @@ class PodRuntime:
         blocks = list(self._ns.get("trade_blocks") or [])
         blocks.insert(0, block)
         self._ns.set("trade_blocks", blocks[:50])
+        managed = self._managed_runtime()
+        if managed:
+            try:
+                for snapshot_id in self._ns.get("last_decision_snapshot_ids") or []:
+                    snap = managed.decisions.get_snapshot(str(snapshot_id))
+                    if not snap:
+                        continue
+                    if str(snap.get("symbol") or "").upper() != order.symbol.upper():
+                        continue
+                    if str(snap.get("side") or "").upper() != order.side.value.upper():
+                        continue
+                    managed.decisions.update_snapshot_status(
+                        str(snapshot_id),
+                        f"blocked:{stage}",
+                        {"stage": stage, "reason": str(reason or "")[:1000]},
+                    )
+            except Exception as exc:
+                logger.debug("[%s] decision snapshot block update failed: %s", self._pod_id, exc)
+
+    def _update_decision_snapshot_order_status(self, order: Order, order_update: dict) -> None:
+        managed = self._managed_runtime()
+        if not managed or not isinstance(order_update, dict):
+            return
+        raw_status = str(order_update.get("status") or order_update.get("order_status") or "").upper()
+        if not raw_status:
+            raw_status = "SUBMITTED"
+        status = raw_status.lower()
+        if "REJECT" in raw_status:
+            status = "rejected"
+        elif "FILL" in raw_status:
+            status = "filled"
+        elif "PEND" in raw_status:
+            status = "pending"
+        try:
+            for snapshot_id in self._ns.get("last_decision_snapshot_ids") or []:
+                snap = managed.decisions.get_snapshot(str(snapshot_id))
+                if not snap:
+                    continue
+                if str(snap.get("symbol") or "").upper() != order.symbol.upper():
+                    continue
+                if str(snap.get("side") or "").upper() != order.side.value.upper():
+                    continue
+                managed.decisions.update_snapshot_status(
+                    str(snapshot_id),
+                    status,
+                    {
+                        "order_update": {
+                            k: v for k, v in order_update.items()
+                            if k not in {"raw_request", "raw_response", "prompt", "api_key"}
+                        }
+                    },
+                )
+        except Exception as exc:
+            logger.debug("[%s] decision snapshot execution update failed: %s", self._pod_id, exc)
 
     def _log_pm_reasoning(self, pm_decision: dict) -> None:
         """Log PM reasoning for all held positions after each PM decision cycle."""
@@ -1087,6 +2973,7 @@ class PodRuntime:
                     thesis_status=snapshot.thesis_status,
                     thesis_issues=snapshot.thesis_issues,
                     thesis_review=snapshot.thesis_review,
+                    evidence_packet=snapshot.evidence_packet,
                     price_source=snapshot.price_source,
                     price_updated_at=snapshot.price_updated_at,
                     price_stale=snapshot.price_stale,
@@ -1150,6 +3037,11 @@ class PodRuntime:
         invested = total_notional
         cash_value = accountant.nav - invested
 
+        risk_mode = factor_report.get("risk_mode", "normal") if factor_report else "normal"
+        evidence_guard = self._ns.get("evidence_trade_guard") or {}
+        if isinstance(evidence_guard, dict) and evidence_guard.get("blocked_symbols"):
+            risk_mode = "evidence_review"
+
         # Build risk metrics
         risk_metrics = PodRiskMetrics(
             pod_id=self._pod_id,
@@ -1166,7 +3058,7 @@ class PodRuntime:
             net_leverage=net_leverage,
             var_95_1d=var_95,
             es_95_1d=var_95 * 1.25,  # Expected shortfall approximation
-            risk_mode=factor_report.get("risk_mode", "normal") if factor_report else "normal",
+            risk_mode=risk_mode,
             factor_exposures=factor_report,
             factor_breaches=list(factor_report.get("breaches", [])) if factor_report else [],
         )

@@ -63,6 +63,32 @@ def test_record_fill_direct_prefers_explicit_entry_thesis():
     assert acct._entry_metadata["SPY"]["reasoning"] == "raw PM response"
 
 
+def test_record_fill_direct_persists_trade_evidence_packet():
+    acct = PortfolioAccountant(pod_id="crypto", initial_nav=1_000.0)
+    packet = {
+        "version": 1,
+        "symbol": "SOL/USD",
+        "trade": {"side": "BUY", "qty": 1.0, "entry_thesis": "THESIS: verified catch-up trade"},
+        "checks": [{"name": "market_data", "status": "PASS", "detail": "fresh price"}],
+    }
+
+    acct.record_fill_direct(
+        "order-1",
+        "SOL/USD",
+        qty=1.0,
+        fill_price=90.0,
+        reasoning="THESIS: verified catch-up trade",
+        evidence_packet=packet,
+    )
+
+    snap = acct.current_positions["SOL/USD"]
+    state = acct.to_state_dict()
+
+    assert snap.evidence_packet["trade"]["entry_thesis"] == "THESIS: verified catch-up trade"
+    assert acct._fill_log[0]["evidence_packet"]["checks"][0]["name"] == "market_data"
+    assert state["entry_metadata"]["SOL/USD"]["evidence_packet"]["symbol"] == "SOL/USD"
+
+
 def test_load_entry_state_backfills_thesis_from_metadata_reasoning():
     acct = PortfolioAccountant(pod_id="fx", initial_nav=1_000.0)
 
@@ -82,11 +108,15 @@ def test_load_entry_state_backfills_thesis_from_metadata_reasoning():
 class _Namespace:
     def __init__(self, accountant):
         self._accountant = accountant
+        self._data = {}
 
     def get(self, key):
         if key == "accountant":
             return self._accountant
-        return None
+        return self._data.get(key)
+
+    def set(self, key, value):
+        self._data[key] = value
 
 
 def test_positions_api_falls_back_to_metadata_reasoning_for_thesis():
@@ -100,6 +130,7 @@ def test_positions_api_falls_back_to_metadata_reasoning_for_thesis():
         "thesis_status": "challenged",
         "thesis_issues": ["Macro regime changed"],
         "thesis_review": {"status": "challenged", "issues": ["Macro regime changed"], "block_adds": True},
+        "evidence_packet": {"symbol": "SLV", "checks": [{"name": "thesis_lifecycle", "status": "WATCH"}]},
     }
     manager._pod_runtimes = {"commodities": SimpleNamespace(_ns=_Namespace(acct))}
 
@@ -111,6 +142,69 @@ def test_positions_api_falls_back_to_metadata_reasoning_for_thesis():
     assert rows[0]["entry_notional"] == 25.0
     assert rows[0]["current_notional"] == rows[0]["notional"]
     assert rows[0]["notional_basis"] == "current_price"
+    assert rows[0]["evidence_packet"]["symbol"] == "SLV"
+
+
+def test_evidence_review_queue_flags_missing_and_weak_evidence():
+    manager = SessionManager.__new__(SessionManager)
+    acct = PortfolioAccountant(pod_id="crypto", initial_nav=1_000.0)
+    acct.record_fill_direct("order-1", "SOL/USD", qty=1.0, fill_price=90.0)
+    acct.record_fill_direct(
+        "order-2",
+        "ETH/USD",
+        qty=0.1,
+        fill_price=2300.0,
+        evidence_packet={
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "trade": {"side": "BUY", "qty": 0.1, "entry_thesis": "THESIS: ETH beta"},
+            "market_context": {"price_source": "CoinMarketCap", "price_age_seconds": 20},
+            "checks": [{"name": "pre_trade_quality", "status": "WARN", "detail": "needs valuation evidence"}],
+            "missing_evidence": ["Needs valuation evidence"],
+            "evidence": {"top_news": [], "top_prediction_markets": []},
+        },
+    )
+    manager._pod_runtimes = {"crypto": SimpleNamespace(_ns=_Namespace(acct))}
+
+    queue = manager.get_evidence_review_queue()
+    rows = {row["symbol"]: row for row in queue["queue"]}
+
+    assert queue["status"] == "CHECK"
+    assert rows["SOL/USD"]["status"] == "URGENT"
+    assert "No evidence packet" in rows["SOL/USD"]["reasons"][0]
+    assert rows["ETH/USD"]["status"] in {"WATCH", "REVIEW"}
+    assert "Needs valuation evidence" in rows["ETH/USD"]["missing_evidence"]
+
+
+def test_evidence_trade_guard_restricts_urgent_and_review_symbols():
+    manager = SessionManager.__new__(SessionManager)
+    acct = PortfolioAccountant(pod_id="crypto", initial_nav=1_000.0)
+    acct.record_fill_direct("order-1", "SOL/USD", qty=1.0, fill_price=90.0)
+    acct.record_fill_direct(
+        "order-2",
+        "ETH/USD",
+        qty=0.1,
+        fill_price=2300.0,
+        evidence_packet={
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "trade": {"side": "BUY", "qty": 0.1, "entry_thesis": "THESIS: ETH beta"},
+            "market_context": {"price_source": "CoinMarketCap", "price_age_seconds": 20},
+            "checks": [{"name": "pre_trade_quality", "status": "WARN", "detail": "needs valuation evidence"}],
+            "missing_evidence": ["Needs valuation evidence"],
+            "evidence": {"top_news": [], "top_prediction_markets": []},
+        },
+    )
+    ns = _Namespace(acct)
+    manager._pod_runtimes = {"crypto": SimpleNamespace(_ns=ns)}
+
+    review = manager.get_evidence_review_queue()
+    guard = manager._apply_evidence_trade_guard(review)
+
+    pod_guard = ns.get("evidence_trade_guard")
+    assert guard["status"] == "CHECK"
+    assert pod_guard["blocked_symbols"]["SOL/USD"]["status"] == "URGENT"
+    assert pod_guard["blocked_symbols"]["SOL/USD"]["mode"] == "reduce_only"
+    assert pod_guard["blocked_count"] >= 1
+    assert "Evidence/thesis review queue" in ns.get("evidence_review_text")
 
 
 def test_position_detail_backfills_all_buy_fill_theses_from_memory():

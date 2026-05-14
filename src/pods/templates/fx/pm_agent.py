@@ -12,9 +12,15 @@ from src.core.thesis_quality import (
     TRADEABLE_ENTRY_THESIS_STANDARD,
     tradeable_entry_thesis_instruction,
 )
-from src.core.llm import has_llm_key, llm_chat, extract_json
+from src.core.llm import has_llm_key, llm_chat, extract_json, get_last_llm_call
 from src.pods.base.agent import BasePodAgent
 from src.pods.templates.execution_common import execution_feedback_block
+from src.pods.templates.pm_context import (
+    catalyst_events_from_context,
+    format_pm_research_sections,
+    normalize_pm_context_fields,
+    pm_context_output_instruction,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,10 +82,11 @@ If you need information not provided (e.g. a central bank decision date, policy 
 include "search_queries": ["query1", "query2"] (max 2). Results will be provided before your final decision.
 
 Output JSON:
-{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "conviction": 0.0-1.0, "reasoning": "THESIS: ... | EDGE: ... | RISK: ...", "stop_loss_pct": 0.05, "take_profit_pct": 0.15, "exit_when": "", "max_hold_days": 0}], "read_articles": ["url1"], "search_queries": ["query1"]}
+{"trades": [{"action": "BUY"|"SELL", "symbol": "TICKER", "qty": N, "conviction": 0.0-1.0, "reasoning": "FACTS: ... | ASSUMPTIONS: ... | THESIS: ... | VALUATION/EVIDENCE: ... | WHY NOW: ... | INVALIDATION: ... | RISK: ...", "stop_loss_pct": 0.05, "take_profit_pct": 0.15, "exit_when": "", "max_hold_days": 0}], "read_articles": ["url1"], "search_queries": ["query1"]}
 conviction: 0.0 = no confidence, 0.5 = moderate, 0.8+ = high conviction, 1.0 = maximum.
 stop_loss_pct: auto-exit if loss exceeds this % (default 5%). Use tighter stops (3%) in volatile setups.
-take_profit_pct: auto-exit if gain exceeds this % (default 15%).
+take_profit_pct: single fallback auto-exit if gain exceeds this % (default 15%).
+take_profit_levels: optional scale-out plan, e.g. [{"trigger_pct": 0.08, "close_pct": 0.25}, {"trigger_pct": 0.15, "close_pct": 0.35}]. Use only when the thesis has a path for partial de-risking; fractions are decimals and should not sum above 1.0.
 exit_when: free-text condition for exit (e.g. "exit if DXY breaks 105").
 max_hold_days: optional. Set to a specific number of days if the thesis is time-bound (e.g. central bank decision in 10 days -> max_hold_days: 15). Set to 0 (default) for thesis-driven holds with no fixed time limit. Only set a limit when the trade thesis has a clear expiration.
 Only trades with conviction >= 0.7 should be above 10% of NAV.
@@ -329,6 +336,8 @@ class FXPMAgent(BasePodAgent):
         if firm_memo:
             sections.append(f"\n## Firm Intelligence\n{firm_memo}")
 
+        sections.extend(format_pm_research_sections(features, self._ns))
+
         sections.append(f"\n## Current Positions\n  {positions}")
 
         user_content = "\n".join(sections)
@@ -338,6 +347,7 @@ class FXPMAgent(BasePodAgent):
             if memory_block:
                 user_content = memory_block + "\n\n" + user_content
         user_content += '\n\nBased on ALL the above data (including your track record if shown), propose 0-3 FX ETF trades or HOLD. Learn from past wins/losses.\nOutput JSON: {"trades": [...], "read_articles": ["url1"]} (omit read_articles if not needed)'
+        user_content += pm_context_output_instruction()
         user_content += tradeable_entry_thesis_instruction("FX")
 
         aging_alerts = self._ns.get("aging_alerts") or []
@@ -415,6 +425,7 @@ class FXPMAgent(BasePodAgent):
                 max_tokens=2400,
                 task="pm_decision",
             )
+            llm_meta = get_last_llm_call("pm_decision")
             decision = extract_json(raw)
 
             if self._session_logger:
@@ -434,6 +445,7 @@ class FXPMAgent(BasePodAgent):
                     read_urls, user_content, system_prompt, decision
                 )
                 response_text = raw_second or raw
+                llm_meta = get_last_llm_call("article_deep_dive") or llm_meta
             else:
                 response_text = raw
 
@@ -449,11 +461,15 @@ class FXPMAgent(BasePodAgent):
                     continue
                 try:
                     TradeProposal(action=action, symbol=str(t.get("symbol", "")),
-                                  qty=float(t.get("qty", 0)), reasoning=t.get("reasoning", ""))
+                                  qty=float(t.get("qty", 0)), reasoning=t.get("reasoning", ""),
+                                  stop_loss_pct=t.get("stop_loss_pct", 0.05),
+                                  take_profit_pct=t.get("take_profit_pct", 0.15),
+                                  take_profit_levels=t.get("take_profit_levels") or [])
                     validated_trades.append(t)
                 except Exception as ve:
                     logger.warning("[fx.pm] Invalid trade proposal skipped: %s — %s", t, ve)
             parsed_trades = validated_trades
+            pm_context_fields = normalize_pm_context_fields(decision, parsed_trades, features)
 
             signal_snap = {}
             fred = features.get("fred_indicators", {})
@@ -474,6 +490,9 @@ class FXPMAgent(BasePodAgent):
                 "reasoning": response_text or "",
                 "action_summary": action_summary[:500],
                 "signal_snapshot": signal_snap,
+                "llm": llm_meta,
+                "foresight_events": catalyst_events_from_context(features, self._ns),
+                **pm_context_fields,
             })
 
             self._decision_history.append({

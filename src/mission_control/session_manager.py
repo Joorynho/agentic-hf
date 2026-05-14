@@ -28,6 +28,7 @@ from src.core.position_monitor import PositionMonitor
 from src.core.position_aging import check_aging
 from src.core.concentration import aggregate_exposure
 from src.core.loss_review import build_loss_review, format_loss_review_for_prompt
+from src.core.managed_runtime import ManagedRuntime
 from src.core.bus.audit_log import AuditLog
 from src.core.bus.event_bus import EventBus
 from src.core.state.nav_store import NavStore
@@ -37,6 +38,7 @@ from src.data.adapters.market_tracker import MarketTracker
 from src.data.adapters.polymarket_adapter import PolymarketAdapter
 from src.data.adapters.rss_adapter import RssAdapter
 from src.data.adapters.x_adapter import XAdapter
+from src.data.services.foresight_service import ForesightService
 from src.data.services.research_ingestion import ResearchIngestionService
 from src.data.adapters.price_service import (
     PriceService,
@@ -159,6 +161,7 @@ class SessionManager:
             enable_news_adapters: Create FRED/GDELT/RSS adapters (default False)
         """
         self._enable_news_adapters = enable_news_adapters
+        self._explicit_session_dir = session_dir
         self._alpaca = alpaca_adapter or AlpacaAdapter()
         # Use file-based DuckDB if session_dir is provided for persistence across restarts
         if audit_log:
@@ -194,6 +197,9 @@ class SessionManager:
         self._session_active = False
         self._capital_per_pod = 0.0
         self._iteration = 0
+        self._session_stage = "idle"
+        self._session_stage_detail = "Idle"
+        self._session_stage_updated_at: str | None = None
         self._restartable = False
         self._stop_in_progress = False
 
@@ -227,6 +233,11 @@ class SessionManager:
         self._loss_reviews: dict[str, dict] = {}
         self._loss_review_history: list[dict] = []
         self._loss_review_last_signature: dict[str, str] = {}
+        self._last_evidence_trade_guard: dict | None = None
+        self._evidence_guard_last_signature: dict[str, str] = {}
+        self._foresight: ForesightService | None = None
+        self._managed_runtime: ManagedRuntime | None = None
+        self._managed_runtime_path: str | None = None
 
         logger.info("[session_manager] Initialized with DataProvider and governance tracking")
 
@@ -234,6 +245,190 @@ class SessionManager:
         """Inject an externally-created FastAPI app so _update_web_state can update it."""
         self._web_app = app
         self._external_web_app = True
+        app.state.session_stage = self._session_stage
+        app.state.session_stage_detail = self._session_stage_detail
+        app.state.session_stage_updated_at = self._session_stage_updated_at
+
+    def _session_stage_payload(self) -> dict[str, str | None]:
+        return {
+            "stage": self._session_stage,
+            "stage_detail": self._session_stage_detail,
+            "stage_updated_at": self._session_stage_updated_at,
+        }
+
+    async def _set_session_stage(self, stage: str, detail: str | None = None) -> None:
+        """Expose the current long-running loop phase to the web dashboard."""
+        self._session_stage = stage
+        self._session_stage_detail = detail or stage.replace("_", " ").title()
+        self._session_stage_updated_at = datetime.now(timezone.utc).isoformat()
+
+        if self._web_app:
+            try:
+                self._web_app.state.session_stage = self._session_stage
+                self._web_app.state.session_stage_detail = self._session_stage_detail
+                self._web_app.state.session_stage_updated_at = self._session_stage_updated_at
+                listener = getattr(self._web_app.state, "listener", None)
+                if listener is not None:
+                    await listener.manager.broadcast({
+                        "type": "session_status",
+                        "data": {
+                            "active": self._session_active,
+                            "iteration": self._iteration,
+                            **self._session_stage_payload(),
+                        },
+                    })
+            except Exception:
+                logger.debug("[session_manager] Failed to broadcast session stage", exc_info=True)
+
+    def _managed_state_dir(self) -> Path:
+        state_dir = Path(self._explicit_session_dir) if self._explicit_session_dir else self._MEMORY_DIR
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir
+
+    def _ensure_managed_runtime(self) -> ManagedRuntime:
+        if self._managed_runtime is None:
+            db_path = str(self._managed_state_dir() / "managed_runtime.duckdb")
+            self._managed_runtime_path = db_path
+            self._managed_runtime = ManagedRuntime(db_path)
+        return self._managed_runtime
+
+    def _managed_start_run(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str,
+        task: str = "",
+        pod_id: str | None = None,
+        trigger: str = "",
+        parent_run_id: str | None = None,
+        input_payload=None,
+    ) -> str:
+        try:
+            return self._ensure_managed_runtime().agent_runs.start_run(
+                agent_id=agent_id,
+                agent_type=agent_type,
+                pod_id=pod_id,
+                task=task,
+                trigger=trigger,
+                parent_run_id=parent_run_id,
+                input_payload=input_payload,
+            )
+        except Exception as exc:
+            logger.debug("[managed] start_run failed for %s: %s", agent_id, exc)
+            return ""
+
+    def _managed_complete_run(self, run_id: str, output_summary=None, *, status: str = "success", artifact_refs: list[str] | None = None) -> None:
+        if not run_id:
+            return
+        try:
+            self._ensure_managed_runtime().agent_runs.complete_run(
+                run_id,
+                status=status,
+                output_summary=output_summary,
+                artifact_refs=artifact_refs,
+            )
+        except Exception as exc:
+            logger.debug("[managed] complete_run failed for %s: %s", run_id, exc)
+
+    def _managed_fail_run(self, run_id: str, error, *, status: str = "failed") -> None:
+        if not run_id:
+            return
+        try:
+            self._ensure_managed_runtime().agent_runs.fail_run(run_id, error, status=status)
+        except Exception as exc:
+            logger.debug("[managed] fail_run failed for %s: %s", run_id, exc)
+
+    def _managed_start_job(self, job_name: str, *, trigger: str = "", agent_type: str = "scheduler_job", input_payload=None) -> str:
+        run_id = self._managed_start_run(
+            agent_id=job_name,
+            agent_type=agent_type,
+            task=job_name,
+            trigger=trigger,
+            input_payload=input_payload,
+        )
+        if not run_id:
+            return ""
+        try:
+            acquired, state = self._ensure_managed_runtime().scheduler.start_job(job_name, trigger=trigger, run_id=run_id)
+            if not acquired:
+                self._managed_fail_run(run_id, f"Skipped overlapping job: {job_name}", status="skipped")
+                return ""
+        except Exception as exc:
+            self._managed_fail_run(run_id, exc)
+            return ""
+        return run_id
+
+    def _managed_complete_job(self, job_name: str, run_id: str, output_summary=None, *, artifact_refs: list[str] | None = None) -> None:
+        if not run_id:
+            return
+        try:
+            self._ensure_managed_runtime().scheduler.complete_job(job_name, status="success")
+        except Exception as exc:
+            logger.debug("[managed] complete_job failed for %s: %s", job_name, exc)
+        self._managed_complete_run(run_id, output_summary, artifact_refs=artifact_refs)
+
+    def _managed_fail_job(self, job_name: str, run_id: str, error) -> None:
+        if not run_id:
+            return
+        try:
+            self._ensure_managed_runtime().scheduler.fail_job(job_name, error)
+        except Exception as exc:
+            logger.debug("[managed] fail_job failed for %s: %s", job_name, exc)
+        self._managed_fail_run(run_id, error)
+
+    def _record_artifact(
+        self,
+        kind: str,
+        *,
+        owner: str = "system",
+        status: str = "fresh",
+        freshness_seconds: float | None = None,
+        source_run_id: str = "",
+        payload_ref: str = "",
+    ) -> str:
+        try:
+            return self._ensure_managed_runtime().artifacts.record(
+                kind=kind,
+                owner=owner,
+                status=status,
+                freshness_seconds=freshness_seconds,
+                source_run_id=source_run_id,
+                payload_ref=payload_ref,
+            )
+        except Exception as exc:
+            logger.debug("[managed] artifact record failed for %s/%s: %s", owner, kind, exc)
+            return ""
+
+    def _record_report(
+        self,
+        *,
+        report_type: str,
+        title: str,
+        summary: str,
+        body_markdown: str = "",
+        pod_id: str = "",
+        symbol: str = "",
+        related_run_ids: list[str] | None = None,
+        related_catalyst_ids: list[str] | None = None,
+        tags: list[str] | None = None,
+        quality_flags: list[str] | None = None,
+    ) -> str:
+        try:
+            return self._ensure_managed_runtime().reports.add_report(
+                report_type=report_type,
+                title=title,
+                summary=summary,
+                body_markdown=body_markdown,
+                pod_id=pod_id,
+                symbol=symbol,
+                related_run_ids=related_run_ids or [],
+                related_catalyst_ids=related_catalyst_ids or [],
+                tags=tags or [],
+                quality_flags=quality_flags or [],
+            )
+        except Exception as exc:
+            logger.debug("[managed] report record failed for %s: %s", report_type, exc)
+            return ""
 
     async def start_live_session(
         self,
@@ -264,17 +459,29 @@ class SessionManager:
             self._loss_reviews = {}
             self._loss_review_history = []
             self._loss_review_last_signature = {}
+            self._last_evidence_trade_guard = None
+            self._evidence_guard_last_signature = {}
 
         self._start_time = datetime.now()
         self._session_start = datetime.now()
         self._MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+        state_dir = Path(self._explicit_session_dir) if self._explicit_session_dir else self._MEMORY_DIR
+        state_dir.mkdir(parents=True, exist_ok=True)
+        if self._managed_runtime:
+            try:
+                self._managed_runtime.close()
+            except Exception:
+                pass
+            self._managed_runtime = None
+        self._managed_runtime_path = str(state_dir / "managed_runtime.duckdb")
+        self._managed_runtime = ManagedRuntime(self._managed_runtime_path)
         if self._nav_store:
             try:
                 self._nav_store.close()
             except Exception:
                 pass
             self._nav_store = None
-        self._nav_store = NavStore(str(self._MEMORY_DIR / "state.db"))
+        self._nav_store = NavStore(str(state_dir / "state.db"))
         try:
             repaired = self._nav_store.repair_collapsed_snapshots()
             if repaired:
@@ -354,6 +561,7 @@ class SessionManager:
 
                 # Expose audit_log to pod namespace so PM agents can persist decisions
                 namespace.set("audit_log", self._audit_log)
+                namespace.set("managed_runtime", self._managed_runtime)
 
                 # Create PortfolioAccountant for this pod
                 accountant = PortfolioAccountant(pod_id=pod_id, initial_nav=capital_per_pod)
@@ -483,8 +691,11 @@ class SessionManager:
                 rss_adapter=getattr(self, "_rss_adapter", None),
                 x_adapter=getattr(self, "_x_adapter", None),
                 interval_seconds=300,
-                feed_store_path=str(self._MEMORY_DIR / "research_feed.duckdb"),
+                feed_store_path=str(state_dir / "research_feed.duckdb"),
             )
+            self._foresight = ForesightService(feed_store=self._research_ingestion.feed_store)
+            for runtime in self._pod_runtimes.values():
+                runtime._ns.set("catalyst_lifecycle_store", self._foresight.feed_store)
             logger.info("[session_manager] ResearchIngestionService created")
 
             # Initialize governance orchestrator with CEO, CIO, CRO agents
@@ -742,6 +953,8 @@ class SessionManager:
                     pod_dicts[pod_id]["x_tweet_count"] = len(all_feed)
                     pod_dicts[pod_id]["news_last_refresh"] = datetime.now(timezone.utc).isoformat()
                     pod_dicts[pod_id]["features"] = ns.get("features") or {}
+                    pod_dicts[pod_id]["foresight_events"] = ns.get("foresight_events") or []
+                    pod_dicts[pod_id]["foresight_text"] = ns.get("foresight_text") or ""
                     pod_dicts[pod_id]["loss_review"] = ns.get("loss_review") or {}
                     pod_dicts[pod_id]["loss_review_restriction"] = ns.get("loss_review_restriction") or {}
 
@@ -788,7 +1001,9 @@ class SessionManager:
 
     async def _refresh_loss_reviews(self) -> None:
         """Evaluate pod-level loss reviews and push restrictions into runtimes."""
+        run_id = self._managed_start_job("loss_review", trigger="iteration", agent_type="loss_reviewer")
         now = datetime.now(timezone.utc)
+        touched: list[str] = []
         for pod_id, runtime in self._pod_runtimes.items():
             acct = runtime._ns.get("accountant")
             if not acct:
@@ -813,6 +1028,7 @@ class SessionManager:
                     review["created_at"] = previous.get("created_at")
 
                 self._loss_reviews[pod_id] = review
+                touched.append(pod_id)
                 runtime._ns.set("loss_review", review)
                 runtime._ns.set("loss_review_restriction", review.get("restriction", {}))
                 runtime._ns.set("loss_review_text", format_loss_review_for_prompt(review))
@@ -867,6 +1083,28 @@ class SessionManager:
                         logger.debug("[session_manager] loss review alert failed for %s: %s", pod_id, e)
             except Exception as e:
                 logger.debug("[session_manager] loss review failed for %s: %s", pod_id, e)
+        artifact_id = self._record_artifact(
+            "loss_review",
+            owner="risk",
+            status="fresh",
+            freshness_seconds=3600,
+            source_run_id=run_id,
+            payload_ref="/api/loss-reviews",
+        )
+        if touched:
+            self._record_report(
+                report_type="loss_review",
+                title=f"Loss review refreshed for {len(touched)} pod(s)",
+                summary=", ".join(touched),
+                body_markdown="\n".join(
+                    f"- `{pid}`: {self._loss_reviews.get(pid, {}).get('status', 'unknown')} "
+                    f"{self._loss_reviews.get(pid, {}).get('trigger_reason', '')}"
+                    for pid in touched
+                ),
+                related_run_ids=[run_id] if run_id else [],
+                tags=["risk", "loss_review"],
+            )
+        self._managed_complete_job("loss_review", run_id, {"pods": touched}, artifact_refs=[artifact_id] if artifact_id else [])
 
     def get_loss_review_report(self) -> dict:
         """Return active and historical pod loss reviews for the dashboard."""
@@ -900,6 +1138,7 @@ class SessionManager:
             interval_seconds,
             governance_freq,
         )
+        await self._set_session_stage("starting", "Starting event loop")
 
         # Start background price ticker (updates prices between iterations)
         ticker_task = asyncio.create_task(self._run_price_ticker())
@@ -911,6 +1150,7 @@ class SessionManager:
         try:
             while self._session_active:
                 self._iteration += 1
+                await self._set_session_stage("iteration_start", f"Iteration {self._iteration}: starting")
                 if self._web_app:
                     try:
                         self._web_app.state.iteration = self._iteration
@@ -918,7 +1158,11 @@ class SessionManager:
                         if listener is not None:
                             await listener.manager.broadcast({
                                 "type": "session_status",
-                                "data": {"active": True, "iteration": self._iteration},
+                                "data": {
+                                    "active": True,
+                                    "iteration": self._iteration,
+                                    **self._session_stage_payload(),
+                                },
                             })
                     except Exception:
                         pass
@@ -933,10 +1177,12 @@ class SessionManager:
                         )
 
                     # 1.5 Daily position review (fires once per calendar day)
+                    await self._set_session_stage("position_review", f"Iteration {self._iteration}: reviewing open theses")
                     await self._maybe_run_position_review()
 
                     # 2. Inject shared research data into each pod namespace before researchers run
                     if hasattr(self, "_research_ingestion") and self._research_ingestion and self._research_ingestion.last_fetch_time:
+                        research_run_id = self._managed_start_job("research_ingestion", trigger="background_cache", agent_type="research_ingestion")
                         _shared = self._research_ingestion.get_shared_data()
                         for _pid, _rt in self._pod_runtimes.items():
                             _ns = _rt._ns
@@ -949,29 +1195,71 @@ class SessionManager:
                             if _shared.get("x_feed") is not None:
                                 _ns.set("shared_x_feed", _shared["x_feed"])
                         logger.debug("[session_manager] Injected shared research data into %d pod namespaces", len(self._pod_runtimes))
+                        research_artifact = self._record_artifact(
+                            "research_feed",
+                            owner="research",
+                            status="fresh",
+                            freshness_seconds=900,
+                            source_run_id=research_run_id,
+                            payload_ref="/api/research-feed",
+                        )
+                        macro_artifact = self._record_artifact(
+                            "macro_snapshot",
+                            owner="research",
+                            status="fresh" if _shared.get("fred_snapshot") else "degraded",
+                            freshness_seconds=1800,
+                            source_run_id=research_run_id,
+                            payload_ref="/api/research-feed",
+                        )
+                        self._managed_complete_job(
+                            "research_ingestion",
+                            research_run_id,
+                            {"keys": sorted(_shared.keys())},
+                            artifact_refs=[x for x in (research_artifact, macro_artifact) if x],
+                        )
+                        self._refresh_foresight(_shared)
 
                     # 2. Run researcher cycles for all pods IN PARALLEL
                     async def _run_researcher(pod_id: str, runtime):
+                        run_id = self._managed_start_run(
+                            agent_id=f"{pod_id}.researcher",
+                            agent_type="researcher",
+                            pod_id=pod_id,
+                            task="research_cycle",
+                            trigger=f"iteration:{self._iteration}",
+                        )
                         try:
                             researcher = runtime._researcher
                             if researcher:
                                 res = await researcher.run_cycle({"bar": None})
+                                artifact_id = self._record_artifact(
+                                    "research_feed",
+                                    owner=pod_id,
+                                    status="fresh",
+                                    freshness_seconds=900,
+                                    source_run_id=run_id,
+                                    payload_ref=f"/api/research-feed?pod_id={pod_id}",
+                                )
+                                self._managed_complete_run(run_id, res, artifact_refs=[artifact_id] if artifact_id else [])
                                 logger.info(
                                     "[session_manager] [iter %d] %s researcher: %d signals",
                                     self._iteration, pod_id,
                                     len(res.get("poly_signals", [])),
                                 )
                         except Exception as e:
+                            self._managed_fail_run(run_id, e)
                             logger.warning(
                                 "[session_manager] [iter %d] %s researcher failed: %s",
                                 self._iteration, pod_id, e,
                             )
 
+                    await self._set_session_stage("research", f"Iteration {self._iteration}: refreshing pod research")
                     await asyncio.gather(
                         *[_run_researcher(pid, rt) for pid, rt in self._pod_runtimes.items()]
                     )
 
                     # 3. Update gateway universes from namespace
+                    await self._set_session_stage("market_data", f"Iteration {self._iteration}: fetching market data")
                     for pod_id, gateway in self._pod_gateways.items():
                         runtime = self._pod_runtimes[pod_id]
                         gateway.set_universe(runtime._ns.get("universe") or POD_UNIVERSES.get(pod_id, []))
@@ -1012,25 +1300,83 @@ class SessionManager:
                             if accountant:
                                 accountant.mark_to_market(tick_prices, price_sources=tick_sources)
                             self._store_runtime_prices(runtime, tick_prices, tick_sources)
+                            self._record_artifact(
+                                "fresh_prices",
+                                owner=pod_id,
+                                status="fresh",
+                                freshness_seconds=180 if pod_id == "crypto" else 600,
+                                payload_ref=f"namespace:{pod_id}:price_cache",
+                            )
 
                         pod_latest_bars[pod_id] = latest_bar
                         logger.info("[session_manager] [iter %d] Pod %s: ingested %d bars, mark-to-market done",
                                     self._iteration, pod_id, bars_count)
 
                     # 5b. Position monitor — check for stop-loss / take-profit / max-hold breaches
+                    await self._set_session_stage("broker_reconciliation", f"Iteration {self._iteration}: checking broker sync")
+                    broker_run_id = self._managed_start_job(
+                        "broker_reconciliation",
+                        trigger=f"iteration:{self._iteration}",
+                        agent_type="broker_reconciliation",
+                    )
+                    try:
+                        broker_guard = await self._refresh_broker_trade_guards()
+                        broker_artifact = self._record_artifact(
+                            "broker_snapshot",
+                            owner="firm",
+                            status="fresh" if not (self._last_broker_reconciliation or {}).get("errors") else "degraded",
+                            freshness_seconds=300,
+                            source_run_id=broker_run_id,
+                            payload_ref="/api/broker-reconciliation",
+                        )
+                        self._managed_complete_job(
+                            "broker_reconciliation",
+                            broker_run_id,
+                            broker_guard,
+                            artifact_refs=[broker_artifact] if broker_artifact else [],
+                        )
+                    except Exception as exc:
+                        self._record_artifact(
+                            "broker_snapshot",
+                            owner="firm",
+                            status="failed",
+                            freshness_seconds=60,
+                            source_run_id=broker_run_id,
+                            payload_ref="/api/broker-reconciliation",
+                        )
+                        self._managed_fail_job("broker_reconciliation", broker_run_id, exc)
+                        raise
+
+                    await self._set_session_stage("position_monitor", f"Iteration {self._iteration}: checking stops and targets")
                     await self._run_position_monitor()
 
                     # 5c. Loss review / intervention: evaluate before PMs can add new risk.
+                    await self._set_session_stage("loss_review", f"Iteration {self._iteration}: reviewing losses")
                     await self._refresh_loss_reviews()
 
+                    await self._set_session_stage("evidence_review", f"Iteration {self._iteration}: checking thesis evidence guards")
+                    await self._refresh_evidence_trade_guards()
+
                     # 5. Build cross-pod intelligence memos and run agent cycles
+                    await self._set_session_stage("agent_decisions", f"Iteration {self._iteration}: running PM/risk/execution agents")
                     self._inject_firm_memos()
                     for pod_id, runtime in self._pod_runtimes.items():
                         bar = pod_latest_bars.get(pod_id)
                         if bar is None:
                             continue
+                        pod_cycle_run_id = self._managed_start_job(
+                            f"pod_decision_cycle:{pod_id}",
+                            trigger=f"iteration:{self._iteration}",
+                            agent_type="pod_decision_cycle",
+                            input_payload={"pod_id": pod_id, "bar": getattr(bar, "symbol", "")},
+                        )
                         try:
                             await runtime.run_cycle(bar, skip_researcher=True)
+                            self._managed_complete_job(
+                                f"pod_decision_cycle:{pod_id}",
+                                pod_cycle_run_id,
+                                {"pod_id": pod_id, "status": "complete"},
+                            )
                             logger.info("[session_manager] [iter %d] Pod %s: agent cycle complete", self._iteration, pod_id)
 
                             # Publish PM decision activity for live intelligence feed
@@ -1062,6 +1408,7 @@ class SessionManager:
                                 pass
 
                         except Exception as e:
+                            self._managed_fail_job(f"pod_decision_cycle:{pod_id}", pod_cycle_run_id, e)
                             logger.warning("[session_manager] [iter %d] Pod %s agent cycle failed: %s",
                                           self._iteration, pod_id, e)
 
@@ -1084,7 +1431,23 @@ class SessionManager:
                                 logger.debug("[session_manager] source attribution update failed for %s: %s", pod_id, e)
 
                     # 4. Collect pod summaries for governance and emission
+                    await self._set_session_stage("summaries", f"Iteration {self._iteration}: collecting pod summaries")
                     pod_summaries = await self._collect_pod_summaries()
+                    self._record_artifact(
+                        "nav_snapshot",
+                        owner="firm",
+                        status="fresh" if pod_summaries else "degraded",
+                        freshness_seconds=300,
+                        payload_ref="/api/nav-history",
+                    )
+                    for _pid in pod_summaries:
+                        self._record_artifact(
+                            "nav_snapshot",
+                            owner=_pid,
+                            status="fresh",
+                            freshness_seconds=300,
+                            payload_ref=f"/api/nav-history?pod_id={_pid}",
+                        )
                     logger.info("[session_manager] [iter %d] Collected %d pod summaries", self._iteration, len(pod_summaries))
 
                     # 4.0 Firm drawdown circuit breaker (vs peak NAV from memory)
@@ -1182,6 +1545,8 @@ class SessionManager:
                                     "social_score": ns.get("social_score") or 0.0,
                                     "x_feed": (ns.get("x_feed") or [])[:100],
                                     "x_tweet_count": len(ns.get("x_feed") or []),
+                                    "foresight_events": ns.get("foresight_events") or [],
+                                    "foresight_text": ns.get("foresight_text") or "",
                                     "news_last_refresh": datetime.now(timezone.utc).isoformat(),
                                 },
                             )
@@ -1234,8 +1599,41 @@ class SessionManager:
                                 pod_briefs = self._build_pod_intelligence_briefs(pod_summaries)
                                 self._cio_agent.set_pod_intelligence(pod_briefs)
 
+                            await self._set_session_stage("governance", f"Iteration {self._iteration}: running governance")
                             logger.info("[session_manager] [iter %d] Running governance cycle", self._iteration)
+                            governance_run_id = self._managed_start_job(
+                                "governance",
+                                trigger=f"iteration:{self._iteration}",
+                                agent_type="governance",
+                                input_payload={"pods": list(pod_summaries.keys())},
+                            )
                             governance_result = await self._governance.run_full_cycle(pod_summaries)
+                            governance_artifact = self._record_artifact(
+                                "governance_mandate",
+                                owner="firm",
+                                status="fresh",
+                                freshness_seconds=3600,
+                                source_run_id=governance_run_id,
+                                payload_ref="/api/decision-audit",
+                            )
+                            self._record_report(
+                                report_type="daily_brief",
+                                title=f"Governance cycle {self._iteration}",
+                                summary=(
+                                    f"Breached={governance_result.get('breached_pods', [])}; "
+                                    f"risk_halt={governance_result.get('cro_halt', False)}"
+                                ),
+                                body_markdown=json.dumps(governance_result, default=str, indent=2)[:8000],
+                                pod_id="firm",
+                                related_run_ids=[governance_run_id] if governance_run_id else [],
+                                tags=["governance"],
+                            )
+                            self._managed_complete_job(
+                                "governance",
+                                governance_run_id,
+                                governance_result,
+                                artifact_refs=[governance_artifact] if governance_artifact else [],
+                            )
 
                             # Extract results
                             breached_pods = governance_result.get("breached_pods", [])
@@ -1372,10 +1770,18 @@ class SessionManager:
 
                         await self._reconcile_positions()
 
+                    # 7.5 Advisory hindsight/meta reviews. These write reports only; they
+                    # do not mutate trading rules or submit orders.
+                    if self._iteration % 10 == 0:
+                        self._run_hindsight_review(trigger=f"iteration:{self._iteration}")
+                        self._run_meta_health_review(trigger=f"iteration:{self._iteration}")
+
                     # 8. Persist session state to disk
+                    await self._set_session_stage("saving", f"Iteration {self._iteration}: saving session state")
                     self._save_memory()
 
                     # 9. Sleep
+                    await self._set_session_stage("sleeping", f"Iteration {self._iteration}: waiting {interval_seconds:.0f}s for next cycle")
                     await asyncio.sleep(interval_seconds)
 
                 except asyncio.CancelledError:
@@ -1384,6 +1790,7 @@ class SessionManager:
                 except Exception as exc:
                     logger.error("[session_manager] [iter %d] Event loop error: %s", self._iteration, exc)
                     # Continue running; don't exit on transient errors
+                    await self._set_session_stage("error_wait", f"Iteration {self._iteration}: error, retrying after {interval_seconds:.0f}s")
                     await asyncio.sleep(interval_seconds)
 
         finally:
@@ -1405,6 +1812,7 @@ class SessionManager:
         """
         await asyncio.sleep(5)
         while self._session_active:
+            run_id = self._managed_start_job("price_refresh", trigger="ticker", agent_type="price_refresh")
             try:
                 refresh = await self.refresh_live_position_prices_if_due(force=True)
 
@@ -1416,11 +1824,29 @@ class SessionManager:
                     except Exception:
                         pass
 
+                self._record_artifact(
+                    "fresh_prices",
+                    owner="firm",
+                    status="fresh" if refresh.get("updated_count", 0) else "degraded",
+                    freshness_seconds=180,
+                    source_run_id=run_id,
+                    payload_ref="price_ticker",
+                )
+                self._managed_complete_job("price_refresh", run_id, refresh)
                 logger.info("[session_manager] Price ticker: refreshed %d prices across %d symbols",
                            refresh["updated_count"], refresh["live_symbol_count"])
             except asyncio.CancelledError:
                 return
             except Exception as e:
+                self._record_artifact(
+                    "fresh_prices",
+                    owner="firm",
+                    status="failed",
+                    freshness_seconds=60,
+                    source_run_id=run_id,
+                    payload_ref="price_ticker",
+                )
+                self._managed_fail_job("price_refresh", run_id, e)
                 logger.warning("[session_manager] Price ticker failed (non-fatal): %s", e)
 
             await asyncio.sleep(60)
@@ -1556,6 +1982,8 @@ class SessionManager:
         )
         if live_error:
             logger.debug("[session_manager] %s", live_error)
+        if not isinstance(live, dict):
+            live = {}
         live_by_alias = self._dict_by_symbol_alias(live)
 
         crypto_quotes = await self._fetch_crypto_position_quotes(held_crypto_symbols)
@@ -1628,7 +2056,11 @@ class SessionManager:
     async def _maybe_run_position_review(self) -> None:
         """Run position review if the date has changed since last review."""
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        if today == self._last_review_date:
+        material_due = any(
+            bool(runtime._ns.get("material_catalyst_due"))
+            for runtime in self._pod_runtimes.values()
+        )
+        if today == self._last_review_date and not material_due:
             return
 
         if not self._position_reviewer:
@@ -1646,7 +2078,14 @@ class SessionManager:
             self._last_review_date = today
             return
 
-        logger.info("[session_manager] Running daily position review for %d pod(s)", len(pod_accountants))
+        review_trigger = "material_catalyst" if material_due else "daily"
+        logger.info("[session_manager] Running %s position review for %d pod(s)", review_trigger, len(pod_accountants))
+        run_id = self._managed_start_job(
+            "position_review",
+            trigger=review_trigger,
+            agent_type="position_reviewer",
+            input_payload={"pods": list(pod_accountants.keys()), "date": today, "material_due": material_due},
+        )
 
         try:
             review_result = await self._position_reviewer.run_review(
@@ -1672,12 +2111,40 @@ class SessionManager:
 
             # Generate report
             await self._generate_review_report(review_result)
+            artifact_id = self._record_artifact(
+                "position_review",
+                owner="governance",
+                status="fresh",
+                freshness_seconds=86400,
+                source_run_id=run_id,
+                payload_ref="/api/reports/corpus?report_type=position_review",
+            )
+            self._record_report(
+                report_type="position_review",
+                title=f"Daily position review {today}",
+                summary=f"Reviewed {len(review_result.get('pods', {}) or {})} pod(s)",
+                body_markdown=json.dumps(review_result, default=str, indent=2)[:8000],
+                related_run_ids=[run_id] if run_id else [],
+                tags=["position_review", "governance"],
+            )
+            self._managed_complete_job("position_review", run_id, review_result, artifact_refs=[artifact_id] if artifact_id else [])
 
             self._last_review_date = today
+            for runtime in self._pod_runtimes.values():
+                runtime._ns.set("material_catalyst_due", False)
             logger.info("[session_manager] Daily position review complete")
 
         except Exception as e:
             logger.error("[session_manager] Position review failed: %s", e, exc_info=True)
+            self._record_artifact(
+                "position_review",
+                owner="governance",
+                status="failed",
+                freshness_seconds=3600,
+                source_run_id=run_id,
+                payload_ref="/api/reports/corpus?report_type=position_review",
+            )
+            self._managed_fail_job("position_review", run_id, e)
             self._last_review_date = today
 
     async def _generate_review_report(self, review_result: dict) -> None:
@@ -2102,17 +2569,32 @@ class SessionManager:
         except Exception as exc:
             return default, f"{label} failed: {exc}"
 
+    async def _broker_diagnostic_method(self, label: str, method_name: str, default):
+        method = getattr(self._alpaca, method_name, None)
+        if not callable(method):
+            return default, f"{label} unavailable on adapter"
+        return await self._broker_diagnostic_call(label, method(), default)
+
     async def get_broker_reconciliation(self) -> dict:
         """Return a local-vs-Alpaca reconciliation payload for the dashboard."""
         generated_at = datetime.now(timezone.utc).isoformat()
         errors: list[str] = []
 
         (account, account_error), (broker_positions, position_error), (open_orders, order_error) = await asyncio.gather(
-            self._broker_diagnostic_call("Account fetch", self._alpaca.fetch_account(), {}),
-            self._broker_diagnostic_call("Position fetch", self._alpaca.get_open_positions(), {}),
-            self._broker_diagnostic_call("Open order fetch", self._alpaca.get_all_open_orders(), []),
+            self._broker_diagnostic_method("Account fetch", "fetch_account", {}),
+            self._broker_diagnostic_method("Position fetch", "get_open_positions", {}),
+            self._broker_diagnostic_method("Open order fetch", "get_all_open_orders", []),
         )
         errors.extend(e for e in (account_error, position_error, order_error) if e)
+        if not isinstance(account, dict):
+            errors.append("Account fetch returned an unexpected payload")
+            account = {}
+        if not isinstance(broker_positions, dict):
+            errors.append("Position fetch returned an unexpected payload")
+            broker_positions = {}
+        if not isinstance(open_orders, list):
+            errors.append("Open order fetch returned an unexpected payload")
+            open_orders = []
 
         local_positions = self._local_positions_by_symbol()
         local_by_alias = self._dict_by_symbol_alias(local_positions)
@@ -2173,8 +2655,103 @@ class SessionManager:
             "status": "OK" if not mismatches and not errors else "CHECK",
             "source": "live_broker" if not errors else "partial_broker",
         }
+        payload["trade_guard"] = self._build_broker_trade_guard(payload)
         self._last_broker_reconciliation = payload
         return payload
+
+    @staticmethod
+    def _format_broker_guard_reason(row: dict) -> str:
+        status = str(row.get("status") or "CHECK").replace("_", " ").lower()
+        symbol = row.get("symbol") or row.get("broker_symbol") or "symbol"
+        return (
+            f"Broker/local {status} for {symbol}: "
+            f"local qty {row.get('local_qty', 0)}, broker qty {row.get('broker_qty', 0)}"
+        )
+
+    def _build_broker_trade_guard(self, reconciliation: dict | None) -> dict:
+        """Translate reconciliation diagnostics into a runtime trading guard."""
+        reconciliation = reconciliation or {}
+        generated_at = reconciliation.get("generated_at") or datetime.now(timezone.utc).isoformat()
+        errors = list(reconciliation.get("errors") or [])
+        blocked_symbols: dict[str, dict] = {}
+
+        for row in reconciliation.get("mismatches", []) or []:
+            if not isinstance(row, dict):
+                continue
+            symbol = str(row.get("symbol") or row.get("broker_symbol") or "").upper()
+            if not symbol:
+                continue
+            blocked_symbols[symbol] = {
+                "status": row.get("status") or "CHECK",
+                "reason": self._format_broker_guard_reason(row),
+                "block_new_risk": True,
+                "block_all_orders": False,
+                "local_qty": row.get("local_qty"),
+                "broker_qty": row.get("broker_qty"),
+                "broker_symbol": row.get("broker_symbol"),
+            }
+
+        for order in reconciliation.get("open_orders", []) or []:
+            if not isinstance(order, dict):
+                continue
+            symbol = str(order.get("symbol") or "").upper()
+            if not symbol:
+                continue
+            order_id = order.get("order_id") or order.get("id") or "open-order"
+            side = str(order.get("side") or "").upper()
+            qty = order.get("qty") or order.get("quantity") or 0
+            status = str(order.get("status") or "open").upper()
+            blocked_symbols[symbol] = {
+                "status": "OPEN_ORDER",
+                "reason": f"Open broker order already in flight for {symbol}: {side} {qty} ({status}, id={order_id})",
+                "block_new_risk": True,
+                "block_all_orders": True,
+                "order_id": order_id,
+                "side": side,
+                "qty": qty,
+            }
+
+        position_fetch_errors = [err for err in errors if str(err).lower().startswith("position fetch")]
+        global_block = bool(position_fetch_errors)
+        global_reason = position_fetch_errors[0] if position_fetch_errors else ""
+
+        status = "OK"
+        if blocked_symbols or global_block or errors:
+            status = "CHECK"
+
+        return {
+            "generated_at": generated_at,
+            "status": status,
+            "global_block_new_risk": global_block,
+            "global_reason": global_reason,
+            "blocked_symbols": blocked_symbols,
+            "mismatch_count": len(reconciliation.get("mismatches", []) or []),
+            "open_order_count": len(reconciliation.get("open_orders", []) or []),
+            "errors": errors,
+            "source": reconciliation.get("source") or "unknown",
+        }
+
+    def _apply_broker_trade_guard(self, reconciliation: dict | None) -> dict:
+        guard = self._build_broker_trade_guard(reconciliation)
+        for runtime in self._pod_runtimes.values():
+            try:
+                runtime._ns.set("broker_trade_guard", guard)
+            except Exception:
+                logger.debug("[session_manager] Failed to set broker guard on runtime", exc_info=True)
+        return guard
+
+    async def _refresh_broker_trade_guards(self) -> dict:
+        """Refresh broker diagnostics and push a trading guard into every pod runtime."""
+        reconciliation = await self.get_broker_reconciliation()
+        guard = self._apply_broker_trade_guard(reconciliation)
+        if guard.get("status") != "OK":
+            logger.warning(
+                "[session_manager] Broker guard active: %d mismatch(es), %d open order(s), global_block=%s",
+                guard.get("mismatch_count", 0),
+                guard.get("open_order_count", 0),
+                guard.get("global_block_new_risk", False),
+            )
+        return guard
 
     @staticmethod
     def _position_price_age_seconds(price_updated_at: str | None) -> float | None:
@@ -2358,6 +2935,662 @@ class SessionManager:
             "next_action": next_action,
         }
 
+    def _foresight_pod_contexts(self) -> dict[str, dict]:
+        contexts: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            ns = runtime._ns
+            acct = ns.get("accountant")
+            held_symbols = []
+            if acct:
+                try:
+                    held_symbols = list(acct.current_positions.keys())
+                except Exception:
+                    held_symbols = []
+            contexts[pod_id] = {
+                "universe": ns.get("universe") or POD_UNIVERSES.get(pod_id, []),
+                "held_symbols": held_symbols,
+                "macro_regime": ns.get("market_regime") or {},
+            }
+        return contexts
+
+    def _format_foresight_text(self, events: list[dict]) -> str:
+        if not events:
+            return "No active catalysts routed to this pod."
+        lines = ["Foresight / Catalyst Ledger:"]
+        for event in events[:8]:
+            bits = []
+            if event.get("direction"):
+                bits.append(f"dir={event.get('direction')}")
+            if event.get("impact_score") is not None:
+                bits.append(f"impact={float(event.get('impact_score') or 0.0):.2f}")
+            if event.get("confidence") is not None:
+                bits.append(f"conf={float(event.get('confidence') or 0.0):.2f}")
+            lines.append(f"- {event.get('event_id')}: {event.get('title')} ({', '.join(bits)})")
+            if event.get("summary"):
+                lines.append(f"  {str(event.get('summary'))[:260]}")
+        return "\n".join(lines)
+
+    def _refresh_foresight(self, shared_data: dict | None = None) -> dict:
+        if not self._foresight:
+            return {"status": "NO_FORESIGHT", "events": []}
+        run_id = self._managed_start_job(
+            "foresight_refresh",
+            trigger="research_ingestion",
+            agent_type="foresight",
+            input_payload={
+                "shared_keys": sorted((shared_data or {}).keys()),
+                "pods": list(self._pod_runtimes.keys()),
+            },
+        )
+        try:
+            report = self._foresight.refresh(shared_data or {}, self._foresight_pod_contexts())
+            events = report.get("events", []) or []
+            material_events = [
+                e for e in events
+                if float(e.get("materiality_score") or e.get("impact_score") or 0.0) >= 0.75
+            ]
+            for pod_id, runtime in self._pod_runtimes.items():
+                pod_events = [
+                    event for event in events
+                    if pod_id in [str(p).lower() for p in event.get("affected_pods", [])]
+                ][:10]
+                runtime._ns.set("foresight_events", pod_events)
+                runtime._ns.set("catalyst_events", pod_events)
+                runtime._ns.set("foresight_text", self._format_foresight_text(pod_events))
+                features = runtime._ns.get("features") or {}
+                if isinstance(features, dict):
+                    features["foresight_events"] = pod_events
+                    features["catalyst_events"] = pod_events
+                    runtime._ns.set("features", features)
+                if any(e in material_events for e in pod_events):
+                    runtime._ns.set("material_catalyst_due", True)
+                    runtime._ns.set("material_catalyst_events", [e for e in pod_events if e in material_events])
+            if material_events:
+                # Material catalysts schedule a near-term position review, but do
+                # not bypass PM/thesis/IC/risk/execution gates.
+                self._last_review_date = ""
+            artifact_id = self._record_artifact(
+                "catalyst_ledger",
+                owner="research",
+                status="fresh" if report.get("status") != "ERROR" else "failed",
+                freshness_seconds=900,
+                source_run_id=run_id,
+                payload_ref="/api/foresight",
+            )
+            if events:
+                report_id = self._record_report(
+                    report_type="foresight_catalyst",
+                    title=f"Foresight refresh: {len(events)} catalyst event(s)",
+                    summary="; ".join(str(e.get("title") or e.get("event_id") or "event") for e in events[:5]),
+                    body_markdown="\n".join(
+                        f"- `{e.get('event_id')}` {e.get('title')}: {e.get('summary', '')}"
+                        for e in events[:25]
+                    ),
+                    related_run_ids=[run_id] if run_id else [],
+                    related_catalyst_ids=[str(e.get("event_id")) for e in events if e.get("event_id")],
+                    tags=["foresight", "catalyst_ledger"],
+                )
+                if report_id:
+                    for event in events:
+                        event_id = str(event.get("event_id") or "")
+                        if event_id:
+                            try:
+                                self._foresight.feed_store.update_catalyst_lifecycle(
+                                    event_id,
+                                    linked_run_ids=[run_id] if run_id else [],
+                                    linked_report_ids=[report_id],
+                                )
+                            except Exception:
+                                pass
+            self._managed_complete_job("foresight_refresh", run_id, report, artifact_refs=[artifact_id] if artifact_id else [])
+            return report
+        except Exception as exc:
+            logger.warning("[session_manager] Foresight refresh failed: %s", exc)
+            self._record_artifact(
+                "catalyst_ledger",
+                owner="research",
+                status="failed",
+                freshness_seconds=300,
+                source_run_id=run_id,
+                payload_ref="/api/foresight",
+            )
+            self._managed_fail_job("foresight_refresh", run_id, exc)
+            return {"status": "ERROR", "events": [], "error": str(exc)}
+
+    def get_foresight_report(self, limit: int = 100, pod_id: str | None = None) -> dict:
+        generated_at = datetime.now(timezone.utc).isoformat()
+        if not self._foresight:
+            return {
+                "status": "NO_FORESIGHT",
+                "generated_at": generated_at,
+                "events": [],
+                "counts": {"active": 0, "stale": 0, "failed": 0},
+                "by_pod": {pod: 0 for pod in POD_IDS},
+                "event_count": 0,
+            }
+        return self._foresight.get_report(limit=limit, pod_id=pod_id)
+
+    def get_catalyst_threads(self, limit: int = 100, pod_id: str | None = None) -> dict:
+        generated_at = datetime.now(timezone.utc).isoformat()
+        if not self._foresight:
+            return {"generated_at": generated_at, "threads": [], "count": 0, "status": "NO_FORESIGHT"}
+        try:
+            threads = self._foresight.feed_store.catalyst_threads(limit=limit, pod_id=pod_id)
+        except Exception as exc:
+            logger.debug("[session_manager] Catalyst thread read failed: %s", exc)
+            threads = []
+        return {
+            "generated_at": generated_at,
+            "threads": threads,
+            "count": len(threads),
+            "status": "OK" if threads else "EMPTY",
+        }
+
+    def get_specialist_briefs(self, limit: int = 100, pod_id: str | None = None) -> dict:
+        rows: list[dict] = []
+        for pid, runtime in self._pod_runtimes.items():
+            if pod_id and pid != pod_id:
+                continue
+            for row in runtime._ns.get("specialist_brief_history") or []:
+                if isinstance(row, dict):
+                    rows.append({**row, "pod_id": row.get("pod_id") or pid})
+        rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        limit = max(1, min(int(limit or 100), 500))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "briefs": rows[:limit],
+            "count": len(rows[:limit]),
+        }
+
+    def get_committee_reviews(self, limit: int = 100, pod_id: str | None = None) -> dict:
+        rows: list[dict] = []
+        for pid, runtime in self._pod_runtimes.items():
+            if pod_id and pid != pod_id:
+                continue
+            for row in runtime._ns.get("committee_review_history") or []:
+                if isinstance(row, dict):
+                    rows.append({**row, "pod_id": row.get("pod_id") or pid})
+        rows.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        limit = max(1, min(int(limit or 100), 500))
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "reviews": rows[:limit],
+            "count": len(rows[:limit]),
+        }
+
+    def get_agent_runs(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        status: str | None = None,
+        agent_type: str | None = None,
+        task: str | None = None,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        rows = runtime.agent_runs.list_runs(
+            limit=limit,
+            pod_id=pod_id,
+            status=status,
+            agent_type=agent_type,
+            task=task,
+        )
+        summary = runtime.agent_runs.summary(limit=500)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "runs": rows,
+            "count": len(rows),
+            "summary": summary,
+        }
+
+    def get_artifacts(self, limit: int = 500, owner: str | None = None, kind: str | None = None) -> dict:
+        runtime = self._ensure_managed_runtime()
+        rows = runtime.artifacts.list_artifacts(owner=owner, kind=kind, limit=limit)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "artifacts": rows,
+            "count": len(rows),
+            "summary": runtime.artifacts.summary(),
+        }
+
+    def get_report_corpus(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        report_type: str | None = None,
+        catalyst_id: str | None = None,
+        factor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        rows = runtime.reports.list_reports(
+            limit=limit,
+            pod_id=pod_id,
+            symbol=symbol,
+            report_type=report_type,
+            catalyst_id=catalyst_id,
+            factor=factor,
+            since=since,
+            until=until,
+        )
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "reports": rows,
+            "count": len(rows),
+            "summary": runtime.reports.summary(),
+        }
+
+    def get_decision_trace(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        catalyst_id: str | None = None,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        trace = runtime.reports.decision_trace(
+            limit=limit,
+            pod_id=pod_id,
+            symbol=symbol,
+            catalyst_id=catalyst_id,
+        )
+        if catalyst_id and self._foresight:
+            try:
+                trace["catalyst_threads"] = [
+                    t for t in self._foresight.feed_store.catalyst_threads(limit=50)
+                    if any(e.get("event_id") == catalyst_id for e in t.get("events", []))
+                ]
+            except Exception:
+                trace["catalyst_threads"] = []
+        return trace
+
+    def get_decision_evaluations(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        run: bool = False,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        run_result = None
+        if run:
+            run_result = runtime.decisions.evaluate_due(outcome_context=self._hindsight_outcome_context())
+            runtime.calibration.update_from_evaluations(runtime.decisions.list_evaluations(limit=2000))
+        rows = runtime.decisions.list_evaluations(limit=limit, pod_id=pod_id, symbol=symbol)
+        snapshots = runtime.decisions.list_snapshots(limit=limit, pod_id=pod_id, symbol=symbol)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "evaluations": rows,
+            "snapshots": snapshots,
+            "count": len(rows),
+            "snapshot_count": len(snapshots),
+            "run_result": run_result,
+        }
+
+    def _shadow_replay_decision(self, snapshot: dict) -> dict:
+        """Build a dry-run replay decision from stored context only."""
+        symbol = str(snapshot.get("symbol") or "").upper()
+        try:
+            from src.core.instrument_profile import get_instrument_profile
+
+            profile = get_instrument_profile(symbol).model_dump(mode="json") if symbol else {}
+        except Exception:
+            profile = {}
+        artifact_status = snapshot.get("artifact_status") or {}
+        degraded = artifact_status.get("status") == "degraded" or bool(artifact_status.get("degraded_reasons"))
+        side = str(snapshot.get("side") or "HOLD").upper()
+        replay_side = side
+        reason_parts = [
+            "Dry-run replay used the saved decision snapshot only.",
+            "No PM memory, live positions, NAV, broker state, or execution adapters were mutated.",
+        ]
+        if degraded:
+            reason_parts.append("Saved dependency state was degraded, so current policy would demand stronger evidence before adding risk.")
+            if side == "BUY":
+                replay_side = "HOLD"
+        return {
+            "side": replay_side,
+            "symbol": symbol,
+            "original_side": side,
+            "dry_run": True,
+            "instrument_profile": profile,
+            "dependency_status": artifact_status,
+            "reason": " ".join(reason_parts),
+        }
+
+    def get_shadow_replay(self, limit: int = 100, snapshot_id: str | None = None, run: bool = False) -> dict:
+        runtime = self._ensure_managed_runtime()
+        run_result = None
+        if run:
+            target_snapshot_id = snapshot_id
+            if not target_snapshot_id:
+                latest = runtime.decisions.list_snapshots(limit=1)
+                target_snapshot_id = latest[0].get("snapshot_id") if latest else None
+            if target_snapshot_id:
+                snapshot = runtime.decisions.get_snapshot(target_snapshot_id)
+                replay_decision = self._shadow_replay_decision(snapshot) if snapshot else {}
+                run_result = runtime.decisions.record_shadow_replay(target_snapshot_id, replay_decision)
+            else:
+                run_result = {"error": "no decision snapshot available", "dry_run": True}
+        rows = runtime.decisions.list_shadow_replays(limit=limit, snapshot_id=snapshot_id)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "replays": rows,
+            "count": len(rows),
+            "run_result": run_result,
+        }
+
+    def get_portfolio_construction_reviews(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        rows = runtime.portfolio_construction.list_reviews(limit=limit, pod_id=pod_id, symbol=symbol)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "reviews": rows,
+            "count": len(rows),
+        }
+
+    def get_thesis_monitor_results(
+        self,
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        rows = runtime.thesis_monitor.list_results(limit=limit, pod_id=pod_id, symbol=symbol)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "results": rows,
+            "count": len(rows),
+        }
+
+    def get_calibration_report(
+        self,
+        limit: int = 200,
+        entity_type: str | None = None,
+        pod_id: str | None = None,
+        run: bool = False,
+    ) -> dict:
+        runtime = self._ensure_managed_runtime()
+        run_result = None
+        if run:
+            run_result = runtime.calibration.update_from_evaluations(runtime.decisions.list_evaluations(limit=2000))
+        rows = runtime.calibration.list_scores(limit=limit, entity_type=entity_type, pod_id=pod_id)
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "scores": rows,
+            "count": len(rows),
+            "run_result": run_result,
+        }
+
+    def get_hindsight_report(self, limit: int = 100, run: bool = False) -> dict:
+        runtime = self._ensure_managed_runtime()
+        run_result = runtime.hindsight.run_once(outcome_context=self._hindsight_outcome_context()) if run else None
+        decision_result = runtime.decisions.evaluate_due(outcome_context=self._hindsight_outcome_context()) if run else None
+        calibration_result = (
+            runtime.calibration.update_from_evaluations(runtime.decisions.list_evaluations(limit=2000))
+            if run else None
+        )
+        if run_result and self._foresight:
+            for review in run_result.get("reviews", []) or []:
+                for event_id in review.get("related_catalyst_ids") or []:
+                    try:
+                        self._foresight.feed_store.update_catalyst_lifecycle(
+                            str(event_id),
+                            status="reviewed",
+                            linked_report_ids=[review.get("report_id")] if review.get("report_id") else [],
+                            hindsight_score=review.get("hindsight_score"),
+                            reviewed_at=datetime.now(timezone.utc),
+                        )
+                    except Exception:
+                        pass
+        rows = runtime.reports.list_reports(limit=limit, report_type="hindsight_review")
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "reviews": rows,
+            "count": len(rows),
+            "run_result": run_result,
+            "decision_result": decision_result,
+            "calibration_result": calibration_result,
+        }
+
+    def _run_hindsight_review(self, *, trigger: str = "scheduled") -> dict:
+        run_id = self._managed_start_job("hindsight_review", trigger=trigger, agent_type="hindsight_agent")
+        try:
+            runtime = self._ensure_managed_runtime()
+            outcome_context = self._hindsight_outcome_context()
+            result = runtime.hindsight.run_once(outcome_context=outcome_context)
+            decision_result = runtime.decisions.evaluate_due(outcome_context=outcome_context)
+            calibration_result = runtime.calibration.update_from_evaluations(runtime.decisions.list_evaluations(limit=2000))
+            result["decision_evaluations"] = decision_result
+            result["calibration"] = calibration_result
+            if self._foresight:
+                for review in result.get("reviews", []) or []:
+                    for event_id in review.get("related_catalyst_ids") or []:
+                        try:
+                            self._foresight.feed_store.update_catalyst_lifecycle(
+                                str(event_id),
+                                status="reviewed",
+                                linked_report_ids=[review.get("report_id")] if review.get("report_id") else [],
+                                hindsight_score=review.get("hindsight_score"),
+                                reviewed_at=datetime.now(timezone.utc),
+                            )
+                        except Exception:
+                            pass
+            artifact_id = self._record_artifact(
+                "hindsight_reviews",
+                owner="meta",
+                status="fresh",
+                freshness_seconds=86400,
+                source_run_id=run_id,
+                payload_ref="/api/hindsight",
+            )
+            self._managed_complete_job("hindsight_review", run_id, result, artifact_refs=[artifact_id] if artifact_id else [])
+            return result
+        except Exception as exc:
+            self._record_artifact(
+                "hindsight_reviews",
+                owner="meta",
+                status="failed",
+                freshness_seconds=3600,
+                source_run_id=run_id,
+                payload_ref="/api/hindsight",
+            )
+            self._managed_fail_job("hindsight_review", run_id, exc)
+            return {"error": str(exc), "created_count": 0}
+
+    def _hindsight_outcome_context(self) -> dict:
+        symbols: dict[str, dict] = {}
+        pods: dict[str, dict] = {}
+        for pod_id, runtime in self._pod_runtimes.items():
+            acct = runtime._ns.get("accountant")
+            pod_pnl = 0.0
+            pod_nav = 0.0
+            if acct:
+                try:
+                    pod_nav = float(getattr(acct, "nav", 0.0) or 0.0)
+                    starting = float(getattr(acct, "starting_capital", 0.0) or self._pod_capital.get(pod_id) or 1000.0)
+                    pod_pnl = pod_nav - starting
+                    for sym, snap in acct.current_positions.items():
+                        symbols[str(sym).upper()] = {
+                            "pod_id": pod_id,
+                            "pnl": float(getattr(snap, "unrealized_pnl", 0.0) or 0.0),
+                            "pnl_pct": (
+                                float(getattr(snap, "unrealized_pnl", 0.0) or 0.0)
+                                / max(abs(float(getattr(snap, "qty", 0.0) or 0.0) * float(getattr(snap, "cost_basis", 0.0) or 0.0)), 1e-9)
+                            ),
+                            "price": float(getattr(snap, "current_price", 0.0) or 0.0),
+                            "entry": float(getattr(snap, "cost_basis", 0.0) or 0.0),
+                            "updated_recently": True,
+                        }
+                    for trade in getattr(acct, "closed_trades", []) or []:
+                        sym = str(getattr(trade, "symbol", "") or (trade.get("symbol") if isinstance(trade, dict) else "")).upper()
+                        if not sym:
+                            continue
+                        pnl = getattr(trade, "pnl", None) if not isinstance(trade, dict) else trade.get("pnl")
+                        if pnl is not None:
+                            row = symbols.setdefault(sym, {"pod_id": pod_id, "pnl": 0.0, "pnl_pct": 0.0, "updated_recently": False})
+                            row["pnl"] = float(row.get("pnl") or 0.0) + float(pnl or 0.0)
+                except Exception as exc:
+                    logger.debug("[session_manager] hindsight outcome context skipped %s: %s", pod_id, exc)
+            pods[pod_id] = {
+                "nav": pod_nav,
+                "pnl": pod_pnl,
+                "pnl_pct": pod_pnl / max(float(self._pod_capital.get(pod_id) or self._capital_per_pod or 1000.0), 1e-9),
+            }
+        return {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "symbols": symbols,
+            "pods": pods,
+        }
+
+    def _run_meta_health_review(self, *, trigger: str = "scheduled") -> dict:
+        run_id = self._managed_start_job("meta_health_review", trigger=trigger, agent_type="meta_agent")
+        try:
+            runtime = self._ensure_managed_runtime()
+            artifacts = runtime.artifacts.summary()
+            runs = runtime.agent_runs.summary(limit=500)
+            budgets = self.get_budget_report(limit=500)
+            scheduler = runtime.scheduler.summary()
+            reports_created: list[str] = []
+
+            system_flags: list[str] = []
+            if artifacts.get("stale_count"):
+                system_flags.append("stale_artifacts")
+            if runs.get("failed_count"):
+                system_flags.append("failed_runs")
+            if budgets.get("today", {}).get("degraded"):
+                system_flags.append("budget_degraded")
+            if scheduler.get("failed_count"):
+                system_flags.append("failed_jobs")
+            reports_created.append(self._record_report(
+                report_type="meta_system_health",
+                title="SystemHealthReviewer",
+                summary=(
+                    f"{artifacts.get('stale_count', 0)} stale artefacts, "
+                    f"{runs.get('failed_count', 0)} failed runs, "
+                    f"{scheduler.get('failed_count', 0)} failed jobs"
+                ),
+                body_markdown=json.dumps({
+                    "artifacts": artifacts,
+                    "agent_runs": {k: runs.get(k) for k in ("count", "failed_count", "running_count", "by_agent_type")},
+                    "budget_today": budgets.get("today", {}),
+                    "scheduler": scheduler,
+                }, default=str, indent=2)[:10000],
+                pod_id="firm",
+                related_run_ids=[run_id] if run_id else [],
+                tags=["meta_agent", "system_health"],
+                quality_flags=system_flags,
+            ))
+
+            research_report = self.get_research_feed_report(limit=50)
+            source_flags = ["source_errors"] if research_report.get("source_error_count", 0) else []
+            reports_created.append(self._record_report(
+                report_type="meta_source_audit",
+                title="SourceAuditor",
+                summary=f"{research_report.get('source_count', 0)} sources, {research_report.get('source_error_count', 0)} with errors",
+                body_markdown=json.dumps({
+                    "sources": research_report.get("sources", [])[:50],
+                    "status": research_report.get("status"),
+                    "last_fetch_time": research_report.get("last_fetch_time"),
+                }, default=str, indent=2)[:10000],
+                pod_id="firm",
+                related_run_ids=[run_id] if run_id else [],
+                tags=["meta_agent", "source_audit"],
+                quality_flags=source_flags,
+            ))
+
+            thesis_reports = runtime.reports.list_reports(limit=200, report_type="thesis_review")
+            weak = [
+                r for r in thesis_reports
+                if any(flag in (r.get("quality_flags") or []) for flag in ("thesis_gate_failed", "missing_invalidation"))
+            ]
+            reports_created.append(self._record_report(
+                report_type="meta_thesis_quality",
+                title="ThesisQualityAuditor",
+                summary=f"{len(weak)} weak thesis pattern(s) in recent thesis reviews",
+                body_markdown=json.dumps({
+                    "weak_reports": [
+                        {
+                            "report_id": r.get("report_id"),
+                            "pod_id": r.get("pod_id"),
+                            "symbol": r.get("symbol"),
+                            "summary": r.get("summary"),
+                            "quality_flags": r.get("quality_flags"),
+                        }
+                        for r in weak[:25]
+                    ],
+                }, default=str, indent=2)[:10000],
+                pod_id="firm",
+                related_run_ids=[run_id] if run_id else [],
+                tags=["meta_agent", "thesis_quality"],
+                quality_flags=["weak_thesis_patterns"] if weak else [],
+            ))
+
+            hindsight = runtime.reports.list_reports(limit=100, report_type="hindsight_review")
+            reports_created.append(self._record_report(
+                report_type="meta_memory_distillation",
+                title="MemoryDistiller",
+                summary=f"{len(hindsight)} hindsight review(s) available for durable lessons",
+                body_markdown=json.dumps({
+                    "recent_hindsight": [
+                        {
+                            "report_id": r.get("report_id"),
+                            "pod_id": r.get("pod_id"),
+                            "symbol": r.get("symbol"),
+                            "quality_flags": r.get("quality_flags"),
+                            "summary": r.get("summary"),
+                        }
+                        for r in hindsight[:25]
+                    ],
+                }, default=str, indent=2)[:10000],
+                pod_id="firm",
+                related_run_ids=[run_id] if run_id else [],
+                tags=["meta_agent", "memory_distiller"],
+                quality_flags=[],
+            ))
+
+            artifact_id = self._record_artifact(
+                "meta_health_review",
+                owner="meta",
+                status="fresh",
+                freshness_seconds=86400,
+                source_run_id=run_id,
+                payload_ref="/api/reports/corpus?report_type=meta_system_health",
+            )
+            result = {"reports_created": [r for r in reports_created if r], "quality_flags": system_flags}
+            self._managed_complete_job("meta_health_review", run_id, result, artifact_refs=[artifact_id] if artifact_id else [])
+            return result
+        except Exception as exc:
+            self._record_artifact(
+                "meta_health_review",
+                owner="meta",
+                status="failed",
+                freshness_seconds=3600,
+                source_run_id=run_id,
+                payload_ref="/api/reports/corpus?report_type=meta_system_health",
+            )
+            self._managed_fail_job("meta_health_review", run_id, exc)
+            return {"error": str(exc), "reports_created": []}
+
+    def get_budget_report(self, limit: int = 500) -> dict:
+        runtime = self._ensure_managed_runtime()
+        try:
+            from src.core.llm import get_llm_health_report
+
+            runtime.budgets.ingest_llm_health(get_llm_health_report(limit=limit))
+        except Exception as exc:
+            logger.debug("[managed] budget LLM health ingest skipped: %s", exc)
+        return runtime.budgets.summary(limit=limit)
+
+    def get_scheduler_jobs(self) -> dict:
+        return self._ensure_managed_runtime().scheduler.summary()
+
     def get_research_feed_report(self, limit: int = 100, listener_state: dict | None = None) -> dict:
         """Return persistent research feed, source health, routing, and action audit."""
         generated_at = datetime.now(timezone.utc).isoformat()
@@ -2404,6 +3637,7 @@ class SessionManager:
         """Return state-integrity diagnostics for the dashboard."""
         generated_at = datetime.now(timezone.utc).isoformat()
         data_quality = self.get_data_quality_report()
+        evidence_review = self.get_evidence_review_queue()
         nav_history = self._nav_store.health_summary() if self._nav_store else {
             "total_rows": 0,
             "repaired_rows": 0,
@@ -2447,6 +3681,40 @@ class SessionManager:
                 issues.append("Missing live NAV")
             if nav_row and nav_row.get("quality") not in (None, "ok"):
                 issues.append(f"Latest NAV row was {nav_row.get('quality')}")
+            broker_guard = runtime._ns.get("broker_trade_guard") if runtime else {}
+            loss_restriction = runtime._ns.get("loss_review_restriction") if runtime else {}
+            execution_cooldown = runtime._ns.get("execution_cooldown") if runtime else {}
+            evidence_guard = runtime._ns.get("evidence_trade_guard") if runtime else {}
+            trading_mode = "normal"
+            trading_reason = ""
+            if isinstance(execution_cooldown, dict) and execution_cooldown.get("active"):
+                trading_mode = "reduce_only"
+                trading_reason = str(execution_cooldown.get("reason") or "Execution cooldown active")
+            if isinstance(loss_restriction, dict) and loss_restriction.get("block_new_risk"):
+                trading_mode = "reduce_only"
+                trading_reason = str(loss_restriction.get("reason") or "Loss review restriction active")
+            if isinstance(broker_guard, dict):
+                blocked_symbols = broker_guard.get("blocked_symbols") or {}
+                if broker_guard.get("global_block_new_risk"):
+                    trading_mode = "reduce_only"
+                    trading_reason = str(broker_guard.get("global_reason") or "Broker reconciliation guard active")
+                elif blocked_symbols and trading_mode == "normal":
+                    trading_mode = "symbol_guard"
+                    trading_reason = f"{len(blocked_symbols)} symbol(s) blocked by broker guard"
+            if isinstance(evidence_guard, dict):
+                evidence_blocks = evidence_guard.get("blocked_symbols") or {}
+                if evidence_blocks:
+                    urgent = evidence_guard.get("urgent_count", 0) or any(
+                        str(block.get("status", "")).upper() == "URGENT"
+                        for block in evidence_blocks.values()
+                        if isinstance(block, dict)
+                    )
+                    if urgent:
+                        trading_mode = "reduce_only"
+                        trading_reason = f"{len(evidence_blocks)} symbol(s) reduce-only pending evidence/thesis review"
+                    elif trading_mode == "normal":
+                        trading_mode = "evidence_review"
+                        trading_reason = f"{len(evidence_blocks)} symbol(s) require refreshed thesis before adding risk"
             status = "OK" if not issues else "CHECK"
             pods.append({
                 "pod_id": pod_id,
@@ -2460,6 +3728,12 @@ class SessionManager:
                 "position_count": len(positions),
                 "last_nav_ts": nav_row.get("ts"),
                 "last_nav_quality": nav_row.get("quality", "unknown"),
+                "trading_mode": trading_mode,
+                "trading_block_reason": trading_reason,
+                "broker_guard": broker_guard if isinstance(broker_guard, dict) else {},
+                "loss_review_restriction": loss_restriction if isinstance(loss_restriction, dict) else {},
+                "execution_cooldown": execution_cooldown if isinstance(execution_cooldown, dict) else {},
+                "evidence_trade_guard": evidence_guard if isinstance(evidence_guard, dict) else {},
             })
 
         overall_status = "OK"
@@ -2473,6 +3747,28 @@ class SessionManager:
         if data_quality.get("status") == "CHECK":
             overall_status = "CHECK"
             warnings.append("Market data quality needs review")
+        if evidence_review.get("status") == "CHECK":
+            overall_status = "CHECK"
+            warnings.append("Trade evidence/thesis review queue needs attention")
+        foresight_report = self.get_foresight_report(limit=100) if self._foresight else {
+            "counts": {"active": 0, "stale": 0, "failed": 0},
+            "event_count": 0,
+        }
+        specialist_report = self.get_specialist_briefs(limit=100)
+        committee_report = self.get_committee_reviews(limit=100)
+        managed_artifacts = self.get_artifacts(limit=100)
+        managed_runs = self.get_agent_runs(limit=100)
+        managed_budgets = self.get_budget_report(limit=200)
+        scheduler_jobs = self.get_scheduler_jobs()
+        if managed_artifacts.get("summary", {}).get("stale_count", 0):
+            overall_status = "CHECK"
+            warnings.append(f"{managed_artifacts['summary'].get('stale_count')} managed artefact(s) stale or degraded")
+        if managed_runs.get("summary", {}).get("failed_count", 0):
+            overall_status = "CHECK"
+            warnings.append(f"{managed_runs['summary'].get('failed_count')} recent managed run(s) failed")
+        if managed_budgets.get("today", {}).get("degraded"):
+            overall_status = "CHECK"
+            warnings.append(managed_budgets["today"].get("degraded_reason") or "Model/tool budget is degraded")
         for pod in pods:
             if pod["status"] != "OK":
                 overall_status = "CHECK"
@@ -2489,7 +3785,383 @@ class SessionManager:
             "nav_history": nav_history,
             "broker": broker_status,
             "data_quality": data_quality,
+            "evidence_review": evidence_review,
+            "foresight": {
+                "event_count": foresight_report.get("event_count", 0),
+                "counts": foresight_report.get("counts", {}),
+            },
+            "specialists": {
+                "brief_count": specialist_report.get("count", 0),
+            },
+            "committee_reviews": {
+                "review_count": committee_report.get("count", 0),
+            },
+            "managed_runtime": {
+                "agent_runs": managed_runs.get("summary", {}),
+                "artifacts": managed_artifacts.get("summary", {}),
+                "budgets": managed_budgets,
+                "scheduler": scheduler_jobs,
+            },
         }
+
+    @staticmethod
+    def _parse_review_timestamp(value) -> datetime | None:
+        if not value:
+            return None
+        try:
+            ts = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return ts.astimezone(timezone.utc)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _freshness_limit_for_symbol(symbol: str) -> int:
+        return 180 if "/" in str(symbol or "") else 900
+
+    def _score_evidence_packet(self, pod_id: str, symbol: str, snap, meta: dict) -> dict:
+        """Score evidence coverage/freshness for one open holding."""
+        packet = (
+            meta.get("latest_evidence_packet")
+            or meta.get("evidence_packet")
+            or getattr(snap, "evidence_packet", {})
+            or {}
+        )
+        if not isinstance(packet, dict):
+            packet = {}
+
+        now = datetime.now(timezone.utc)
+        reasons: list[str] = []
+        next_actions: list[str] = []
+        priority = 0
+
+        generated_at = packet.get("generated_at", "")
+        generated_ts = self._parse_review_timestamp(generated_at)
+        packet_age_seconds = round((now - generated_ts).total_seconds(), 1) if generated_ts else None
+
+        market = packet.get("market_context", {}) if packet else {}
+        if not isinstance(market, dict):
+            market = {}
+        price_age = market.get("price_age_seconds")
+        try:
+            price_age = float(price_age) if price_age is not None else None
+        except (TypeError, ValueError):
+            price_age = None
+        limit_s = self._freshness_limit_for_symbol(symbol)
+
+        checks = packet.get("checks", []) if packet else []
+        checks = [c for c in checks if isinstance(c, dict)] if isinstance(checks, list) else []
+        missing_evidence = packet.get("missing_evidence", []) if packet else []
+        missing_evidence = [str(x) for x in missing_evidence if str(x).strip()] if isinstance(missing_evidence, list) else []
+
+        if not packet:
+            reasons.append("No evidence packet recorded for this open holding")
+            next_actions.append("Open the holding detail and wait for the next reviewed PM decision, or manually review before adding risk.")
+            priority += 55
+        if generated_ts is None and packet:
+            reasons.append("Evidence packet has no timestamp")
+            priority += 20
+        elif packet_age_seconds is not None and packet_age_seconds > 24 * 3600:
+            reasons.append("Evidence packet is older than 24h")
+            next_actions.append("Refresh thesis against current macro/news regime before adding exposure.")
+            priority += 20
+
+        if price_age is None and packet:
+            reasons.append("Evidence packet has no market data freshness age")
+            priority += 12
+        elif price_age is not None and price_age > limit_s:
+            reasons.append(f"Market price evidence is stale ({price_age:.0f}s old)")
+            next_actions.append("Refresh market data before making a new risk-increasing decision.")
+            priority += 25
+
+        check_statuses = [str(c.get("status") or "").upper() for c in checks]
+        if any(s in {"BLOCK", "BLOCKED", "REJECTED", "FAILED", "FAIL"} for s in check_statuses):
+            reasons.append("One or more recorded checks failed or blocked the trade")
+            priority += 45
+        warn_count = sum(1 for s in check_statuses if s in {"WARN", "WATCH", "REDUCE_ONLY", "ACTIVE"})
+        if warn_count:
+            reasons.append(f"{warn_count} evidence/risk check(s) are in warning state")
+            priority += min(30, warn_count * 10)
+
+        if missing_evidence:
+            reasons.append(f"{len(missing_evidence)} missing/weak evidence item(s)")
+            next_actions.append("Ask PM to strengthen facts, assumptions, why-now, valuation, or catalyst evidence.")
+            priority += min(35, len(missing_evidence) * 7)
+
+        thesis_status = str(
+            getattr(snap, "thesis_status", "")
+            or meta.get("thesis_status")
+            or (meta.get("thesis_review") or {}).get("status")
+            or "unknown"
+        ).lower()
+        thesis_issues = list(getattr(snap, "thesis_issues", []) or meta.get("thesis_issues", []) or [])
+        if thesis_status in {"broken", "challenged", "needs_pm_rewrite", "watch"}:
+            reasons.append(f"Thesis lifecycle status is {thesis_status}")
+            next_actions.append("Review thesis validity before adding or holding unchanged through the next cycle.")
+            priority += 35 if thesis_status in {"broken", "needs_pm_rewrite"} else 22
+        if thesis_issues:
+            reasons.extend(str(issue) for issue in thesis_issues[:3])
+            priority += min(20, len(thesis_issues) * 6)
+
+        coverage_checks = {
+            "pm_thesis": bool((packet.get("trade") or {}).get("entry_thesis")) if packet else False,
+            "market_data": bool(market.get("price_source")) if packet else False,
+            "gate_checks": bool(checks),
+            "news": bool(((packet.get("evidence") or {}).get("top_news") or [])) if packet else False,
+            "prediction_markets": bool(((packet.get("evidence") or {}).get("top_prediction_markets") or [])) if packet else False,
+            "macro_facts": bool(market.get("fred")) if packet else False,
+        }
+        coverage_count = sum(1 for ok in coverage_checks.values() if ok)
+        coverage_score = round(coverage_count / max(1, len(coverage_checks)) * 100, 1)
+        if coverage_score < 50:
+            reasons.append("Evidence coverage is thin")
+            priority += 15
+
+        evidence_score = max(0, min(100, 100 - priority))
+        status = "OK"
+        if priority >= 70:
+            status = "URGENT"
+        elif priority >= 35:
+            status = "REVIEW"
+        elif priority > 0:
+            status = "WATCH"
+
+        if not next_actions:
+            next_actions.append("Monitor; no immediate action required.")
+
+        return {
+            "pod_id": pod_id,
+            "symbol": symbol,
+            "status": status,
+            "priority": min(100, priority),
+            "evidence_score": round(evidence_score, 1),
+            "coverage_score": coverage_score,
+            "coverage": coverage_checks,
+            "reasons": reasons[:8],
+            "next_action": next_actions[0],
+            "missing_evidence": missing_evidence[:8],
+            "check_statuses": check_statuses,
+            "thesis_status": thesis_status,
+            "thesis_issues": thesis_issues[:6],
+            "evidence_generated_at": generated_at,
+            "evidence_age_seconds": packet_age_seconds,
+            "price_source": market.get("price_source", ""),
+            "price_age_seconds": price_age,
+            "current_price": getattr(snap, "current_price", 0.0),
+            "qty": getattr(snap, "qty", 0.0),
+            "notional": getattr(snap, "notional", 0.0),
+        }
+
+    def get_evidence_review_queue(self) -> dict:
+        """Return an actionable queue of positions with weak, stale, or missing evidence."""
+        generated_at = datetime.now(timezone.utc).isoformat()
+        rows: list[dict] = []
+        for pod_id in POD_IDS:
+            runtime = self._pod_runtimes.get(pod_id)
+            if not runtime:
+                continue
+            accountant = runtime._ns.get("accountant")
+            if not accountant:
+                continue
+            for symbol, snap in accountant.current_positions.items():
+                entry_metadata = getattr(accountant, "_entry_metadata", {}) or {}
+                meta = entry_metadata.get(symbol, {}) if isinstance(entry_metadata, dict) else {}
+                row = self._score_evidence_packet(pod_id, symbol, snap, meta)
+                if row["status"] != "OK":
+                    rows.append(row)
+
+        rows.sort(key=lambda row: (row.get("priority", 0), abs(row.get("notional", 0) or 0)), reverse=True)
+        counts = {"URGENT": 0, "REVIEW": 0, "WATCH": 0}
+        for row in rows:
+            if row["status"] in counts:
+                counts[row["status"]] += 1
+        return {
+            "generated_at": generated_at,
+            "status": "CHECK" if rows else "OK",
+            "counts": counts,
+            "queue": rows[:50],
+        }
+
+    @staticmethod
+    def _evidence_guard_reason(row: dict) -> str:
+        reasons = [str(v) for v in row.get("reasons", []) if str(v).strip()]
+        reason = "; ".join(reasons[:3]) if reasons else "Evidence/thesis review is required"
+        return f"{row.get('status', 'REVIEW')} evidence review for {row.get('symbol', 'symbol')}: {reason}"
+
+    @staticmethod
+    def _format_evidence_review_text(rows: list[dict]) -> str:
+        if not rows:
+            return ""
+        lines = ["Evidence/thesis review queue:"]
+        for row in rows[:8]:
+            reasons = "; ".join(str(v) for v in (row.get("reasons") or [])[:2]) or "review required"
+            lines.append(
+                f"  {str(row.get('symbol', '')).upper()}: {row.get('status')} "
+                f"score={row.get('evidence_score')} coverage={row.get('coverage_score')}% - {reasons}"
+            )
+        return "\n".join(lines)
+
+    def _build_evidence_trade_guard(self, review_queue: dict | None) -> dict:
+        """Translate evidence review rows into per-pod trading restrictions."""
+        review_queue = review_queue or {}
+        generated_at = review_queue.get("generated_at") or datetime.now(timezone.utc).isoformat()
+        pod_rows: dict[str, list[dict]] = {pod_id: [] for pod_id in POD_IDS}
+        blocked_count = 0
+        review_count = 0
+        urgent_count = 0
+
+        for row in review_queue.get("queue", []) or []:
+            if not isinstance(row, dict):
+                continue
+            pod_id = str(row.get("pod_id") or "").lower()
+            symbol = str(row.get("symbol") or "").upper()
+            if pod_id not in pod_rows or not symbol:
+                continue
+            status = str(row.get("status") or "WATCH").upper()
+            item = dict(row)
+            item["symbol"] = symbol
+            item["status"] = status
+            item["reason"] = self._evidence_guard_reason(item)
+            item["requires_thesis_refresh"] = status in {"URGENT", "REVIEW"}
+            item["block_new_risk"] = status in {"URGENT", "REVIEW"}
+            item["block_all_orders"] = False
+            item["allow_add_after_refresh"] = status == "REVIEW"
+            item["mode"] = "reduce_only" if status == "URGENT" else (
+                "refresh_required" if status == "REVIEW" else "watch"
+            )
+            pod_rows[pod_id].append(item)
+            if item["block_new_risk"]:
+                blocked_count += 1
+            if status == "REVIEW":
+                review_count += 1
+            if status == "URGENT":
+                urgent_count += 1
+
+        pods: dict[str, dict] = {}
+        for pod_id in POD_IDS:
+            rows = pod_rows[pod_id]
+            blocked_symbols = {
+                row["symbol"]: {
+                    "status": row["status"],
+                    "mode": row["mode"],
+                    "reason": row["reason"],
+                    "next_action": row.get("next_action", ""),
+                    "evidence_score": row.get("evidence_score"),
+                    "coverage_score": row.get("coverage_score"),
+                    "requires_thesis_refresh": row.get("requires_thesis_refresh", False),
+                    "block_new_risk": row.get("block_new_risk", False),
+                    "block_all_orders": False,
+                    "allow_add_after_refresh": row.get("allow_add_after_refresh", False),
+                    "reasons": list(row.get("reasons") or []),
+                    "missing_evidence": list(row.get("missing_evidence") or []),
+                }
+                for row in rows
+                if row.get("block_new_risk")
+            }
+            pods[pod_id] = {
+                "generated_at": generated_at,
+                "pod_id": pod_id,
+                "status": "CHECK" if rows else "OK",
+                "mode": (
+                    "reduce_only" if any(row.get("status") == "URGENT" for row in rows)
+                    else "refresh_required" if blocked_symbols
+                    else "watch" if rows
+                    else "normal"
+                ),
+                "blocked_symbols": blocked_symbols,
+                "review_rows": rows[:20],
+                "review_text": self._format_evidence_review_text(rows),
+                "blocked_count": len(blocked_symbols),
+                "watch_count": sum(1 for row in rows if row.get("status") == "WATCH"),
+                "review_count": sum(1 for row in rows if row.get("status") == "REVIEW"),
+                "urgent_count": sum(1 for row in rows if row.get("status") == "URGENT"),
+            }
+
+        return {
+            "generated_at": generated_at,
+            "status": "CHECK" if blocked_count or review_queue.get("status") == "CHECK" else "OK",
+            "blocked_count": blocked_count,
+            "review_count": review_count,
+            "urgent_count": urgent_count,
+            "pods": pods,
+            "source": "evidence_review_queue",
+        }
+
+    def _apply_evidence_trade_guard(self, review_queue: dict | None = None) -> dict:
+        guard = self._build_evidence_trade_guard(review_queue or self.get_evidence_review_queue())
+        for pod_id, runtime in self._pod_runtimes.items():
+            try:
+                pod_guard = (guard.get("pods") or {}).get(pod_id, {
+                    "generated_at": guard.get("generated_at"),
+                    "pod_id": pod_id,
+                    "status": "OK",
+                    "mode": "normal",
+                    "blocked_symbols": {},
+                    "review_rows": [],
+                    "review_text": "",
+                    "blocked_count": 0,
+                    "watch_count": 0,
+                    "review_count": 0,
+                    "urgent_count": 0,
+                })
+                runtime._ns.set("evidence_trade_guard", pod_guard)
+                runtime._ns.set("evidence_review_text", pod_guard.get("review_text", ""))
+            except Exception:
+                logger.debug("[session_manager] Failed to set evidence guard on %s", pod_id, exc_info=True)
+        self._last_evidence_trade_guard = guard
+        return guard
+
+    async def _publish_evidence_trade_guard_events(self, guard: dict) -> None:
+        signatures = getattr(self, "_evidence_guard_last_signature", {})
+        if not isinstance(signatures, dict):
+            signatures = {}
+        for pod_id, pod_guard in (guard.get("pods") or {}).items():
+            for symbol, block in (pod_guard.get("blocked_symbols") or {}).items():
+                status = str(block.get("status") or "REVIEW").upper()
+                reason = str(block.get("reason") or "")
+                signature = f"{status}:{reason[:160]}"
+                key = f"{pod_id}:{symbol}"
+                if signatures.get(key) == signature:
+                    continue
+                signatures[key] = signature
+                try:
+                    await self._event_bus.publish("agent.activity", AgentMessage(
+                        timestamp=datetime.now(timezone.utc),
+                        sender=f"{pod_id}.runtime",
+                        recipient="dashboard",
+                        topic="agent.activity",
+                        payload={
+                            "agent_id": f"{pod_id}_runtime",
+                            "agent_role": "Runtime",
+                            "pod_id": pod_id,
+                            "symbol": symbol,
+                            "action": "evidence_review_required",
+                            "status": "REDUCE_ONLY" if status == "URGENT" else "REVIEW_REQUIRED",
+                            "summary": (
+                                f"{pod_id.upper()} {symbol}: "
+                                f"{'reduce-only' if status == 'URGENT' else 'thesis refresh required'}"
+                            ),
+                            "detail": reason[:700],
+                            "reason": reason,
+                        },
+                    ), publisher_id=f"{pod_id}.runtime")
+                except Exception as exc:
+                    logger.debug("[session_manager] Failed to publish evidence guard event: %s", exc)
+        self._evidence_guard_last_signature = signatures
+
+    async def _refresh_evidence_trade_guards(self) -> dict:
+        """Refresh evidence review restrictions and push them into every pod runtime."""
+        review_queue = self.get_evidence_review_queue()
+        guard = self._apply_evidence_trade_guard(review_queue)
+        if guard.get("status") != "OK":
+            logger.warning(
+                "[session_manager] Evidence guard active: %d blocked symbol(s), %d urgent",
+                guard.get("blocked_count", 0),
+                guard.get("urgent_count", 0),
+            )
+        await self._publish_evidence_trade_guard_events(guard)
+        return guard
 
     def get_execution_truth(self) -> dict:
         """Summarize the latest PM-to-execution outcome per pod."""
@@ -2509,6 +4181,10 @@ class SessionManager:
                     "active_symbols": [],
                     "thesis_gate": {},
                     "data_gate": {},
+                    "broker_guard": {},
+                    "loss_review": {},
+                    "execution_cooldown": {},
+                    "evidence_guard": {},
                     "last_block": {},
                     "last_order_result": {},
                     "execution_feedback": [],
@@ -2534,9 +4210,21 @@ class SessionManager:
             order_result = ns.get("last_order_result") or {}
             feedback = list(ns.get("execution_feedback") or [])
             thesis_gate = ns.get("thesis_gate_result") or {}
+            quality_gate = ns.get("last_quality_gate") or {}
             data_gate = ns.get("last_data_quality_check") or {}
+            broker_guard = ns.get("broker_trade_guard") or {}
+            loss_review = ns.get("loss_review") or {}
+            execution_cooldown = ns.get("execution_cooldown") or {}
+            evidence_guard = ns.get("evidence_trade_guard") or {}
+            evidence_blocks = evidence_guard.get("blocked_symbols", {}) if isinstance(evidence_guard, dict) else {}
 
-            if not active_trades:
+            if not active_trades and evidence_blocks:
+                status = "GUARDED"
+                stage = "evidence_review"
+                reason = (
+                    f"{len(evidence_blocks)} symbol(s) require evidence/thesis review before adding risk"
+                )
+            elif not active_trades:
                 status = "NO_ACTIVE_TRADE"
                 stage = "pm"
                 reason = pm_decision.get("action_summary") or "PM did not propose a BUY/SELL trade"
@@ -2570,7 +4258,12 @@ class SessionManager:
                 "active_trade_count": len(active_trades),
                 "active_symbols": active_symbols,
                 "thesis_gate": thesis_gate,
+                "quality_gate": quality_gate,
                 "data_gate": data_gate,
+                "broker_guard": broker_guard,
+                "loss_review": loss_review,
+                "execution_cooldown": execution_cooldown,
+                "evidence_guard": evidence_guard,
                 "last_block": latest_block,
                 "last_order_result": order_result,
                 "execution_feedback": feedback[:3],
@@ -2579,7 +4272,7 @@ class SessionManager:
         status = "OK"
         if any(row["status"] in {"BLOCKED", "REJECTED"} for row in pods):
             status = "CHECK"
-        elif any(row["status"] in {"PENDING", "PROPOSED"} for row in pods):
+        elif any(row["status"] in {"PENDING", "PROPOSED", "GUARDED"} for row in pods):
             status = "PENDING"
 
         return {
@@ -3046,6 +4739,9 @@ class SessionManager:
         """Load real positions from Alpaca and inject into pod accountants."""
         try:
             positions = await self._alpaca.get_open_positions()
+            if not isinstance(positions, dict):
+                logger.debug("[session_manager] Alpaca positions returned unexpected payload during hydration")
+                positions = {}
             if not positions:
                 logger.info("[session_manager] Alpaca: no open positions to hydrate")
                 # Still run reconcile so pods keep allocated capital.
@@ -3181,6 +4877,7 @@ class SessionManager:
                 if reasoning and not acct._entry_theses.get(sym):
                     acct._entry_theses[sym] = reasoning
                 if sym not in acct._entry_metadata:
+                    evidence_packet = earliest.get("evidence_packet") or {}
                     acct._entry_metadata[sym] = {
                         "entry_price": acct._cost_basis.get(sym, 0),
                         "entry_time": ts,
@@ -3193,12 +4890,18 @@ class SessionManager:
                         "take_profit_pct": 0.15,
                         "exit_when": "",
                         "max_hold_days": 0,
+                        "evidence_packet": evidence_packet,
+                        "latest_evidence_packet": evidence_packet,
+                        "evidence_packets": [evidence_packet] if evidence_packet else [],
                     }
                 else:
                     acct._entry_metadata[sym].setdefault("entry_time", ts)
                     acct._entry_metadata[sym].setdefault("entry_thesis", reasoning)
                     if reasoning and not acct._entry_metadata[sym].get("reasoning"):
                         acct._entry_metadata[sym]["reasoning"] = reasoning
+                    if earliest.get("evidence_packet") and not acct._entry_metadata[sym].get("evidence_packet"):
+                        acct._entry_metadata[sym]["evidence_packet"] = earliest.get("evidence_packet")
+                        acct._entry_metadata[sym]["latest_evidence_packet"] = earliest.get("evidence_packet")
 
                 existing_keys = set()
                 for f in getattr(acct, "_fill_log", []):
@@ -3237,7 +4940,14 @@ class SessionManager:
                         "conviction": buy.get("conviction", 0),
                         "strategy_tag": buy.get("strategy_tag", ""),
                         "signal_snapshot": buy.get("signal_snapshot", {}),
+                        "evidence_packet": buy.get("evidence_packet", {}),
                     })
+                    if buy.get("evidence_packet"):
+                        meta = acct._entry_metadata.setdefault(sym, {})
+                        packets = list(meta.get("evidence_packets") or [])
+                        packets.append(buy.get("evidence_packet"))
+                        meta["evidence_packets"] = packets[-20:]
+                        meta["latest_evidence_packet"] = buy.get("evidence_packet")
                     existing_keys.add(key)
                     backfilled += 1
                 logger.info(
@@ -3258,6 +4968,7 @@ class SessionManager:
             return {"already_stopped": True}
         self._stop_in_progress = True
         logger.info("[session_manager] Stopping live session")
+        await self._set_session_stage("stopping", "Stopping session")
         self._session_active = False
 
         # Persist final state before shutdown
@@ -3301,6 +5012,14 @@ class SessionManager:
             except Exception as e:
                 logger.warning("[session_manager] Error closing NavStore: %s", e)
             self._nav_store = None
+
+        if self._managed_runtime:
+            try:
+                self._managed_runtime.close()
+                logger.info("[session_manager] ManagedRuntime stores closed")
+            except Exception as e:
+                logger.warning("[session_manager] Error closing ManagedRuntime stores: %s", e)
+            self._managed_runtime = None
 
         # Skip if session may be restarted via dashboard
         if not self._restartable:
@@ -3371,6 +5090,7 @@ class SessionManager:
         uptime_seconds = (datetime.now() - self._start_time).total_seconds() if hasattr(self, '_start_time') else 0
 
         self._stop_in_progress = False
+        await self._set_session_stage("idle", "Idle")
 
         # Return session summary
         return {
@@ -3389,6 +5109,11 @@ class SessionManager:
     def iteration(self) -> int:
         """Current event loop iteration count."""
         return self._iteration
+
+    @property
+    def session_stage(self) -> dict[str, str | None]:
+        """Current long-running loop phase for dashboard status text."""
+        return self._session_stage_payload()
 
     @property
     def event_bus(self) -> EventBus:
@@ -3646,9 +5371,14 @@ class SessionManager:
                         or meta.get("entry_thesis")
                         or meta.get("reasoning", "")
                     ),
+                    "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
+                    "take_profit_pct": meta.get("take_profit_pct", 0.15),
+                    "take_profit_levels": list(meta.get("take_profit_levels", [])),
+                    "take_profit_hits": list(meta.get("take_profit_hits", [])),
                     "thesis_status": snap.thesis_status or meta.get("thesis_status", "unknown"),
                     "thesis_issues": snap.thesis_issues or meta.get("thesis_issues", []),
                     "thesis_review": snap.thesis_review or meta.get("thesis_review", {}),
+                    "evidence_packet": snap.evidence_packet or meta.get("latest_evidence_packet") or meta.get("evidence_packet", {}),
                     "price_source": snap.price_source,
                     "price_updated_at": snap.price_updated_at,
                     "price_stale": snap.price_stale,
@@ -3706,6 +5436,7 @@ class SessionManager:
                 "signal_snapshot": f.get("signal_snapshot", {}),
                 "entry_macro_regime": f.get("entry_macro_regime", ""),
                 "thesis_review": f.get("thesis_review", {}),
+                "evidence_packet": f.get("evidence_packet", {}),
             })
 
         # Also include fills from restored memory
@@ -3748,6 +5479,7 @@ class SessionManager:
                 "signal_snapshot": t.get("signal_snapshot", {}),
                 "entry_macro_regime": t.get("entry_macro_regime", ""),
                 "thesis_review": t.get("thesis_review", {}),
+                "evidence_packet": t.get("evidence_packet", {}),
             })
 
         fills.sort(key=lambda x: x.get("timestamp", ""))
@@ -3769,6 +5501,92 @@ class SessionManager:
             })
 
         reasoning_history = accountant.get_reasoning_log(symbol)
+        ns = runtime._ns
+        pm_decision = ns.get("last_pm_decision") or {}
+        pm_trades = pm_decision.get("trades", []) if isinstance(pm_decision, dict) else []
+        pm_matches = [
+            trade for trade in pm_trades
+            if isinstance(trade, dict) and str(trade.get("symbol", "")).upper() == symbol.upper()
+        ]
+        quality_history = [
+            gate for gate in list(ns.get("quality_gate_history") or [])
+            if isinstance(gate, dict) and str(gate.get("symbol", "")).upper() == symbol.upper()
+        ][:10]
+        block_history = [
+            block for block in list(ns.get("trade_blocks") or [])
+            if isinstance(block, dict) and str(block.get("symbol", "")).upper() == symbol.upper()
+        ][:10]
+        evidence_packet = (
+            meta.get("latest_evidence_packet")
+            or meta.get("evidence_packet")
+            or getattr(snap, "evidence_packet", {})
+            or {}
+        )
+        if not isinstance(evidence_packet, dict):
+            evidence_packet = {}
+        evidence_packets = [
+            packet for packet in list(meta.get("evidence_packets") or [])
+            if isinstance(packet, dict)
+        ]
+        if evidence_packet and evidence_packet not in evidence_packets:
+            evidence_packets.append(evidence_packet)
+        decision_chain: list[dict] = []
+        if evidence_packet:
+            trade = evidence_packet.get("trade", {}) if isinstance(evidence_packet, dict) else {}
+            market = evidence_packet.get("market_context", {}) if isinstance(evidence_packet, dict) else {}
+            decision_chain.append({
+                "stage": "evidence_packet",
+                "timestamp": evidence_packet.get("generated_at", ""),
+                "status": "RECORDED",
+                "summary": (
+                    f"{trade.get('side', '')} {trade.get('qty', '')} {symbol} "
+                    f"at {market.get('price_source') or 'market'}"
+                ).strip(),
+                "detail": trade.get("entry_thesis", ""),
+                "llm": (evidence_packet.get("evidence", {}) or {}).get("pm_llm", {}),
+            })
+            for check in (evidence_packet.get("checks") or [])[:8]:
+                if not isinstance(check, dict):
+                    continue
+                decision_chain.append({
+                    "stage": check.get("name", "check"),
+                    "timestamp": evidence_packet.get("generated_at", ""),
+                    "status": str(check.get("status") or "INFO").upper(),
+                    "summary": (
+                        f"Score {check.get('score')}"
+                        if check.get("score") is not None
+                        else str(check.get("source") or check.get("price") or "")
+                    ),
+                    "detail": check.get("detail", ""),
+                    "llm": {},
+                })
+        if pm_matches:
+            decision_chain.append({
+                "stage": "pm_decision",
+                "timestamp": pm_decision.get("timestamp", ""),
+                "status": "PROPOSED",
+                "summary": pm_decision.get("action_summary", ""),
+                "detail": self._extract_trade_reasoning(pm_matches[0].get("reasoning") or pm_decision.get("reasoning", ""), symbol),
+                "llm": pm_decision.get("llm", {}),
+            })
+        for gate in quality_history[:3]:
+            decision_chain.append({
+                "stage": "quality_gate",
+                "timestamp": gate.get("timestamp", ""),
+                "status": str(gate.get("status") or gate.get("action") or "").upper(),
+                "summary": f"Quality score {gate.get('quality_score', '—')}",
+                "detail": gate.get("reason", ""),
+                "llm": gate.get("llm", {}),
+            })
+        for block in block_history[:3]:
+            decision_chain.append({
+                "stage": block.get("stage", "runtime_gate"),
+                "timestamp": block.get("timestamp", ""),
+                "status": block.get("status", "BLOCKED"),
+                "summary": f"{block.get('side', '')} {block.get('qty', '')} {symbol}".strip(),
+                "detail": block.get("reason", ""),
+                "llm": {},
+            })
 
         return {
             "symbol": symbol,
@@ -3790,12 +5608,16 @@ class SessionManager:
             ),
             "stop_loss_pct": meta.get("stop_loss_pct", 0.05),
             "take_profit_pct": meta.get("take_profit_pct", 0.15),
+            "take_profit_levels": list(meta.get("take_profit_levels", [])),
+            "take_profit_hits": list(meta.get("take_profit_hits", [])),
             "max_hold_days": meta.get("max_hold_days", 0),
             "conviction": meta.get("conviction", 0),
             "days_held": days_held,
             "thesis_status": snap.thesis_status or meta.get("thesis_status", "unknown"),
             "thesis_issues": snap.thesis_issues or meta.get("thesis_issues", []),
             "thesis_review": snap.thesis_review or meta.get("thesis_review", {}),
+            "evidence_packet": evidence_packet,
+            "evidence_packets": evidence_packets,
             "price_source": snap.price_source,
             "price_updated_at": snap.price_updated_at,
             "price_stale": snap.price_stale,
@@ -3803,6 +5625,9 @@ class SessionManager:
             "fills": fills,
             "partial_exits": partial_exits,
             "reasoning_history": reasoning_history,
+            "quality_gate_history": quality_history,
+            "trade_blocks": block_history,
+            "decision_chain": decision_chain,
         }
 
     @staticmethod

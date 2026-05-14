@@ -45,3 +45,36 @@ def test_completeness_score():
     cache = ParquetCache(tempfile.mkdtemp())
     score = cache.completeness_score("NONEXIST", date(2024, 1, 2), date(2024, 1, 5))
     assert score == 0.0
+
+
+def test_yfinance_adapter_normalizes_crypto_symbols_for_yahoo():
+    cache = ParquetCache(tempfile.mkdtemp())
+    adapter = YFinanceAdapter(cache=cache)
+    fake_df = MagicMock()
+    fake_df.iterrows.return_value = []
+
+    with patch("src.data.adapters.yfinance_adapter.yf.Ticker") as mock_ticker:
+        mock_ticker.return_value.history.return_value = fake_df
+
+        bars = adapter._fetch_sync("ETH/USD", date(2024, 1, 2), date(2024, 1, 5))
+
+    mock_ticker.assert_called_once_with("ETH-USD")
+    assert bars == []
+
+
+def test_yfinance_adapter_keeps_original_symbol_on_crypto_bars():
+    cache = ParquetCache(tempfile.mkdtemp())
+    adapter = YFinanceAdapter(cache=cache)
+
+    with patch("src.data.adapters.yfinance_adapter.yf.Ticker") as mock_ticker:
+        mock_ticker.return_value.history.return_value.iterrows.return_value = [
+            (
+                MagicMock(to_pydatetime=MagicMock(return_value=datetime(2024, 1, 2))),
+                {"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5, "Volume": 1234},
+            )
+        ]
+
+        bars = adapter._fetch_sync("SOL/USD", date(2024, 1, 2), date(2024, 1, 5))
+
+    assert bars[0].symbol == "SOL/USD"
+    mock_ticker.assert_called_once_with("SOL-USD")

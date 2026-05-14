@@ -229,6 +229,43 @@ class AlpacaAdapter:
         except Exception:
             return 0.0
 
+    @staticmethod
+    def _symbol_aliases(symbol: str) -> set[str]:
+        raw = str(symbol or "").upper()
+        return {
+            raw,
+            raw.replace("/", ""),
+            raw.replace("/", "-"),
+        }
+
+    @staticmethod
+    def _allow_short_sells() -> bool:
+        raw = os.getenv("ALPACA_ALLOW_SHORT_SELLS", "false")
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    def _sync_open_sell_order_qty(self, symbol: str) -> float:
+        """Return quantity already reserved by open broker sell orders."""
+        aliases = self._symbol_aliases(symbol)
+        try:
+            orders = self._client.list_orders(status="open")
+        except Exception as exc:
+            logger.debug("[alpaca] open-order lookup failed for %s: %s", symbol, exc)
+            return 0.0
+
+        reserved = 0.0
+        for order in orders or []:
+            side = str(getattr(order, "side", "") or "").lower()
+            order_symbol = str(getattr(order, "symbol", "") or "").upper()
+            if side != "sell" or order_symbol not in aliases:
+                continue
+            try:
+                qty = float(getattr(order, "qty", 0.0) or 0.0)
+                filled_qty = float(getattr(order, "filled_qty", 0.0) or 0.0)
+            except Exception:
+                continue
+            reserved += max(qty - filled_qty, 0.0)
+        return reserved
+
     async def _preflight_order(
         self,
         symbol: str,
@@ -288,7 +325,28 @@ class AlpacaAdapter:
         if side == "sell":
             held_qty = self._sync_position_qty(symbol)
             long_qty = max(held_qty, 0.0)
-            excess_short_qty = max(qty - long_qty, 0.0)
+            reserved_sell_qty = await asyncio.to_thread(self._sync_open_sell_order_qty, symbol)
+            available_long_qty = max(long_qty - reserved_sell_qty, 0.0)
+
+            if qty > available_long_qty + 1e-6:
+                if reserved_sell_qty > 0:
+                    return reject(
+                        (
+                            f"Open sell order already reserves {reserved_sell_qty:.8g} {symbol}; "
+                            f"broker available long quantity is {available_long_qty:.8g}"
+                        ),
+                        "sell_qty_reserved_by_open_order",
+                    )
+                if not self._allow_short_sells():
+                    return reject(
+                        (
+                            f"No broker long quantity available to sell for {symbol} "
+                            f"(requested {qty:.8g}, available {available_long_qty:.8g})"
+                        ),
+                        "insufficient_sellable_qty",
+                    )
+
+            excess_short_qty = max(qty - available_long_qty, 0.0)
             if excess_short_qty > 0:
                 if is_crypto:
                     return reject("Alpaca crypto short selling is not supported", "crypto_short_not_supported")

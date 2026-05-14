@@ -44,6 +44,44 @@ CREATE TABLE IF NOT EXISTS research_source_health (
 )
 """
 
+_CATALYST_SCHEMA = """
+CREATE TABLE IF NOT EXISTS catalyst_events (
+    event_id VARCHAR PRIMARY KEY,
+    created_at TIMESTAMP,
+    updated_at TIMESTAMP,
+    title VARCHAR,
+    summary VARCHAR,
+    source_refs JSON,
+    novelty_score DOUBLE,
+    impact_score DOUBLE,
+    confidence DOUBLE,
+    affected_pods JSON,
+    affected_symbols JSON,
+    factors JSON,
+    direction VARCHAR,
+    horizon VARCHAR,
+    suggested_specialists JSON,
+    status VARCHAR,
+    raw JSON
+)
+"""
+
+_CATALYST_V2_COLUMNS: dict[str, str] = {
+    "thread_id": "VARCHAR",
+    "materiality_score": "DOUBLE",
+    "horizon_start": "TIMESTAMP",
+    "horizon_end": "TIMESTAMP",
+    "transmission_path": "VARCHAR",
+    "uncertainty": "VARCHAR",
+    "routing_reason": "JSON",
+    "linked_run_ids": "JSON",
+    "linked_report_ids": "JSON",
+    "linked_trade_ids": "JSON",
+    "outcome_score": "DOUBLE",
+    "hindsight_score": "DOUBLE",
+    "reviewed_at": "TIMESTAMP",
+}
+
 _ASSET_KEYWORDS: dict[str, tuple[str, ...]] = {
     "equities": (
         "stock", "stocks", "equity", "equities", "earnings", "shares", "nasdaq",
@@ -222,9 +260,24 @@ class ResearchFeedStore:
         self._conn = duckdb.connect(db_path)
         self._conn.execute(_ITEM_SCHEMA)
         self._conn.execute(_SOURCE_SCHEMA)
+        self._conn.execute(_CATALYST_SCHEMA)
+        self._migrate_catalyst_schema()
 
     def close(self) -> None:
         self._conn.close()
+
+    def _migrate_catalyst_schema(self) -> None:
+        """Add V2 Catalyst Ledger columns without disturbing existing stores."""
+        try:
+            rows = self._conn.execute("PRAGMA table_info('catalyst_events')").fetchall()
+            existing = {str(row[1]) for row in rows}
+            for column, column_type in _CATALYST_V2_COLUMNS.items():
+                if column not in existing:
+                    self._conn.execute(f"ALTER TABLE catalyst_events ADD COLUMN {column} {column_type}")
+        except Exception:
+            # Old rows still carry the full event JSON in `raw`; callers can degrade
+            # gracefully if the migration is unavailable.
+            pass
 
     def record_source_status(
         self,
@@ -368,12 +421,241 @@ class ResearchFeedStore:
             result.append(item)
         return result
 
+    def record_catalyst_events(self, events: Iterable[dict[str, Any]], ts: datetime | None = None) -> int:
+        """Persist advisory Foresight catalyst events."""
+        ts = ts or _utc_now()
+        count = 0
+        for raw_event in events or []:
+            if hasattr(raw_event, "model_dump"):
+                event = raw_event.model_dump(mode="json")
+            elif isinstance(raw_event, dict):
+                event = dict(raw_event)
+            else:
+                continue
+            event_id = str(event.get("event_id") or "").strip()
+            title = str(event.get("title") or "").strip()
+            if not event_id or not title:
+                continue
+            created_at = _parse_dt(event.get("created_at") or ts)
+            horizon_start = _parse_dt(event.get("horizon_start")) if event.get("horizon_start") else None
+            horizon_end = _parse_dt(event.get("horizon_end")) if event.get("horizon_end") else None
+            reviewed_at = _parse_dt(event.get("reviewed_at")) if event.get("reviewed_at") else None
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO catalyst_events (
+                    event_id, created_at, updated_at, title, summary, source_refs,
+                    novelty_score, impact_score, confidence, affected_pods,
+                    affected_symbols, factors, direction, horizon,
+                    suggested_specialists, status, raw, thread_id,
+                    materiality_score, horizon_start, horizon_end, transmission_path,
+                    uncertainty, routing_reason, linked_run_ids, linked_report_ids,
+                    linked_trade_ids, outcome_score, hindsight_score, reviewed_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    event_id,
+                    created_at,
+                    ts,
+                    title[:500],
+                    str(event.get("summary") or "")[:1400],
+                    _json_dumps(event.get("source_refs") or []),
+                    float(event.get("novelty_score") or 0.0),
+                    float(event.get("impact_score") or 0.0),
+                    float(event.get("confidence") or 0.0),
+                    _json_dumps(event.get("affected_pods") or []),
+                    _json_dumps(event.get("affected_symbols") or []),
+                    _json_dumps(event.get("factors") or []),
+                    str(event.get("direction") or "mixed"),
+                    str(event.get("horizon") or "days"),
+                    _json_dumps(event.get("suggested_specialists") or []),
+                    str(event.get("status") or "active"),
+                    _json_dumps(event),
+                    str(event.get("thread_id") or event_id),
+                    float(event.get("materiality_score") or event.get("impact_score") or 0.0),
+                    horizon_start,
+                    horizon_end,
+                    str(event.get("transmission_path") or ""),
+                    str(event.get("uncertainty") or ""),
+                    _json_dumps(event.get("routing_reason") or {}),
+                    _json_dumps(event.get("linked_run_ids") or []),
+                    _json_dumps(event.get("linked_report_ids") or []),
+                    _json_dumps(event.get("linked_trade_ids") or []),
+                    float(event.get("outcome_score")) if event.get("outcome_score") is not None else None,
+                    float(event.get("hindsight_score")) if event.get("hindsight_score") is not None else None,
+                    reviewed_at,
+                ],
+            )
+            count += 1
+        return count
+
+    def get_catalyst_events(self, limit: int = 100, pod_id: str | None = None) -> list[dict[str, Any]]:
+        """Return persisted Catalyst Ledger events, optionally filtered by pod."""
+        limit = max(1, min(int(limit or 100), 500))
+        rows = self._conn.execute(
+            """
+            SELECT event_id, created_at, updated_at, title, summary, source_refs,
+                   novelty_score, impact_score, confidence, affected_pods,
+                   affected_symbols, factors, direction, horizon,
+                   suggested_specialists, status, raw, thread_id,
+                   materiality_score, horizon_start, horizon_end, transmission_path,
+                   uncertainty, routing_reason, linked_run_ids, linked_report_ids,
+                   linked_trade_ids, outcome_score, hindsight_score, reviewed_at
+            FROM catalyst_events
+            ORDER BY materiality_score DESC, impact_score DESC, confidence DESC, updated_at DESC
+            LIMIT ?
+            """,
+            [limit],
+        ).fetchall()
+        cols = [d[0] for d in self._conn.description]
+        result: list[dict[str, Any]] = []
+        pod_filter = (pod_id or "").strip().lower()
+        for row in rows:
+            item = dict(zip(cols, row))
+            for key in ("created_at", "updated_at", "horizon_start", "horizon_end", "reviewed_at"):
+                if hasattr(item.get(key), "isoformat"):
+                    item[key] = item[key].isoformat()
+            for key in (
+                "source_refs", "affected_pods", "affected_symbols", "factors",
+                "suggested_specialists", "linked_run_ids", "linked_report_ids",
+                "linked_trade_ids",
+            ):
+                item[key] = _json_loads(item.get(key), [])
+            item["routing_reason"] = _json_loads(item.get("routing_reason"), {})
+            item["raw"] = _json_loads(item.get("raw"), {})
+            for key, value in item.get("raw", {}).items():
+                item.setdefault(key, value)
+            if pod_filter and pod_filter not in [str(p).lower() for p in item.get("affected_pods", [])]:
+                continue
+            result.append(item)
+        return result
+
+    def catalyst_threads(self, limit: int = 100, pod_id: str | None = None) -> list[dict[str, Any]]:
+        events = self.get_catalyst_events(limit=max(limit * 4, 100), pod_id=pod_id)
+        threads: dict[str, dict[str, Any]] = {}
+        for event in events:
+            thread_id = str(event.get("thread_id") or event.get("event_id") or "")
+            if not thread_id:
+                continue
+            thread = threads.setdefault(thread_id, {
+                "thread_id": thread_id,
+                "title": event.get("title", ""),
+                "status": event.get("status", "active"),
+                "events": [],
+                "event_count": 0,
+                "affected_pods": set(),
+                "affected_symbols": set(),
+                "factors": set(),
+                "materiality_score": 0.0,
+                "latest_updated_at": "",
+                "hindsight_score": None,
+            })
+            thread["events"].append(event)
+            thread["event_count"] += 1
+            thread["materiality_score"] = max(
+                float(thread.get("materiality_score") or 0.0),
+                float(event.get("materiality_score") or event.get("impact_score") or 0.0),
+            )
+            if event.get("updated_at") and str(event.get("updated_at")) > str(thread.get("latest_updated_at") or ""):
+                thread["latest_updated_at"] = event.get("updated_at")
+                thread["title"] = event.get("title") or thread["title"]
+                thread["status"] = event.get("status") or thread["status"]
+            for pod in event.get("affected_pods") or []:
+                thread["affected_pods"].add(str(pod))
+            for symbol in event.get("affected_symbols") or []:
+                thread["affected_symbols"].add(str(symbol))
+            for factor in event.get("factors") or []:
+                thread["factors"].add(str(factor))
+            if event.get("hindsight_score") is not None:
+                thread["hindsight_score"] = event.get("hindsight_score")
+        rows = []
+        for thread in threads.values():
+            thread["affected_pods"] = sorted(thread["affected_pods"])
+            thread["affected_symbols"] = sorted(thread["affected_symbols"])
+            thread["factors"] = sorted(thread["factors"])
+            thread["events"] = sorted(thread["events"], key=lambda e: e.get("updated_at") or "", reverse=True)[:10]
+            rows.append(thread)
+        rows.sort(key=lambda t: (float(t.get("materiality_score") or 0.0), t.get("latest_updated_at") or ""), reverse=True)
+        return rows[: max(1, min(int(limit or 100), 500))]
+
+    def update_catalyst_lifecycle(
+        self,
+        event_id: str,
+        *,
+        status: str | None = None,
+        linked_run_ids: list[str] | None = None,
+        linked_report_ids: list[str] | None = None,
+        linked_trade_ids: list[str] | None = None,
+        outcome_score: float | None = None,
+        hindsight_score: float | None = None,
+        reviewed_at: datetime | None = None,
+    ) -> None:
+        current = self._conn.execute(
+            """
+            SELECT linked_run_ids, linked_report_ids, linked_trade_ids, raw
+            FROM catalyst_events WHERE event_id=?
+            """,
+            [event_id],
+        ).fetchone()
+        if not current:
+            return
+        existing_runs = _json_loads(current[0], [])
+        existing_reports = _json_loads(current[1], [])
+        existing_trades = _json_loads(current[2], [])
+        raw = _json_loads(current[3], {})
+
+        def merged(existing: list, incoming: list[str] | None) -> list:
+            out = [str(x) for x in existing or [] if x]
+            for item in incoming or []:
+                item = str(item)
+                if item and item not in out:
+                    out.append(item)
+            return out
+
+        runs = merged(existing_runs, linked_run_ids)
+        reports = merged(existing_reports, linked_report_ids)
+        trades = merged(existing_trades, linked_trade_ids)
+        if status:
+            raw["status"] = status
+        raw["linked_run_ids"] = runs
+        raw["linked_report_ids"] = reports
+        raw["linked_trade_ids"] = trades
+        if outcome_score is not None:
+            raw["outcome_score"] = outcome_score
+        if hindsight_score is not None:
+            raw["hindsight_score"] = hindsight_score
+        if reviewed_at is not None:
+            raw["reviewed_at"] = reviewed_at.isoformat()
+        self._conn.execute(
+            """
+            UPDATE catalyst_events
+            SET status=COALESCE(?, status), updated_at=?, linked_run_ids=?,
+                linked_report_ids=?, linked_trade_ids=?, outcome_score=COALESCE(?, outcome_score),
+                hindsight_score=COALESCE(?, hindsight_score), reviewed_at=COALESCE(?, reviewed_at),
+                raw=?
+            WHERE event_id=?
+            """,
+            [
+                status,
+                _utc_now(),
+                _json_dumps(runs),
+                _json_dumps(reports),
+                _json_dumps(trades),
+                outcome_score,
+                hindsight_score,
+                reviewed_at,
+                _json_dumps(raw),
+                event_id,
+            ],
+        )
+
     def summary(self, limit: int = 100) -> dict[str, Any]:
         items = self.get_items(limit=limit)
         sources = self.get_source_health()
         return {
             "items": items,
             "sources": sources,
+            "catalyst_events": self.get_catalyst_events(limit=limit),
             "item_count": len(items),
             "source_count": len(sources),
             "generated_at": _utc_now().isoformat(),

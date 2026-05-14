@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional
 
 from src.core.research_feed import ResearchFeedStore
+from src.data.adapters.market_tracker import MarketTracker
 
 if TYPE_CHECKING:
     from src.data.adapters.fred_adapter import FredAdapter
@@ -60,6 +61,7 @@ class ResearchIngestionService:
         self._interval = interval_seconds
         self._task: asyncio.Task | None = None
         self._feed_store = feed_store or ResearchFeedStore(feed_store_path or ":memory:")
+        self._poly_tracker = MarketTracker(max_markets=30)
 
         # Shared data — updated in-place on every fetch cycle
         self.fred_snapshot: dict = {}
@@ -96,6 +98,10 @@ class ResearchIngestionService:
             self._feed_store.close()
         except Exception:
             pass
+
+    @property
+    def feed_store(self) -> ResearchFeedStore:
+        return self._feed_store
 
     # ------------------------------------------------------------------
     # Background loop
@@ -212,7 +218,7 @@ class ResearchIngestionService:
         if not self._poly:
             return self.poly_signals
         raw = await self._poly.fetch_signals([])
-        return [s.model_dump(mode="json") for s in raw]
+        return self._poly_tracker.update(raw)
 
     async def _fetch_news(self) -> list:
         if not self._rss:

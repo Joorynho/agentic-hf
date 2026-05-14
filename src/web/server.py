@@ -31,8 +31,10 @@ load_dotenv(str(_env_path))
 from src.core.bus.event_bus import EventBus
 from src.core.models.messages import AgentMessage
 from src.core.models.pod_summary import PodSummary
+from src.core.research_feed import classify_research_item
 
 logger = logging.getLogger(__name__)
+POD_IDS = ("equities", "fx", "crypto", "commodities")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -205,6 +207,7 @@ class EventBusListener:
                         "polymarket_signals", "polymarket_confidence", "macro_score",
                         "fred_snapshot", "fred_score", "poly_sentiment", "social_score",
                         "x_feed", "x_tweet_count", "news_last_refresh", "features",
+                        "foresight_events", "foresight_text",
                     )
                     for key in research_keys:
                         if key not in payload and key in existing_data:
@@ -486,6 +489,9 @@ def create_app(
     app.state.event_bus = event_bus
     app.state.session_start_time = session_start_time or datetime.now(timezone.utc)
     app.state.iteration = 0
+    app.state.session_stage = "idle"
+    app.state.session_stage_detail = "Idle"
+    app.state.session_stage_updated_at = None
     app.state.capital_per_pod = 0.0
     app.state.pod_summaries: dict[str, dict] = {}
     app.state.risk_halt = False
@@ -498,6 +504,16 @@ def create_app(
     app.state.session_manager = session_manager
     if session_manager:
         session_manager._restartable = True
+
+    def _session_stage_payload(sm=None) -> dict:
+        raw = getattr(sm, "session_stage", None) if sm is not None else None
+        if not isinstance(raw, dict):
+            raw = {}
+        return {
+            "stage": str(raw.get("stage") or getattr(app.state, "session_stage", "idle") or "idle"),
+            "stage_detail": str(raw.get("stage_detail") or getattr(app.state, "session_stage_detail", "Idle") or "Idle"),
+            "stage_updated_at": raw.get("stage_updated_at") or getattr(app.state, "session_stage_updated_at", None),
+        }
 
     # REST endpoints
     @app.get("/health", response_model=HealthResponse)
@@ -519,6 +535,64 @@ def create_app(
             firm_inception_pnl=getattr(app.state, "firm_inception_pnl", 0.0),
             firm_peak_nav=getattr(app.state, "firm_peak_nav", 0.0),
         )
+
+    def _build_session_snapshot_payload() -> dict:
+        """Build the same recoverable session snapshot used by WebSocket clients."""
+        if listener:
+            snapshot = listener.get_snapshot_with_app_state(app)
+        else:
+            snapshot = {
+                "type": "session_snapshot",
+                "data": {
+                    "pod_summaries": {},
+                    "recent_trades": [],
+                    "recent_governance": [],
+                    "recent_activity": [],
+                    "recent_orders": [],
+                    "position_reviews": [],
+                    "loss_reviews": {},
+                },
+            }
+
+        data = snapshot.setdefault("data", {})
+        data["iteration"] = app.state.iteration
+        sm = app.state.session_manager
+        data["session_active"] = sm.session_active if sm else False
+        stage_payload = _session_stage_payload(sm)
+        data.update(stage_payload)
+        data["firm_inception_pnl"] = getattr(app.state, "firm_inception_pnl", 0.0)
+        data["firm_peak_nav"] = getattr(app.state, "firm_peak_nav", 0.0)
+        data["benchmark_returns"] = getattr(app.state, "benchmark_returns", {}) or {}
+        data["drawdown_tier"] = getattr(app.state, "drawdown_tier", "none")
+        data["loss_reviews"] = getattr(app.state, "loss_reviews", {}) or data.get("loss_reviews", {})
+        listener_state = getattr(getattr(app.state, "listener", None), "_app_state", {}) or {}
+        data["research_feed"] = _research_feed_report(limit=100, listener_state=listener_state)
+
+        # Merge app.state.pod_summaries into snapshot so HTTP fallback and
+        # WebSocket recovery both include the freshest positions/metrics.
+        pod_summaries = data.setdefault("pod_summaries", {})
+        for pod_id, raw in (app.state.pod_summaries or {}).items():
+            rm = raw.get("risk_metrics") or {}
+            pod_data = dict(raw)
+            pod_data["nav"] = pod_data.get("nav") or rm.get("nav", 0)
+            pod_data["daily_pnl"] = pod_data.get("daily_pnl") or rm.get("daily_pnl", 0)
+            pod_data["current_positions"] = pod_data.get("current_positions") or pod_data.get("positions", [])
+            pod_data["positions"] = pod_data["current_positions"]
+            existing = pod_summaries.get(pod_id, {})
+            existing_data = existing.get("data", {}) if isinstance(existing, dict) else {}
+            existing_data.update(pod_data)
+            pod_summaries[pod_id] = {
+                "type": "pod_summary",
+                "pod_id": pod_id,
+                "data": existing_data,
+                "timestamp": raw.get("timestamp", existing.get("timestamp", "")) if isinstance(existing, dict) else raw.get("timestamp", ""),
+            }
+        return snapshot
+
+    @app.get("/api/session/snapshot")
+    async def get_session_snapshot():
+        """HTTP fallback snapshot for dashboards whose WebSocket is unavailable."""
+        return _build_session_snapshot_payload()
 
     @app.get("/api/pods", response_model=dict)
     async def get_all_pods():
@@ -707,6 +781,11 @@ def create_app(
                 "positions": [],
                 "recent_failures": [],
             },
+            "evidence_review": {
+                "status": "UNKNOWN",
+                "counts": {"URGENT": 0, "REVIEW": 0, "WATCH": 0},
+                "queue": [],
+            },
         }
 
     @app.get("/api/data-quality")
@@ -733,16 +812,290 @@ def create_app(
             "triggered_count": 0,
         }
 
+    def _research_feed_fallback(limit: int = 100, listener_state: dict | None = None, error: str = "") -> dict:
+        """Best-effort feed from in-memory RSS/news data when persistent diagnostics are unavailable."""
+        limit = max(1, min(int(limit or 100), 500))
+        generated_at = datetime.now(timezone.utc).isoformat()
+        sm = app.state.session_manager
+        listener_state = listener_state or {}
+        raw_items: list[tuple[dict, str]] = []
+        last_fetch_time = None
+
+        ingestion = getattr(sm, "_research_ingestion", None) if sm else None
+        if ingestion:
+            raw_items.extend((item, "rss") for item in (getattr(ingestion, "news_items", None) or []))
+            raw_items.extend((item, "news") for item in (getattr(ingestion, "x_feed", None) or []))
+            last_fetch = getattr(ingestion, "last_fetch_time", None)
+            if hasattr(last_fetch, "isoformat"):
+                last_fetch_time = last_fetch.isoformat()
+
+        def _summary_payload(raw: dict, source_type: str) -> dict:
+            item = raw.model_dump(mode="json") if hasattr(raw, "model_dump") else dict(raw or {})
+            title = str(item.get("title") or item.get("headline") or item.get("text") or item.get("summary") or "").strip()
+            text = str(item.get("text") or item.get("summary") or item.get("headline") or title).strip()
+            source = str(item.get("source") or item.get("publisher") or item.get("handle") or item.get("username") or source_type).strip() or source_type
+            published_at = item.get("published_at") or item.get("published") or item.get("timestamp") or item.get("date")
+            routing = classify_research_item(item)
+            return {
+                "title": title,
+                "text": text,
+                "source": source,
+                "source_type": source_type,
+                "published_at": published_at,
+                "last_seen_at": generated_at,
+                "url": item.get("url") or "#",
+                "category": item.get("category") or "Markets",
+                "sentiment": item.get("sentiment"),
+                "reliability": item.get("reliability_score", item.get("reliability")),
+                "asset_classes": routing["asset_classes"],
+                "affected_pods": list(POD_IDS) if "macro" in routing["asset_classes"] else [p for p in POD_IDS if p in routing["asset_classes"]],
+                "factors": routing["factors"],
+                "tickers": routing["tickers"],
+                "held_symbols": [],
+                "urgency": routing["urgency"],
+                "action_audit": {"status": "monitor", "matched_events": [], "next_action": "Monitor for trade thesis relevance."},
+                "raw": item,
+            }
+
+        seen = set()
+        items = []
+        for raw, source_type in raw_items:
+            payload = _summary_payload(raw, source_type)
+            identity = (str(payload.get("url") or "").lower(), payload["source"].lower(), payload["title"].lower()[:160])
+            if not payload["title"] and not payload["text"]:
+                continue
+            if identity in seen:
+                continue
+            seen.add(identity)
+            items.append(payload)
+
+        def _item_ts(item: dict) -> float:
+            raw = item.get("published_at") or item.get("last_seen_at")
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp() if raw else 0.0
+            except ValueError:
+                return 0.0
+
+        items = sorted(items, key=_item_ts, reverse=True)[:limit]
+        source_counts: dict[tuple[str, str], int] = {}
+        for item in items:
+            key = (str(item["source"]), str(item["source_type"]))
+            source_counts[key] = source_counts.get(key, 0) + 1
+        sources = [
+            {
+                "source": source,
+                "source_type": source_type,
+                "status": "cached",
+                "item_count": count,
+                "last_fetch_at": last_fetch_time or generated_at,
+                "last_success_at": last_fetch_time or generated_at,
+                "consecutive_failures": 0,
+                "error": "",
+            }
+            for (source, source_type), count in sorted(source_counts.items())
+        ]
+        return {
+            "generated_at": generated_at,
+            "items": items,
+            "sources": sources,
+            "item_count": len(items),
+            "source_count": len(sources),
+            "source_error_count": 1 if error else 0,
+            "held_symbols_by_pod": sm._held_symbols_by_pod() if sm and hasattr(sm, "_held_symbols_by_pod") else {},
+            "status": "FALLBACK" if items else ("ERROR" if error else "NO_DATA"),
+            "last_fetch_time": last_fetch_time,
+            "error": error,
+        }
+
+    def _research_feed_report(limit: int = 100, listener_state: dict | None = None) -> dict:
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_research_feed_report"):
+            try:
+                return sm.get_research_feed_report(limit=limit, listener_state=listener_state or {})
+            except Exception as exc:
+                logger.warning("[web] Research feed report failed, using in-memory fallback: %s", exc)
+                return _research_feed_fallback(limit=limit, listener_state=listener_state, error=str(exc))
+        return _research_feed_fallback(limit=limit, listener_state=listener_state)
+
     @app.get("/api/research-feed")
     async def get_research_feed(limit: int = 100):
         """Persistent research feed, source health, routing, and action audit."""
-        sm = app.state.session_manager
-        if not sm:
-            raise HTTPException(status_code=503, detail="Session not initialized")
-        if not hasattr(sm, "get_research_feed_report"):
-            raise HTTPException(status_code=501, detail="Research feed diagnostics unavailable")
         listener_state = getattr(getattr(app.state, "listener", None), "_app_state", {}) or {}
-        return sm.get_research_feed_report(limit=limit, listener_state=listener_state)
+        return _research_feed_report(limit=limit, listener_state=listener_state)
+
+    @app.get("/api/foresight")
+    async def get_foresight(limit: int = 100, pod_id: str | None = None):
+        """Advisory catalyst ledger produced by the Foresight layer."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_foresight_report"):
+            return sm.get_foresight_report(limit=limit, pod_id=pod_id)
+        return {
+            "status": "NO_FORESIGHT",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "events": [],
+            "counts": {"active": 0, "stale": 0, "failed": 0},
+            "by_pod": {pod: 0 for pod in POD_IDS},
+            "event_count": 0,
+        }
+
+    @app.get("/api/catalyst-threads")
+    async def get_catalyst_threads(limit: int = 100, pod_id: str | None = None):
+        """Lifecycle/thread view over related catalyst events."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_catalyst_threads"):
+            return sm.get_catalyst_threads(limit=limit, pod_id=pod_id)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "threads": [], "count": 0, "status": "NO_FORESIGHT"}
+
+    @app.get("/api/specialist-briefs")
+    async def get_specialist_briefs(limit: int = 100, pod_id: str | None = None):
+        """Recent PM-requested specialist briefs."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_specialist_briefs"):
+            return sm.get_specialist_briefs(limit=limit, pod_id=pod_id)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "briefs": [], "count": 0}
+
+    @app.get("/api/committee-reviews")
+    async def get_committee_reviews(limit: int = 100, pod_id: str | None = None):
+        """Recent investment committee challenge reviews."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_committee_reviews"):
+            return sm.get_committee_reviews(limit=limit, pod_id=pod_id)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "reviews": [], "count": 0}
+
+    @app.get("/api/agent-runs")
+    async def get_agent_runs(
+        limit: int = 100,
+        pod_id: str | None = None,
+        status: str | None = None,
+        agent_type: str | None = None,
+        task: str | None = None,
+    ):
+        """Managed-agent run ledger."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_agent_runs"):
+            return sm.get_agent_runs(limit=limit, pod_id=pod_id, status=status, agent_type=agent_type, task=task)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "runs": [], "count": 0, "summary": {}}
+
+    @app.get("/api/artifacts")
+    async def get_artifacts(limit: int = 500, owner: str | None = None, kind: str | None = None):
+        """Managed artefact registry and dependency freshness."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_artifacts"):
+            return sm.get_artifacts(limit=limit, owner=owner, kind=kind)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "artifacts": [], "count": 0, "summary": {}}
+
+    @app.get("/api/reports/corpus")
+    async def get_report_corpus(
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        report_type: str | None = None,
+        catalyst_id: str | None = None,
+        factor: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+    ):
+        """Agent-readable structured report corpus."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_report_corpus"):
+            return sm.get_report_corpus(
+                limit=limit,
+                pod_id=pod_id,
+                symbol=symbol,
+                report_type=report_type,
+                catalyst_id=catalyst_id,
+                factor=factor,
+                since=since,
+                until=until,
+            )
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "reports": [], "count": 0, "summary": {}}
+
+    @app.get("/api/decision-trace")
+    async def get_decision_trace(
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        catalyst_id: str | None = None,
+    ):
+        """Linked catalyst -> PM -> specialist -> IC -> thesis/risk/execution report trace."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_decision_trace"):
+            return sm.get_decision_trace(limit=limit, pod_id=pod_id, symbol=symbol, catalyst_id=catalyst_id)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "stages": [], "reports": [], "count": 0}
+
+    @app.get("/api/decision-evaluations")
+    async def get_decision_evaluations(
+        limit: int = 100,
+        pod_id: str | None = None,
+        symbol: str | None = None,
+        run: bool = False,
+    ):
+        """Stored PM decision snapshots and horizon-based evaluations."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_decision_evaluations"):
+            return sm.get_decision_evaluations(limit=limit, pod_id=pod_id, symbol=symbol, run=run)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "evaluations": [], "snapshots": [], "count": 0}
+
+    @app.get("/api/shadow-replay")
+    async def get_shadow_replay(limit: int = 100, snapshot_id: str | None = None, run: bool = False):
+        """Dry-run replay over saved decision snapshots; writes reports only."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_shadow_replay"):
+            return sm.get_shadow_replay(limit=limit, snapshot_id=snapshot_id, run=run)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "replays": [], "count": 0, "run_result": None}
+
+    @app.get("/api/portfolio-construction")
+    async def get_portfolio_construction(limit: int = 100, pod_id: str | None = None, symbol: str | None = None):
+        """Advisory portfolio-construction reviews before hard risk/execution gates."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_portfolio_construction_reviews"):
+            return sm.get_portfolio_construction_reviews(limit=limit, pod_id=pod_id, symbol=symbol)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "reviews": [], "count": 0}
+
+    @app.get("/api/thesis-monitor")
+    async def get_thesis_monitor(limit: int = 100, pod_id: str | None = None, symbol: str | None = None):
+        """Live thesis monitor results for open positions."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_thesis_monitor_results"):
+            return sm.get_thesis_monitor_results(limit=limit, pod_id=pod_id, symbol=symbol)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "results": [], "count": 0}
+
+    @app.get("/api/calibration")
+    async def get_calibration(
+        limit: int = 200,
+        entity_type: str | None = None,
+        pod_id: str | None = None,
+        run: bool = False,
+    ):
+        """Advisory calibration scores derived from decision evaluations."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_calibration_report"):
+            return sm.get_calibration_report(limit=limit, entity_type=entity_type, pod_id=pod_id, run=run)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "scores": [], "count": 0}
+
+    @app.get("/api/hindsight")
+    async def get_hindsight(limit: int = 100, run: bool = False):
+        """Advisory hindsight reviews over expired catalysts/theses/briefs/IC records."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_hindsight_report"):
+            return sm.get_hindsight_report(limit=limit, run=run)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "reviews": [], "count": 0, "run_result": None}
+
+    @app.get("/api/budgets")
+    async def get_budgets(limit: int = 500):
+        """Model/tool budget policy and usage telemetry."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_budget_report"):
+            return sm.get_budget_report(limit=limit)
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "policy": {}, "today": {}, "recent": []}
+
+    @app.get("/api/scheduler/jobs")
+    async def get_scheduler_jobs():
+        """Named scheduled job state for managed runtime operations."""
+        sm = app.state.session_manager
+        if sm and hasattr(sm, "get_scheduler_jobs"):
+            return sm.get_scheduler_jobs()
+        return {"generated_at": datetime.now(timezone.utc).isoformat(), "jobs": [], "count": 0}
 
     @app.get("/api/execution-truth")
     async def get_execution_truth():
@@ -759,6 +1112,16 @@ def create_app(
             for msg in (listener_state.get("recent_orders", []) or [])[:20]
         ]
         return payload
+
+    @app.get("/api/evidence-review")
+    async def get_evidence_review():
+        """Open-position queue for stale, missing, or weak trade evidence."""
+        sm = app.state.session_manager
+        if not sm:
+            raise HTTPException(status_code=503, detail="Session not initialized")
+        if not hasattr(sm, "get_evidence_review_queue"):
+            raise HTTPException(status_code=501, detail="Evidence review diagnostics unavailable")
+        return sm.get_evidence_review_queue()
 
     @app.get("/api/decision-audit")
     async def get_decision_audit(limit: int = 50):
@@ -778,8 +1141,23 @@ def create_app(
                 "position_review_final",
                 "mandate_update",
                 "allocation",
+                "quality_gate_warning",
+                "thesis_gate_failed",
+                "thesis_challenged",
+                "thesis_revised",
+                "data_quality_gate_failed",
+                "loss_review_gate_failed",
+                "broker_guard_blocked",
+                "evidence_review_required",
+                "evidence_review_blocked",
+                "specialist_request",
+                "specialist_brief",
+                "specialist_final_decision",
+                "committee_review",
+                "committee_revision_requested",
             }:
                 continue
+            llm_meta = data.get("llm") or data.get("model") or {}
             items.append({
                 "ts": msg.get("timestamp") or data.get("ts"),
                 "pod_id": data.get("pod_id", ""),
@@ -788,8 +1166,12 @@ def create_app(
                 "symbol": data.get("symbol", ""),
                 "decision": data.get("summary", ""),
                 "detail": data.get("detail", ""),
-                "status": "INFO",
+                "status": data.get("status", "INFO"),
                 "reason": data.get("reason", ""),
+                "llm": llm_meta,
+                "model": llm_meta.get("model") if isinstance(llm_meta, dict) else "",
+                "provider": llm_meta.get("provider") if isinstance(llm_meta, dict) else "",
+                "task": llm_meta.get("task") if isinstance(llm_meta, dict) else "",
             })
 
         for msg in listener_state.get("recent_governance", []) or []:
@@ -853,6 +1235,28 @@ def create_app(
             ),
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    @app.get("/api/model-health")
+    async def get_model_health(limit: int = 100):
+        """LLM provider/model/task health from the central router."""
+        try:
+            from src.core.llm import get_llm_health_report
+
+            payload = get_llm_health_report(limit=limit)
+            sm = app.state.session_manager
+            if sm and hasattr(sm, "get_budget_report"):
+                payload["budget"] = sm.get_budget_report(limit=limit)
+            return payload
+        except Exception as exc:
+            logger.debug("[web] model health unavailable: %s", exc)
+            return {
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "provider_order": [],
+                "by_model": [],
+                "by_task": [],
+                "recent": [],
+                "error": str(exc),
+            }
 
     @app.post("/api/execution-reconciliation")
     async def post_execution_reconciliation():
@@ -923,11 +1327,13 @@ def create_app(
         sm = app.state.session_manager
         active = sm.session_active if sm else False
         iteration = sm.iteration if sm else app.state.iteration
+        stage_payload = _session_stage_payload(sm)
         uptime = (datetime.now(timezone.utc) - app.state.session_start_time).total_seconds() if active else 0
         pod_count = len(sm._pod_runtimes) if sm and hasattr(sm, '_pod_runtimes') else 0
         return {
             "active": active,
             "iteration": iteration,
+            **stage_payload,
             "uptime_seconds": round(uptime, 1),
             "pod_count": pod_count,
         }
@@ -1021,30 +1427,7 @@ def create_app(
         await manager.connect(websocket)
         try:
             # Send session snapshot on connect so client recovers state
-            if listener:
-                snapshot = listener.get_snapshot_with_app_state(app)
-                snapshot["data"]["iteration"] = app.state.iteration
-                sm = app.state.session_manager
-                snapshot["data"]["session_active"] = sm.session_active if sm else False
-                # Merge app.state.pod_summaries into snapshot so positions are never stale
-                # (last_pod_summaries may be empty or lack positions if populated only from EventBus)
-                for pod_id, raw in (app.state.pod_summaries or {}).items():
-                    rm = raw.get("risk_metrics") or {}
-                    data = dict(raw)
-                    data["nav"] = data.get("nav") or rm.get("nav", 0)
-                    data["daily_pnl"] = data.get("daily_pnl") or rm.get("daily_pnl", 0)
-                    data["current_positions"] = data.get("current_positions") or data.get("positions", [])
-                    data["positions"] = data["current_positions"]
-                    existing = snapshot["data"]["pod_summaries"].get(pod_id, {})
-                    existing_data = existing.get("data", {}) if isinstance(existing, dict) else {}
-                    existing_data.update(data)
-                    snapshot["data"]["pod_summaries"][pod_id] = {
-                        "type": "pod_summary",
-                        "pod_id": pod_id,
-                        "data": existing_data,
-                        "timestamp": raw.get("timestamp", existing.get("timestamp", "")),
-                    }
-                await websocket.send_json(snapshot)
+            await websocket.send_json(_build_session_snapshot_payload())
             while True:
                 data = await websocket.receive_text()
                 logger.debug("[web] Received from WebSocket: %s", data)
@@ -1089,6 +1472,9 @@ def create_app(
                     "data": {
                         "active": True,
                         "iteration": iteration,
+                        "stage": getattr(app.state, "session_stage", "running"),
+                        "stage_detail": getattr(app.state, "session_stage_detail", "Running"),
+                        "stage_updated_at": getattr(app.state, "session_stage_updated_at", None),
                         "firm_inception_pnl": getattr(app.state, "firm_inception_pnl", 0.0),
                         "firm_peak_nav": getattr(app.state, "firm_peak_nav", 0.0),
                         "benchmark_returns": getattr(app.state, "benchmark_returns", {}) or {},

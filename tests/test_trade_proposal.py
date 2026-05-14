@@ -35,6 +35,21 @@ def test_trade_proposal_has_signal_snapshot():
     assert tp.signal_snapshot["vix"] == 18.5
 
 
+def test_trade_proposal_accepts_tiered_take_profit_levels():
+    tp = TradeProposal(
+        action="BUY",
+        symbol="AAPL",
+        qty=10,
+        take_profit_levels=[
+            {"trigger_pct": 8, "close_pct": 25, "label": "TP1"},
+            {"trigger_pct": 0.15, "close_pct": 0.35, "label": "TP2"},
+        ],
+    )
+    assert tp.take_profit_levels[0].trigger_pct == pytest.approx(0.08)
+    assert tp.take_profit_levels[0].close_pct == pytest.approx(0.25)
+    assert tp.take_profit_levels[1].trigger_pct == pytest.approx(0.15)
+
+
 def test_trade_proposal_defaults_backward_compatible():
     tp = TradeProposal(action="SELL", symbol="TSLA", qty=5)
     assert tp.conviction == 0.5

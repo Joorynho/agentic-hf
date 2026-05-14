@@ -179,6 +179,10 @@ class MarketTracker:
                 "status": tm.status,
                 "first_seen": tm.first_seen.isoformat(),
                 "prob_change": prob_change,
+                "price_history": [
+                    {"ts": ts.isoformat(), "implied_prob": prob}
+                    for ts, prob in tm.price_history
+                ],
             }
             results.append(d)
         return results

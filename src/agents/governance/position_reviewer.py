@@ -1,6 +1,7 @@
 """Daily position review — CIO challenges each pod's PM to justify holdings."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -66,6 +67,15 @@ class PositionReviewer:
     def __init__(self, event_bus: EventBus, session_logger: Any = None) -> None:
         self._bus = event_bus
         self._session_logger = session_logger
+
+    async def _llm_chat(self, messages: list[dict], *, max_tokens: int, task: str) -> str:
+        """Run the synchronous LLM helper away from the FastAPI event loop."""
+        return await asyncio.to_thread(
+            llm_chat,
+            messages,
+            max_tokens=max_tokens,
+            task=task,
+        )
 
     async def run_review(
         self,
@@ -207,7 +217,7 @@ class PositionReviewer:
             f"Be specific — reference actual P&L and price levels."
         )
         try:
-            return llm_chat(
+            return await self._llm_chat(
                 [{"role": "system", "content": _CIO_REVIEW_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
@@ -247,7 +257,7 @@ class PositionReviewer:
             f'{{"positions": [{{"symbol": "AAPL", "action": "HOLD", "qty": null, "reasoning": "..."}}]}}'
         )
         try:
-            raw = llm_chat(
+            raw = await self._llm_chat(
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
@@ -282,7 +292,7 @@ class PositionReviewer:
             f'{{"decisions": [{{"symbol": "AAPL", "action": "HOLD", "qty": null, "reasoning": "...", "pm_overridden": false}}]}}'
         )
         try:
-            raw = llm_chat(
+            raw = await self._llm_chat(
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=2500,
@@ -332,7 +342,7 @@ class PositionReviewer:
             f'{{\"counters\": [{{\"symbol\": \"X\", \"accept_override\": true, \"counter_reasoning\": \"...\"}}]}}'
         )
         try:
-            raw = llm_chat(
+            raw = await self._llm_chat(
                 [{"role": "system", "content": _PM_DEFEND_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=1500,
@@ -372,7 +382,7 @@ class PositionReviewer:
             f'{{\"decisions\": [{{\"symbol\": \"X\", \"action\": \"HOLD\", \"qty\": null, \"reasoning\": \"...\", \"pm_overridden\": false}}]}}'
         )
         try:
-            raw = llm_chat(
+            raw = await self._llm_chat(
                 [{"role": "system", "content": _CIO_DECISION_SYSTEM.format(pod_id=pod_id.upper())},
                  {"role": "user", "content": prompt}],
                 max_tokens=1500,

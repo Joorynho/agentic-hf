@@ -5,8 +5,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from src.core.models.enums import OrderType, Side
+from src.core.models.execution import Order
 from src.core.models.execution import PositionSnapshot
 from src.mission_control.session_manager import SessionManager
+from src.pods.runtime.pod_runtime import PodRuntime
 
 
 class _FakeNamespace:
@@ -100,6 +103,18 @@ def _manager(fake_alpaca: _FakeAlpaca) -> SessionManager:
     return SessionManager(alpaca_adapter=fake_alpaca, enable_news_adapters=False)
 
 
+def _order(symbol: str, side: Side, qty: float = 1.0) -> Order:
+    return Order(
+        pod_id="crypto",
+        symbol=symbol,
+        side=side,
+        order_type=OrderType.MARKET,
+        quantity=qty,
+        timestamp=datetime(2026, 5, 12, tzinfo=timezone.utc),
+        strategy_tag="broker_guard_test",
+    )
+
+
 @pytest.mark.asyncio
 async def test_broker_reconciliation_reports_qty_mismatch():
     alpaca = _FakeAlpaca()
@@ -130,6 +145,7 @@ async def test_broker_reconciliation_reports_qty_mismatch():
     assert payload["mismatches"][0]["symbol"] == "SOL/USD"
     assert payload["mismatches"][0]["status"] == "QTY_MISMATCH"
     assert payload["mismatches"][0]["qty_delta"] == pytest.approx(0.1)
+    assert payload["trade_guard"]["blocked_symbols"]["SOL/USD"]["block_new_risk"] is True
 
 
 @pytest.mark.asyncio
@@ -161,6 +177,101 @@ async def test_broker_reconciliation_matches_crypto_symbol_aliases():
     assert payload["status"] == "OK"
     assert payload["positions"][0]["symbol"] == "SOL/USD"
     assert payload["positions"][0]["broker_symbol"] == "SOLUSD"
+
+
+@pytest.mark.asyncio
+async def test_broker_trade_guard_is_pushed_to_runtime_namespace():
+    alpaca = _FakeAlpaca()
+    alpaca.positions = {
+        "SOL/USD": {
+            "qty": 0.5,
+            "side": "long",
+            "current_price": 150.0,
+            "unrealized_pl": 3.0,
+        }
+    }
+    sm = _manager(alpaca)
+    runtime = _FakeRuntime(_FakeAccountant({
+        "SOL/USD": PositionSnapshot(
+            symbol="SOL/USD",
+            qty=0.4,
+            cost_basis=140.0,
+            current_price=150.0,
+            unrealized_pnl=4.0,
+        )
+    }))
+    sm._pod_runtimes = {"crypto": runtime}
+
+    guard = await sm._refresh_broker_trade_guards()
+
+    assert guard["status"] == "CHECK"
+    assert runtime._ns.get("broker_trade_guard")["blocked_symbols"]["SOL/USD"]["status"] == "QTY_MISMATCH"
+
+
+def test_runtime_broker_guard_blocks_new_risk_but_allows_reduction():
+    accountant = _FakeAccountant({
+        "SOL/USD": PositionSnapshot(
+            symbol="SOL/USD",
+            qty=0.4,
+            cost_basis=140.0,
+            current_price=150.0,
+            unrealized_pnl=4.0,
+        )
+    })
+    runtime = PodRuntime.__new__(PodRuntime)
+    runtime._pod_id = "crypto"
+    runtime._ns = _FakeNamespace(accountant, extra={
+        "broker_trade_guard": {
+            "status": "CHECK",
+            "blocked_symbols": {
+                "SOL/USD": {
+                    "status": "QTY_MISMATCH",
+                    "reason": "Broker/local qty mismatch for SOL/USD",
+                    "block_new_risk": True,
+                    "block_all_orders": False,
+                }
+            },
+        }
+    })
+
+    buy_allowed, buy_reason = runtime._broker_guard_allows_order(_order("SOL/USD", Side.BUY, 0.1), accountant)
+    sell_allowed, sell_reason = runtime._broker_guard_allows_order(_order("SOL/USD", Side.SELL, 0.1), accountant)
+
+    assert buy_allowed is False
+    assert "mismatch" in buy_reason.lower()
+    assert sell_allowed is True
+    assert sell_reason == ""
+
+
+def test_runtime_broker_guard_blocks_symbols_with_open_orders():
+    accountant = _FakeAccountant({
+        "SHEL": PositionSnapshot(
+            symbol="SHEL",
+            qty=2.0,
+            cost_basis=84.0,
+            current_price=85.0,
+            unrealized_pnl=2.0,
+        )
+    })
+    runtime = PodRuntime.__new__(PodRuntime)
+    runtime._pod_id = "equities"
+    runtime._ns = _FakeNamespace(accountant, extra={
+        "broker_trade_guard": {
+            "status": "CHECK",
+            "blocked_symbols": {
+                "SHEL": {
+                    "status": "OPEN_ORDER",
+                    "reason": "Open broker order already in flight for SHEL",
+                    "block_all_orders": True,
+                }
+            },
+        }
+    })
+
+    allowed, reason = runtime._broker_guard_allows_order(_order("SHEL", Side.SELL, 0.5), accountant)
+
+    assert allowed is False
+    assert "open broker order" in reason.lower()
 
 
 @pytest.mark.asyncio

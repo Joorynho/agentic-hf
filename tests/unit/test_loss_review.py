@@ -16,6 +16,9 @@ class _NS:
     def get(self, key, default=None):
         return self._data.get(key, default)
 
+    def set(self, key, value):
+        self._data[key] = value
+
 
 def _order(symbol: str, side: Side, qty: float = 1.0) -> Order:
     return Order(
@@ -109,3 +112,42 @@ def test_runtime_loss_review_blocks_new_risk_but_allows_reduction():
     assert "blocked" in buy_reason.lower()
     assert sell_allowed is True
     assert sell_reason == ""
+
+
+def test_runtime_execution_cooldown_blocks_repeated_failed_new_risk():
+    acct = PortfolioAccountant(pod_id="crypto", initial_nav=1000.0)
+    runtime = PodRuntime.__new__(PodRuntime)
+    runtime._pod_id = "crypto"
+    now = datetime.now(timezone.utc).isoformat()
+    runtime._ns = _NS({
+        "execution_feedback": [
+            {"timestamp": now, "symbol": "SOL/USD", "stage": "preflight", "reason": "invalid symbol"},
+            {"timestamp": now, "symbol": "SOLUSD", "stage": "preflight", "reason": "invalid symbol"},
+        ]
+    })
+
+    allowed, reason = runtime._execution_cooldown_allows_order(_order("SOL/USD", Side.BUY), acct)
+
+    assert allowed is False
+    assert "2 broker/execution rejection" in reason
+    assert runtime._ns.get("execution_cooldown")["active"] is True
+
+
+def test_runtime_execution_cooldown_allows_reducing_trade():
+    acct = PortfolioAccountant(pod_id="crypto", initial_nav=1000.0)
+    acct.record_fill_direct("open", "SOL/USD", qty=2.0, fill_price=90.0)
+    runtime = PodRuntime.__new__(PodRuntime)
+    runtime._pod_id = "crypto"
+    now = datetime.now(timezone.utc).isoformat()
+    runtime._ns = _NS({
+        "execution_feedback": [
+            {"timestamp": now, "symbol": "SOL/USD", "stage": "preflight", "reason": "invalid symbol"},
+            {"timestamp": now, "symbol": "SOL/USD", "stage": "preflight", "reason": "invalid symbol"},
+        ]
+    })
+
+    allowed, reason = runtime._execution_cooldown_allows_order(_order("SOL/USD", Side.SELL), acct)
+
+    assert allowed is True
+    assert reason == ""
+    assert runtime._ns.get("execution_cooldown")["active"] is True

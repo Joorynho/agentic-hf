@@ -200,6 +200,44 @@ class TestBrokerPreflight:
         mock_client.submit_order.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_open_sell_order_reservation_rejected_before_submit(self, adapter):
+        a, mock_client = adapter
+        mock_client.get_position.side_effect = None
+        mock_client.get_position.return_value = SimpleNamespace(qty="2.5367", side="long")
+        mock_client.list_orders.return_value = [
+            SimpleNamespace(
+                id="ord-existing",
+                symbol="TLT",
+                side="sell",
+                qty="2.5367",
+                filled_qty="0",
+                status="accepted",
+            )
+        ]
+
+        result = await a.place_order("TLT", 2.536700001, "sell", estimated_price=85)
+
+        assert result["status"] == "REJECTED"
+        assert result["stage"] == "preflight"
+        assert result["reason_code"] == "sell_qty_reserved_by_open_order"
+        assert "already reserves" in result["reason"]
+        mock_client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sell_without_broker_long_quantity_rejected_before_submit(self, adapter):
+        a, mock_client = adapter
+        mock_client.get_position.side_effect = Exception("position not found")
+        mock_client.list_orders.return_value = []
+
+        result = await a.place_order("TLT", 3, "sell", estimated_price=85)
+
+        assert result["status"] == "REJECTED"
+        assert result["stage"] == "preflight"
+        assert result["reason_code"] == "insufficient_sellable_qty"
+        assert "available 0" in result["reason"]
+        mock_client.submit_order.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_asset_capability_cache_reuses_lookup(self, adapter):
         a, mock_client = adapter
         mock_order = MagicMock()

@@ -222,7 +222,8 @@ tick(); setInterval(tick, 1000);
 
 // ─── 2. Signal History Persistence (localStorage, 7-day rolling) ────────────
 const HISTORY_STORAGE_KEY = 'aghf_signal_history';
-const HISTORY_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const HISTORY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+const SIGNAL_HISTORY_MAX = 2000;
 
 function loadSignalHistory() {
   try {
@@ -244,12 +245,127 @@ function saveSignalHistory() {
 }
 
 var signalHistory = loadSignalHistory();
+
+function marketHistoryKey(sig) {
+  if (!sig) return '';
+  return String(sig.market_id || sig.id || sig.slug || sig.question || '').trim();
+}
+
+function stripHistoryPayload(sig) {
+  var copy = Object.assign({}, sig || {});
+  delete copy.price_history;
+  return copy;
+}
+
+function normalizeProbability(value) {
+  var n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (n > 1 && n <= 100) n = n / 100;
+  return Math.max(0, Math.min(1, n));
+}
+
+function historyPointTimestamp(point, fallback) {
+  return (point && (point.ts || point.timestamp || point.time || point.date)) || fallback;
+}
+
+function mergePolymarketHistory(signals) {
+  if (!Array.isArray(signals) || !signals.length) return;
+
+  var cutoffMs = Date.now() - HISTORY_MAX_AGE_MS;
+  var byBucketMarket = {};
+
+  function addPoint(sig, tsValue, probValue) {
+    var id = marketHistoryKey(sig);
+    if (!id) return;
+    var tsMs = new Date(tsValue || new Date()).getTime();
+    if (!Number.isFinite(tsMs) || tsMs < cutoffMs) return;
+    var prob = normalizeProbability(probValue != null ? probValue : sig.implied_prob);
+    if (prob == null) return;
+    var bucket = Math.floor(tsMs / BUCKET_MS) * BUCKET_MS;
+    var clean = stripHistoryPayload(sig);
+    clean.implied_prob = prob;
+    clean.timestamp = new Date(tsMs).toISOString();
+    byBucketMarket[bucket + '|' + id] = {
+      ts: new Date(bucket).toISOString(),
+      signals: [clean],
+    };
+  }
+
+  signalHistory.forEach(function(entry) {
+    var signalsInEntry = Array.isArray(entry && entry.signals) ? entry.signals : [];
+    signalsInEntry.forEach(function(sig) {
+      addPoint(sig, entry.ts || sig.timestamp, sig.implied_prob);
+    });
+  });
+
+  signals.forEach(function(sig) {
+    var history = Array.isArray(sig.price_history) ? sig.price_history : [];
+    if (history.length) {
+      history.forEach(function(point) {
+        addPoint(sig, historyPointTimestamp(point, sig.timestamp), point.implied_prob);
+      });
+    } else {
+      addPoint(sig, sig.timestamp || new Date().toISOString(), sig.implied_prob);
+    }
+  });
+
+  signalHistory = Object.keys(byBucketMarket)
+    .map(function(k) { return byBucketMarket[k]; })
+    .sort(function(a, b) { return new Date(a.ts) - new Date(b.ts); });
+  if (signalHistory.length > SIGNAL_HISTORY_MAX) signalHistory = signalHistory.slice(-SIGNAL_HISTORY_MAX);
+  saveSignalHistory();
+}
+
+function flattenedSignalHistory() {
+  var rows = [];
+  signalHistory.forEach(function(entry) {
+    var ts = entry && entry.ts;
+    (entry && entry.signals || []).forEach(function(sig) {
+      rows.push({ ts: ts, id: marketHistoryKey(sig), signal: sig });
+    });
+  });
+  return rows.filter(function(row) {
+    return row.id && row.signal && normalizeProbability(row.signal.implied_prob) != null;
+  }).sort(function(a, b) {
+    return new Date(a.ts) - new Date(b.ts);
+  });
+}
+
+function previousMarketProbability(marketId, beforeTs) {
+  var beforeMs = new Date(beforeTs || new Date()).getTime();
+  var best = null;
+  flattenedSignalHistory().forEach(function(row) {
+    if (row.id !== marketId) return;
+    var rowMs = new Date(row.ts).getTime();
+    if (!Number.isFinite(rowMs) || rowMs >= beforeMs - 1000) return;
+    best = row.signal.implied_prob;
+  });
+  return best;
+}
+
+function ensurePolymarketHistoryLayout() {
+  var header = document.querySelector('#subtab-historical .research-header');
+  if (header) {
+    header.innerHTML = 'IMPLIED PROBABILITY TRENDS - Rolling 30-Day View (4h intervals) - <span id="history-data-count" style="color:var(--cyan);">0</span> data points stored';
+  }
+  var headRow = document.querySelector('#history-table thead tr');
+  if (headRow && headRow.children.length !== 7) {
+    headRow.innerHTML = '<th>Time</th><th>Market</th><th class="num">Status</th><th class="num accent">Prob</th><th class="num">Delta</th><th class="num">24h Vol</th><th class="num">End Date</th>';
+  }
+}
 const NEWS_SCORE_WINDOW = 25;
 const NEWS_DISPLAY_LIMIT = 100;
 const NEWS_CACHE_LIMIT = 200;
 const NEWS_FRESH_MS = 15 * 60 * 1000;
+var RESEARCH_FEED_REFRESH_MS = 60 * 1000;
 var researchFeedAudit = null;
 var researchFeedAuditLoading = false;
+var researchFeedAuditLastFetchMs = 0;
+var foresightLedger = null;
+var foresightLedgerLoading = false;
+var foresightLedgerLastFetchMs = 0;
+var catalystThreads = null;
+var reportCorpus = null;
 
 // ─── 2b. Session Status ──────────────────────────────────────────────────
 var sessionActive = false;
@@ -386,13 +502,16 @@ function setExecSubTab(name) {
   });
   var tl = document.getElementById('exec-subtab-tradelog');
   var q = document.getElementById('exec-subtab-quality');
+  var mh = document.getElementById('exec-subtab-models');
   var br = document.getElementById('exec-subtab-broker');
   var au = document.getElementById('exec-subtab-audit');
   if (tl) tl.style.display = name === 'tradelog' ? 'block' : 'none';
   if (q) q.style.display = name === 'quality' ? 'block' : 'none';
+  if (mh) mh.style.display = name === 'models' ? 'block' : 'none';
   if (br) br.style.display = name === 'broker' ? 'block' : 'none';
   if (au) au.style.display = name === 'audit' ? 'block' : 'none';
   if (name === 'quality' && typeof renderExecutionQuality === 'function') renderExecutionQuality();
+  if (name === 'models' && typeof renderModelHealth === 'function') renderModelHealth();
   if (name === 'broker' && typeof renderBrokerReconciliation === 'function') renderBrokerReconciliation();
   if (name === 'audit' && typeof renderDecisionAudit === 'function') renderDecisionAudit();
 }
@@ -454,6 +573,96 @@ function renderExecutionQuality() {
     });
     html += '</div>';
     el.innerHTML = html;
+  });
+}
+
+function modelStatusClass(status) {
+  status = String(status || '').toLowerCase();
+  if (status === 'success') return 'b-active';
+  if (status === 'rate_limited' || status === 'unavailable') return 'b-pending';
+  if (status === 'failed') return 'b-rejected';
+  return 'b-pending';
+}
+
+function renderModelHealth() {
+  var el = document.getElementById('model-health-panel');
+  if (!el) return;
+  el.innerHTML = '<div class="empty"><div class="empty-txt">Loading model health...</div></div>';
+  fetchJsonWithTimeout('/api/model-health?limit=120', {}, 3500).then(function(data) {
+    data = data || {};
+    var models = data.by_model || [];
+    var tasks = data.by_task || [];
+    var recent = data.recent || [];
+    var budget = data.budget || {};
+    var budgetToday = budget.today || {};
+    var html = '<div class="broker-panel">';
+    html += '<div class="sec-hdr"><span class="sec-title">Model Health</span>' +
+      '<span class="sec-badge">' + recent.length + ' recent calls</span>' +
+      '<button class="export-btn" onclick="renderModelHealth()">Refresh</button></div>';
+    html += '<div class="kpi-row">' +
+      '<div class="kpi"><div class="kpi-lbl">Provider Order</div><div class="kpi-val" style="font-size:15px">' + escapeHtml((data.provider_order || []).join(' -> ') || '—') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Default</div><div class="kpi-val" style="font-size:15px">' + escapeHtml(data.default_openai_model || '—') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Reasoning</div><div class="kpi-val" style="font-size:15px">' + escapeHtml(data.strong_openai_model || '—') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Deep Review</div><div class="kpi-val" style="font-size:15px">' + escapeHtml(data.frontier_openai_model || '—') + '</div></div>' +
+      '</div>';
+
+    html += '<div class="kpi-row">' +
+      '<div class="kpi"><div class="kpi-lbl">Budget Mode</div><div class="kpi-val" style="font-size:15px">' + escapeHtml(budgetToday.degraded ? 'DEGRADED' : 'NORMAL') + '</div><div class="kpi-sub">' + escapeHtml(budgetToday.degraded_reason || 'hard controls active') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Calls Today</div><div class="kpi-val">' + (budgetToday.calls || 0) + '</div><div class="kpi-sub">' + (budgetToday.failures || 0) + ' failures</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Fallback Rate</div><div class="kpi-val">' + (((budgetToday.fallback_rate || 0) * 100).toFixed(0)) + '%</div><div class="kpi-sub">' + (budgetToday.fallback_calls || 0) + ' fallback calls</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Tokens</div><div class="kpi-val">' + (budgetToday.token_estimate || 0) + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Est. Cost</div><div class="kpi-val">$' + Number(budgetToday.cost_estimate || 0).toFixed(4) + '</div></div>' +
+      '</div>';
+    html += '<div class="sec-hdr"><span class="sec-title">By Model</span><span class="sec-badge">' + models.length + ' models</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Model</th><th class="r">Calls</th><th class="r">Success</th><th class="r">Fail</th><th class="r">Avg Latency</th><th>Status</th><th>Last Error</th>' +
+      '</tr></thead><tbody>';
+    html += models.length ? models.map(function(m) {
+      return '<tr>' +
+        '<td class="mono">' + escapeHtml(m.key || '') + '</td>' +
+        '<td class="r">' + (m.calls || 0) + '</td>' +
+        '<td class="r pos">' + (m.successes || 0) + '</td>' +
+        '<td class="r neg">' + (m.failures || 0) + '</td>' +
+        '<td class="r">' + (m.avg_latency_ms != null ? m.avg_latency_ms + ' ms' : '—') + '</td>' +
+        '<td><span class="badge ' + modelStatusClass(m.last_status) + '">' + escapeHtml(m.last_status || '—') + '</span></td>' +
+        '<td style="max-width:320px;white-space:normal">' + escapeHtml(m.last_error || '—') + '</td>' +
+        '</tr>';
+    }).join('') : '<tr><td colspan="7" class="empty"><div class="empty-txt">No model calls recorded yet</div></td></tr>';
+    html += '</tbody></table></div>';
+
+    html += '<div class="sec-hdr"><span class="sec-title">By Task</span><span class="sec-badge">' + tasks.length + ' tasks</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Task</th><th class="r">Calls</th><th class="r">Success</th><th class="r">Fail</th><th class="r">Avg Latency</th><th>Status</th>' +
+      '</tr></thead><tbody>';
+    html += tasks.length ? tasks.map(function(t) {
+      return '<tr><td class="mono">' + escapeHtml(t.key || '') + '</td>' +
+        '<td class="r">' + (t.calls || 0) + '</td>' +
+        '<td class="r pos">' + (t.successes || 0) + '</td>' +
+        '<td class="r neg">' + (t.failures || 0) + '</td>' +
+        '<td class="r">' + (t.avg_latency_ms != null ? t.avg_latency_ms + ' ms' : '—') + '</td>' +
+        '<td><span class="badge ' + modelStatusClass(t.last_status) + '">' + escapeHtml(t.last_status || '—') + '</span></td></tr>';
+    }).join('') : '<tr><td colspan="6" class="empty"><div class="empty-txt">No task telemetry yet</div></td></tr>';
+    html += '</tbody></table></div>';
+
+    html += '<div class="sec-hdr"><span class="sec-title">Recent Calls</span><span class="sec-badge">' + recent.length + ' attempts</span></div>';
+    html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+      '<th>Time</th><th>Task</th><th>Provider</th><th>Model</th><th>Status</th><th class="r">Tokens</th><th class="r">Cost</th><th class="r">Latency</th><th>Error</th>' +
+      '</tr></thead><tbody>';
+    html += recent.length ? recent.slice(0, 40).map(function(r) {
+      return '<tr><td class="mono">' + escapeHtml(formatRelativeTime(r.ts)) + '</td>' +
+        '<td class="mono">' + escapeHtml(r.task || '') + '</td>' +
+        '<td>' + escapeHtml(r.provider || '') + '</td>' +
+        '<td class="mono">' + escapeHtml(r.model || '') + '</td>' +
+        '<td><span class="badge ' + modelStatusClass(r.status) + '">' + escapeHtml(r.status || '') + '</span></td>' +
+        '<td class="r">' + (r.total_tokens != null ? r.total_tokens : '—') + '</td>' +
+        '<td class="r">' + (r.cost_estimate != null ? '$' + Number(r.cost_estimate || 0).toFixed(4) : '—') + '</td>' +
+        '<td class="r">' + (r.latency_ms != null ? r.latency_ms + ' ms' : '—') + '</td>' +
+        '<td style="max-width:320px;white-space:normal">' + escapeHtml(r.error || '—') + '</td></tr>';
+    }).join('') : '<tr><td colspan="9" class="empty"><div class="empty-txt">No calls recorded yet</div></td></tr>';
+    html += '</tbody></table></div></div>';
+    el.innerHTML = html;
+  }).catch(function(err) {
+    el.innerHTML = '<div class="empty"><div class="empty-txt">Could not load model health</div><div class="empty-hint">' + escapeHtml(err && err.message ? err.message : '') + '</div></div>';
   });
 }
 
@@ -534,6 +743,9 @@ function orderDiagnosticAction(item) {
   if (reason.indexOf('not tradable') >= 0 || reason.indexOf('inactive') >= 0 || reason.indexOf('unsupported') >= 0) {
     return 'Remove or replace the symbol in the pod universe.';
   }
+  if (stage.indexOf('evidence_review') >= 0 || reason.indexOf('evidence') >= 0 || reason.indexOf('thesis review') >= 0) {
+    return 'Refresh the thesis/evidence packet before adding risk; reductions remain allowed.';
+  }
   if (symbol.indexOf('/') >= 0 && (!item.reason || reason === 'order rejected')) {
     return 'Crypto rejection is still generic; check Alpaca crypto/account permissions and restart if server code was updated.';
   }
@@ -550,6 +762,22 @@ function recentExecutionDiagnostics(limit) {
   var rows = Object.keys(orderBook || {}).map(function(k) {
     return orderBook[k] || {};
   }).concat(executedTrades || []);
+  (activityFeed || []).forEach(function(item) {
+    var action = String(item.action || '');
+    if (['evidence_review_blocked', 'evidence_review_required', 'broker_guard_blocked', 'loss_review_gate_failed', 'data_quality_gate_failed'].indexOf(action) === -1) return;
+    rows.push({
+      ts: item.ts || item.timestamp || '',
+      pod_id: item.pod_id || '',
+      symbol: item.symbol || '',
+      side: '',
+      qty: 0,
+      price: 0,
+      status: action === 'evidence_review_required' ? 'PENDING' : 'BLOCKED',
+      stage: action,
+      reason: item.reason || item.detail || item.summary || '',
+      order_id: action + '|' + (item.pod_id || '') + '|' + (item.symbol || '') + '|' + (item.ts || ''),
+    });
+  });
   var seen = {};
   var out = [];
   rows.forEach(function(item) {
@@ -557,7 +785,7 @@ function recentExecutionDiagnostics(limit) {
     if (seen[key]) return;
     seen[key] = true;
     var status = String(item.status || '').toUpperCase();
-    if (status !== 'REJECTED' && status !== 'PENDING' && status !== 'PARTIAL') return;
+    if (status !== 'REJECTED' && status !== 'PENDING' && status !== 'PARTIAL' && status !== 'BLOCKED') return;
     out.push({
       ts: item.ts || item.timestamp || item.submitted_at || '',
       pod_id: item.pod_id || item.podId || '',
@@ -623,9 +851,131 @@ function normalizeStateHealthData(data, reason) {
     data.nav_history.last_ts = last.ts ? new Date(last.ts).toISOString() : null;
   }
   data.broker = data.broker || { status: 'UNKNOWN', mismatch_count: null, errors: [] };
+  data.evidence_review = data.evidence_review || { status: 'UNKNOWN', counts: {}, queue: [] };
   data.warnings = warnings;
   if (!data.status) data.status = warnings.length ? 'CHECK' : 'OK';
   return data;
+}
+
+function evidenceReviewBadgeClass(status) {
+  status = String(status || '').toUpperCase();
+  if (status === 'URGENT') return 'b-rejected';
+  if (status === 'REVIEW' || status === 'WATCH') return 'b-pending';
+  if (status === 'OK') return 'b-active';
+  return 'b-pending';
+}
+
+function renderEvidenceReviewQueue(review) {
+  review = review || {};
+  var rows = review.queue || [];
+  var counts = review.counts || {};
+  var html = '<div class="sec-hdr"><span class="sec-title">Evidence Review Queue</span>' +
+    '<span class="sec-badge">' + rows.length + ' item' + (rows.length === 1 ? '' : 's') + '</span>' +
+    '<button class="export-btn" onclick="renderStateHealth()">Refresh</button></div>';
+  html += '<div class="kpi-row">' +
+    '<div class="kpi"><div class="kpi-lbl">Urgent</div><div class="kpi-val neg">' + (counts.URGENT || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Review</div><div class="kpi-val">' + (counts.REVIEW || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Watch</div><div class="kpi-val">' + (counts.WATCH || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Status</div><div class="kpi-val" style="font-size:18px">' + escapeHtml(review.status || 'UNKNOWN') + '</div></div>' +
+    '</div>';
+  html += '<div class="tbl-wrap broker-table-wrap evidence-review-wrap"><table class="dtbl"><thead><tr>' +
+    '<th>Pod</th><th>Symbol</th><th>Status</th><th class="r">Evidence</th><th class="r">Coverage</th><th>Reason</th><th>Next Action</th><th>Updated</th>' +
+    '</tr></thead><tbody>';
+  if (!rows.length) {
+    html += '<tr><td colspan="8" class="empty"><div class="empty-txt">No evidence or thesis review items</div><div class="empty-hint">Open holdings have no stale evidence, challenged theses, or weak-evidence warnings.</div></td></tr>';
+  } else {
+    html += rows.map(function(row) {
+      var reasons = row.reasons || [];
+      var reasonText = reasons.length ? reasons.join('; ') : 'Review evidence packet';
+      var updated = row.evidence_generated_at ? formatRelativeTime(row.evidence_generated_at) : 'not recorded';
+      return '<tr class="evidence-review-row" onclick="showPositionDetail(\'' + escapeHtml(row.pod_id || '') + '\', \'' + escapeHtml(row.symbol || '') + '\')">' +
+        '<td style="font-weight:600">' + escapeHtml(String(row.pod_id || '').toUpperCase()) + '</td>' +
+        '<td style="font-weight:700">' + tickerDisplay(row.symbol || '') + '</td>' +
+        '<td><span class="badge ' + evidenceReviewBadgeClass(row.status) + '">' + escapeHtml(row.status || '') + '</span></td>' +
+        '<td class="r">' + Number(row.evidence_score || 0).toFixed(0) + '</td>' +
+        '<td class="r">' + Number(row.coverage_score || 0).toFixed(0) + '%</td>' +
+        '<td class="evidence-review-reason">' + escapeHtml(reasonText) + '</td>' +
+        '<td>' + escapeHtml(row.next_action || '') + '</td>' +
+        '<td class="mono">' + escapeHtml(updated) + '</td>' +
+        '</tr>';
+    }).join('');
+  }
+  html += '</tbody></table></div>';
+  return html;
+}
+
+function renderManagedRuntimePanel(managed) {
+  managed = managed || {};
+  var runs = managed.agent_runs || {};
+  var artifacts = managed.artifacts || {};
+  var budgets = managed.budgets || {};
+  var scheduler = managed.scheduler || {};
+  var artifactRows = (artifacts.artifacts || []).slice(0, 18);
+  var jobRows = (scheduler.jobs || []).slice(0, 12);
+  var runRows = (runs.recent || []).slice(0, 18);
+  var today = budgets.today || {};
+  var html = '<div class="sec-hdr"><span class="sec-title">Managed Agent Layer</span>' +
+    '<span class="sec-badge">' + (runs.count || 0) + ' recent runs</span></div>';
+  html += '<div class="kpi-row">' +
+    '<div class="kpi"><div class="kpi-lbl">Failed Runs</div><div class="kpi-val ' + ((runs.failed_count || 0) ? 'neg' : '') + '">' + (runs.failed_count || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Running Jobs</div><div class="kpi-val">' + (scheduler.running_count || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Stale Artefacts</div><div class="kpi-val ' + ((artifacts.stale_count || 0) ? 'neg' : '') + '">' + (artifacts.stale_count || 0) + '</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Model Calls Today</div><div class="kpi-val">' + (today.calls || 0) + '</div><div class="kpi-sub">' + (today.failures || 0) + ' failures · ' + (((today.fallback_rate || 0) * 100).toFixed(0)) + '% fallback</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Est. Model Cost</div><div class="kpi-val">$' + Number(today.cost_estimate || 0).toFixed(4) + '</div><div class="kpi-sub">' + (today.token_estimate || 0) + ' tokens</div></div>' +
+    '<div class="kpi"><div class="kpi-lbl">Budget Mode</div><div class="kpi-val" style="font-size:16px">' + escapeHtml(today.degraded ? 'DEGRADED' : 'NORMAL') + '</div><div class="kpi-sub">' + escapeHtml(today.degraded_reason || 'hard risk controls stay active') + '</div></div>' +
+    '</div>';
+
+  html += '<div class="sec-hdr"><span class="sec-title">Scheduler Jobs</span><span class="sec-badge">' + jobRows.length + ' jobs</span></div>';
+  html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+    '<th>Job</th><th>Status</th><th>Trigger</th><th class="r">Runs</th><th class="r">Skipped</th><th>Updated</th><th>Error</th>' +
+    '</tr></thead><tbody>';
+  html += jobRows.length ? jobRows.map(function(j) {
+    var status = String(j.status || '').toUpperCase();
+    var cls = status === 'SUCCESS' ? 'b-active' : (status === 'FAILED' ? 'b-rejected' : 'b-pending');
+    return '<tr><td class="mono">' + escapeHtml(j.job_name || '') + '</td>' +
+      '<td><span class="badge ' + cls + '">' + escapeHtml(status || 'UNKNOWN') + '</span></td>' +
+      '<td>' + escapeHtml(j.trigger || '-') + '</td>' +
+      '<td class="r">' + (j.run_count || 0) + '</td>' +
+      '<td class="r">' + (j.skipped_count || 0) + '</td>' +
+      '<td class="mono">' + escapeHtml(formatRelativeTime(j.updated_at)) + '</td>' +
+      '<td style="max-width:300px;white-space:normal">' + escapeHtml(j.last_error || '-') + '</td></tr>';
+  }).join('') : '<tr><td colspan="7" class="empty"><div class="empty-txt">No scheduler jobs recorded yet</div></td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<div class="sec-hdr"><span class="sec-title">Artefact Dependencies</span><span class="sec-badge">' + artifactRows.length + ' shown</span></div>';
+  html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+    '<th>Owner</th><th>Kind</th><th>Status</th><th class="r">Age</th><th>Expires</th><th>Source Run</th>' +
+    '</tr></thead><tbody>';
+  html += artifactRows.length ? artifactRows.map(function(a) {
+    var status = String(a.status || '').toUpperCase();
+    var cls = (status === 'FRESH' && !a.is_expired) ? 'b-active' : (status === 'FAILED' || a.is_expired ? 'b-rejected' : 'b-pending');
+    return '<tr><td class="mono">' + escapeHtml(a.owner || '') + '</td>' +
+      '<td class="mono">' + escapeHtml(a.kind || '') + '</td>' +
+      '<td><span class="badge ' + cls + '">' + escapeHtml(a.is_expired ? 'EXPIRED' : status) + '</span></td>' +
+      '<td class="r">' + (a.age_seconds != null ? Math.round(Number(a.age_seconds)) + 's' : '—') + '</td>' +
+      '<td class="mono">' + escapeHtml(formatRelativeTime(a.expires_at)) + '</td>' +
+      '<td class="mono">' + escapeHtml(a.source_run_id || '-') + '</td></tr>';
+  }).join('') : '<tr><td colspan="6" class="empty"><div class="empty-txt">No artefacts recorded yet</div></td></tr>';
+  html += '</tbody></table></div>';
+
+  html += '<div class="sec-hdr"><span class="sec-title">Recent Agent Runs</span><span class="sec-badge">' + runRows.length + ' shown</span></div>';
+  html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
+    '<th>Time</th><th>Pod</th><th>Agent</th><th>Task</th><th>Status</th><th class="r">Duration</th><th>Summary/Error</th>' +
+    '</tr></thead><tbody>';
+  html += runRows.length ? runRows.map(function(r) {
+    var status = String(r.status || '').toUpperCase();
+    var cls = status === 'SUCCESS' ? 'b-active' : (status === 'FAILED' || status === 'ERROR' ? 'b-rejected' : 'b-pending');
+    var detail = r.error || r.output_summary || '';
+    return '<tr><td class="mono">' + escapeHtml(formatRelativeTime(r.started_at)) + '</td>' +
+      '<td class="mono">' + escapeHtml(r.pod_id || '-') + '</td>' +
+      '<td class="mono">' + escapeHtml(r.agent_type || '') + '</td>' +
+      '<td class="mono">' + escapeHtml(r.task || '') + '</td>' +
+      '<td><span class="badge ' + cls + '">' + escapeHtml(status || 'UNKNOWN') + '</span></td>' +
+      '<td class="r">' + (r.duration_ms != null ? Math.round(Number(r.duration_ms)) + ' ms' : '—') + '</td>' +
+      '<td style="max-width:360px;white-space:normal">' + escapeHtml(detail || '-') + '</td></tr>';
+  }).join('') : '<tr><td colspan="7" class="empty"><div class="empty-txt">No agent runs recorded yet</div></td></tr>';
+  html += '</tbody></table></div>';
+  return html;
 }
 
 function renderStateHealthFallback(el, reason) {
@@ -664,6 +1014,9 @@ function renderStateHealth() {
     var nav = data.nav_history || {};
     var broker = data.broker || {};
     var dq = data.data_quality || {};
+    var fs = data.foresight || {};
+    var specialists = data.specialists || {};
+    var committee = data.committee_reviews || {};
     var statusCls = data.status === 'OK' ? 'b-active' : 'b-pending';
     var html = '<div class="broker-panel">';
     html += '<div class="sec-hdr"><span class="sec-title">System Health</span>' +
@@ -674,12 +1027,17 @@ function renderStateHealth() {
       '<div class="kpi"><div class="kpi-lbl">NAV Rows</div><div class="kpi-val">' + (nav.total_rows || 0) + '</div><div class="kpi-sub">' + countText(nav.repaired_rows || 0, 'repaired row') + '</div></div>' +
       '<div class="kpi"><div class="kpi-lbl">Broker Match</div><div class="kpi-val">' + escapeHtml(broker.status || 'UNKNOWN') + '</div><div class="kpi-sub">' + (broker.mismatch_count == null ? 'not checked' : countText(broker.mismatch_count, 'mismatch')) + '</div></div>' +
       '<div class="kpi"><div class="kpi-lbl">Data Quality</div><div class="kpi-val">' + escapeHtml(dq.status || 'UNKNOWN') + '</div><div class="kpi-sub">' + countText(dq.check_count || 0, 'position flagged') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Catalysts</div><div class="kpi-val">' + (fs.event_count || 0) + '</div><div class="kpi-sub">' + countText((fs.counts || {}).stale || 0, 'stale') + '</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">Specialists</div><div class="kpi-val">' + (specialists.brief_count || 0) + '</div><div class="kpi-sub">briefs</div></div>' +
+      '<div class="kpi"><div class="kpi-lbl">IC Reviews</div><div class="kpi-val">' + (committee.review_count || 0) + '</div><div class="kpi-sub">challenge records</div></div>' +
       '<div class="kpi"><div class="kpi-lbl">Last NAV</div><div class="kpi-val" style="font-size:14px">' + escapeHtml(formatEndDate(nav.last_ts)) + '</div><div class="kpi-sub">' + escapeHtml(formatTime(nav.last_ts)) + '</div></div>' +
       '</div>';
     var warnings = (data.warnings || []).concat(broker.errors || []);
     if (warnings.length) {
       html += '<div class="broker-errors">' + warnings.map(function(w) { return '<div>' + escapeHtml(w) + '</div>'; }).join('') + '</div>';
     }
+    html += renderManagedRuntimePanel(data.managed_runtime || {});
+    html += renderEvidenceReviewQueue(data.evidence_review);
     var dqRows = dq.positions || [];
     html += '<div class="sec-hdr"><span class="sec-title">Market Data Quality</span><span class="sec-badge">' + (dqRows.length || 0) + ' positions</span></div>';
     html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
@@ -722,16 +1080,20 @@ function renderStateHealth() {
     }
     html += '<div class="sec-hdr"><span class="sec-title">Pod State Integrity</span><span class="sec-badge">' + podsData.length + ' pods</span></div>';
     html += '<div class="tbl-wrap broker-table-wrap"><table class="dtbl"><thead><tr>' +
-      '<th>Pod</th><th>Status</th><th class="r">Start Cap</th><th class="r">NAV</th><th class="r">Cash</th><th class="r">Invested</th><th class="r">Positions</th><th>Last NAV</th><th>Issues</th>' +
+      '<th>Pod</th><th>Status</th><th>Trading Mode</th><th class="r">Start Cap</th><th class="r">NAV</th><th class="r">Cash</th><th class="r">Invested</th><th class="r">Positions</th><th>Last NAV</th><th>Issues</th>' +
       '</tr></thead><tbody>';
     if (!podsData.length) {
-      html += '<tr><td colspan="9" class="empty"><div class="empty-txt">No pod health data yet</div></td></tr>';
+      html += '<tr><td colspan="10" class="empty"><div class="empty-txt">No pod health data yet</div></td></tr>';
     } else {
       html += podsData.map(function(p) {
         var ok = p.status === 'OK';
+        var tradingMode = String(p.trading_mode || 'normal').replace(/_/g, ' ').toUpperCase();
+        var tradingReason = p.trading_block_reason || '';
+        var modeCls = tradingMode === 'NORMAL' ? 'b-active' : 'b-pending';
         return '<tr>' +
           '<td style="font-weight:600">' + escapeHtml(String(p.pod_id || '').toUpperCase()) + '</td>' +
           '<td><span class="badge ' + (ok ? 'b-active' : 'b-pending') + '">' + escapeHtml(p.status || '') + '</span></td>' +
+          '<td><span class="badge ' + modeCls + '" title="' + escapeHtml(tradingReason) + '">' + escapeHtml(tradingMode) + '</span></td>' +
           '<td class="r">' + moneyOrDash(p.starting_capital) + '</td>' +
           '<td class="r">' + moneyOrDash(p.nav) + '</td>' +
           '<td class="r">' + moneyOrDash(p.cash) + '</td>' +
@@ -944,7 +1306,13 @@ function localDecisionAuditItems(limit) {
   var items = [];
   (activityFeed || []).forEach(function(a) {
     var action = a.action || '';
-    if (action && ['trade_decision', 'thesis_verification', 'thesis_review', 'position_review', 'mandate_update', 'allocation'].indexOf(action) === -1) return;
+    if (action && [
+      'trade_decision', 'thesis_verification', 'thesis_review', 'position_review',
+      'mandate_update', 'allocation', 'quality_gate_warning', 'thesis_gate_failed',
+      'thesis_challenged', 'thesis_revised', 'data_quality_gate_failed',
+      'loss_review_gate_failed', 'broker_guard_blocked', 'evidence_review_required',
+      'evidence_review_blocked'
+    ].indexOf(action) === -1) return;
     items.push({
       ts: a.ts || a.timestamp || '',
       pod_id: a.pod_id || '',
@@ -953,7 +1321,7 @@ function localDecisionAuditItems(limit) {
       symbol: a.symbol || '',
       decision: a.summary || '',
       detail: a.detail || '',
-      status: 'INFO',
+      status: a.status || 'INFO',
       reason: a.reason || '',
     });
   });
@@ -992,9 +1360,9 @@ function localDecisionAuditItems(limit) {
 
 function executionTruthBadgeClass(status) {
   status = String(status || '').toUpperCase();
-  if (status === 'REJECTED' || status === 'BLOCKED') return 'b-rejected';
-  if (status === 'PENDING' || status === 'PROPOSED' || status === 'PARTIAL') return 'b-pending';
-  if (status === 'FILLED') return 'b-filled';
+  if (status === 'REJECTED' || status === 'BLOCKED' || status === 'FAILED' || status === 'FAIL') return 'b-rejected';
+  if (status === 'PENDING' || status === 'PROPOSED' || status === 'PARTIAL' || status === 'WARN' || status === 'WATCH' || status === 'ACTIVE' || status === 'REDUCE_ONLY' || status === 'GUARDED' || status === 'REVIEW_REQUIRED') return 'b-pending';
+  if (status === 'FILLED' || status === 'PASS' || status === 'OK' || status === 'RECORDED') return 'b-filled';
   return 'b-active';
 }
 
@@ -1013,7 +1381,11 @@ function renderExecutionTruthPanel(rows) {
     var status = String(row.status || 'UNKNOWN').toUpperCase();
     var gateBits = [];
     if (row.thesis_gate && row.thesis_gate.passed === false) gateBits.push('thesis failed');
+    if (row.quality_gate && row.quality_gate.action && row.quality_gate.action !== 'pass') {
+      gateBits.push('quality ' + row.quality_gate.action);
+    }
     if (row.data_gate && row.data_gate.passed === false) gateBits.push('data failed');
+    if (row.evidence_guard && row.evidence_guard.blocked_count) gateBits.push('evidence review ' + row.evidence_guard.blocked_count);
     var stage = gateBits.length ? gateBits.join(', ') : (row.stage || '—');
     var order = row.last_order_result || {};
     var orderText = order.symbol
@@ -1021,10 +1393,13 @@ function renderExecutionTruthPanel(rows) {
       : '—';
     var symbols = (row.active_symbols || []).map(tickerDisplay).join(', ');
     var pmText = row.pm_summary || (symbols ? 'Active: ' + symbols : 'No active trade');
+    var modelText = row.quality_gate && row.quality_gate.llm && row.quality_gate.llm.model
+      ? ' · ' + row.quality_gate.llm.provider + '/' + row.quality_gate.llm.model
+      : '';
     return '<tr>' +
       '<td><b>' + escapeHtml(String(row.pod_id || '').toUpperCase()) + '</b></td>' +
       '<td><span class="badge ' + executionTruthBadgeClass(status) + '">' + escapeHtml(status.replace(/_/g, ' ')) + '</span></td>' +
-      '<td>' + escapeHtml(pmText) + '</td>' +
+      '<td>' + escapeHtml(pmText + modelText) + '</td>' +
       '<td>' + escapeHtml(String(stage).replace(/_/g, ' ')) + '</td>' +
       '<td style="max-width:320px;white-space:normal">' + escapeHtml(row.reason || '—') + '</td>' +
       '<td>' + orderText + '</td>' +
@@ -1055,12 +1430,14 @@ function renderDecisionAudit() {
         var cls = status === 'REJECTED' ? 'b-rejected' : status === 'FILLED' ? 'b-filled' : status === 'PENDING' ? 'b-pending' : 'b-active';
         var pod = item.pod_id ? String(item.pod_id).toUpperCase() : 'FIRM';
         var detail = item.detail || item.reason || '';
+        var modelMeta = item.model ? item.provider + '/' + item.model + (item.task ? ' · ' + item.task : '') : '';
         return '<div class="audit-card">' +
           '<div class="audit-card-head">' +
             '<span class="badge ' + cls + '">' + escapeHtml(status) + '</span>' +
             '<span class="audit-stage">' + escapeHtml((item.stage || 'event').replace(/_/g, ' ')) + '</span>' +
             '<span class="audit-pod">' + escapeHtml(pod) + '</span>' +
             (item.symbol ? '<span class="audit-symbol">' + tickerDisplay(item.symbol) + '</span>' : '') +
+            (modelMeta ? '<span class="audit-model">' + escapeHtml(modelMeta) + '</span>' : '') +
             '<span class="audit-time">' + escapeHtml(formatRelativeTime(item.ts)) + '</span>' +
           '</div>' +
           '<div class="audit-decision">' + escapeHtml(item.decision || '—') + '</div>' +
@@ -1086,11 +1463,13 @@ function renderDecisionAudit() {
       var cls = status === 'REJECTED' ? 'b-rejected' : status === 'FILLED' ? 'b-filled' : status === 'PENDING' ? 'b-pending' : 'b-active';
       var pod = item.pod_id ? String(item.pod_id).toUpperCase() : 'FIRM';
       var detail = item.detail || item.reason || '';
+      var modelMeta = item.model ? item.provider + '/' + item.model + (item.task ? ' · ' + item.task : '') : '';
       return '<div class="audit-card"><div class="audit-card-head">' +
         '<span class="badge ' + cls + '">' + escapeHtml(status) + '</span>' +
         '<span class="audit-stage">' + escapeHtml((item.stage || 'event').replace(/_/g, ' ')) + '</span>' +
         '<span class="audit-pod">' + escapeHtml(pod) + '</span>' +
         (item.symbol ? '<span class="audit-symbol">' + tickerDisplay(item.symbol) + '</span>' : '') +
+        (modelMeta ? '<span class="audit-model">' + escapeHtml(modelMeta) + '</span>' : '') +
         '<span class="audit-time">' + escapeHtml(formatRelativeTime(item.ts)) + '</span></div>' +
         '<div class="audit-decision">' + escapeHtml(item.decision || '—') + '</div>' +
         (detail ? '<div class="audit-detail">' + escapeHtml(detail) + '</div>' : '') + '</div>';
@@ -1144,8 +1523,16 @@ function switchResearchSubTab(name) {
   if (name === 'historical' && researchHistoryChart) {
     researchHistoryChart.resize();
   }
+  if (name === 'social') {
+    fetchResearchFeedAudit(false).then(function() {
+      renderNewsFeed();
+    }).catch(function() {});
+  }
   if (name === 'feed-health') {
     renderResearchFeedAudit();
+  }
+  if (name === 'foresight') {
+    renderForesightLedger();
   }
 }
 document.querySelectorAll('.sub-tab-btn').forEach(btn => {
@@ -1153,25 +1540,112 @@ document.querySelectorAll('.sub-tab-btn').forEach(btn => {
 });
 
 // ─── 4. WebSocket ────────────────────────────────────────────────────────
-const WS_URL = `ws://${window.location.host}/ws`;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws`;
 var ws = null;
+var backendReachableAt = 0;
+var snapshotFallbackInflight = false;
+
+function wsIsOpen() {
+  return ws && ws.readyState === WebSocket.OPEN;
+}
 
 function setConn(on) {
   const dot = document.getElementById('conn-dot');
   const lbl = document.getElementById('conn-label');
+  if (!dot || !lbl) return;
   dot.classList.toggle('on', on);
   lbl.classList.toggle('on', on);
   lbl.textContent = on ? 'CONNECTED' : 'DISCONNECTED';
 }
 
+function updateIterationDisplay(data) {
+  var sd = data || {};
+  if (sd.iteration != null) iterCount = sd.iteration;
+  var iterEl = document.getElementById('iter-ctr');
+  if (iterEl) iterEl.textContent = (iterCount || iterCount === 0) ? iterCount : '—';
+
+  var stageEl = document.getElementById('iter-stage');
+  if (!stageEl) return;
+  var detail = sd.stage_detail || sd.stage || '';
+  if (!detail || detail === 'Idle') {
+    stageEl.textContent = '';
+    stageEl.title = 'Current session stage';
+    return;
+  }
+  stageEl.textContent = '- ' + detail;
+  stageEl.title = detail + (sd.stage_updated_at ? ' @ ' + sd.stage_updated_at : '');
+}
+
+function applyBackendStatus(data) {
+  var sd = data || {};
+  backendReachableAt = Date.now();
+  setConn(true);
+  updateSessionStatus(!!sd.active);
+  updateIterationDisplay(sd);
+}
+
+function fetchSnapshotFallback(force) {
+  if (!force && wsIsOpen()) return;
+  if (snapshotFallbackInflight) return;
+  snapshotFallbackInflight = true;
+  fetchJsonWithTimeout('/api/session/snapshot', {}, 4500)
+    .then(function(snapshot) {
+      backendReachableAt = Date.now();
+      setConn(true);
+      handleMessage(snapshot);
+    })
+    .catch(function(err) {
+      if (!wsIsOpen()) console.warn('[dashboard] session snapshot fallback failed', err);
+    })
+    .finally(function() {
+      snapshotFallbackInflight = false;
+    });
+}
+
+function pollSessionStatus() {
+  fetchJsonWithTimeout('/api/session/status', {}, 3500)
+    .then(function(data) {
+      applyBackendStatus(data);
+      if (!wsIsOpen()) fetchSnapshotFallback(false);
+    })
+    .catch(function(err) {
+      if (!wsIsOpen() && Date.now() - backendReachableAt > 6000) {
+        setConn(false);
+      }
+      console.warn('[dashboard] session status poll failed', err);
+    });
+}
+
 function connect() {
+  if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   ws = new WebSocket(WS_URL);
-  ws.onopen = () => setConn(true);
-  ws.onclose = () => { setConn(false); setTimeout(connect, 3000); };
-  ws.onerror = () => ws.close();
-  ws.onmessage = ev => { try { handleMessage(JSON.parse(ev.data)); } catch(e) { console.error(e); } };
+  ws.onopen = () => {
+    backendReachableAt = Date.now();
+    setConn(true);
+  };
+  ws.onclose = () => {
+    if (Date.now() - backendReachableAt > 6000) setConn(false);
+    setTimeout(connect, 3000);
+    pollSessionStatus();
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch(e) {}
+    pollSessionStatus();
+  };
+  ws.onmessage = ev => {
+    try {
+      backendReachableAt = Date.now();
+      setConn(true);
+      handleMessage(JSON.parse(ev.data));
+    } catch(e) {
+      console.error(e);
+      fetchSnapshotFallback(true);
+    }
+  };
 }
 connect();
+pollSessionStatus();
+setInterval(pollSessionStatus, 3000);
 
 // ─── 5. Research Tab Helpers ──────────────────────────────────────────────
 function formatPct(v) {
@@ -1260,15 +1734,10 @@ function renderCurrentMarkets(signals) {
     return;
   }
 
-  const prevByMarket = {};
-  if (signalHistory.length) {
-    const last = signalHistory[signalHistory.length - 1].signals || [];
-    last.forEach(s => { prevByMarket[s.market_id || s.question] = s.implied_prob; });
-  }
-
   tbody.innerHTML = signals.map((s, i) => {
     const q = s.question || s.market || JSON.stringify(s);
-    const prevProb = prevByMarket[s.market_id || q];
+    const marketId = marketHistoryKey(s) || q;
+    const prevProb = previousMarketProbability(marketId, s.timestamp || new Date().toISOString());
     const delta = formatDelta(s.implied_prob, prevProb);
     const rowId = 'poly-row-' + i;
     return '<tr class="poly-market-row" data-rowid="' + rowId + '" style="cursor:pointer">' +
@@ -1302,7 +1771,7 @@ function renderCurrentMarkets(signals) {
 const COLORS = ['#00cfe8', '#f0a030', '#00c888', '#7c5cfc', '#e84040'];
 const MAX_MARKETS = 5;
 const BUCKET_MS = 4 * 60 * 60 * 1000;
-const WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+const WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 function initResearchHistoryChart() {
   const ctx = document.getElementById('research-history-chart');
@@ -1353,25 +1822,35 @@ function updateHistoricalChart() {
     const ts = new Date(e.ts).getTime();
     if (ts < cutoff) return;
     const bucket = Math.floor(ts / BUCKET_MS) * BUCKET_MS;
-    if (!bucketed[bucket]) bucketed[bucket] = { ts: bucket, signals: [] };
-    bucketed[bucket].signals = e.signals || [];
+    if (!bucketed[bucket]) bucketed[bucket] = { ts: bucket, byId: {} };
+    (e.signals || []).forEach(function(sig) {
+      var id = marketHistoryKey(sig);
+      if (id) bucketed[bucket].byId[id] = sig;
+    });
   });
 
   const buckets = Object.keys(bucketed).map(Number).sort((a, b) => a - b);
-  const latestSignals = buckets.length
-    ? [...(bucketed[buckets[buckets.length - 1]].signals || [])]
-        .sort((a, b) => (b.implied_prob || 0) - (a.implied_prob || 0))
-        .slice(0, MAX_MARKETS)
-    : [];
+  const latestByMarket = {};
+  buckets.forEach(function(b) {
+    Object.keys(bucketed[b].byId || {}).forEach(function(id) {
+      latestByMarket[id] = bucketed[b].byId[id];
+    });
+  });
+  const latestSignals = Object.keys(latestByMarket)
+    .map(function(id) { return latestByMarket[id]; })
+    .sort(function(a, b) {
+      return (b.volume_24h || 0) - (a.volume_24h || 0) || (b.implied_prob || 0) - (a.implied_prob || 0);
+    })
+    .slice(0, MAX_MARKETS);
 
-  const topIds = latestSignals.map(s => s.market_id || s.question || JSON.stringify(s));
+  const topIds = latestSignals.map(s => marketHistoryKey(s) || JSON.stringify(s));
   const labels = buckets.map(b => new Date(b).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }));
 
   const datasets = topIds.map((id, i) => {
     const market = latestSignals[i];
     const data = buckets.map(b => {
       const entry = bucketed[b];
-      const sig = (entry && entry.signals) ? entry.signals.find(s => (s.market_id || s.question) === id) : null;
+      const sig = (entry && entry.byId) ? entry.byId[id] : null;
       return sig ? parseFloat((sig.implied_prob * 100).toFixed(1)) : null;
     });
     return {
@@ -1391,7 +1870,7 @@ function updateHistoricalChart() {
   researchHistoryChart.update();
 
   const countEl = document.getElementById('history-data-count');
-  if (countEl) countEl.textContent = signalHistory.length;
+  if (countEl) countEl.textContent = flattenedSignalHistory().length;
 }
 
 function renderHistoryTable() {
@@ -1424,6 +1903,50 @@ function renderHistoryTable() {
   tbody.innerHTML = rows.join('');
 
   // Click handler: toggle full question text
+  tbody.querySelectorAll('.poly-market-row').forEach(function(row) {
+    row.addEventListener('click', function() {
+      var rowId = row.dataset.rowid;
+      var shortEl = row.querySelector('.poly-q-short');
+      var fullEl = document.getElementById(rowId);
+      if (!shortEl || !fullEl) return;
+      var isExpanded = fullEl.style.display !== 'none';
+      shortEl.style.display = isExpanded ? '' : 'none';
+      fullEl.style.display = isExpanded ? 'none' : '';
+      row.style.background = isExpanded ? '' : 'var(--bg-elevated)';
+    });
+  });
+}
+
+function renderHistoryTableV2() {
+  const tbody = document.getElementById('history-body');
+  if (!tbody) return;
+
+  const historyRows = flattenedSignalHistory();
+  if (!historyRows.length) {
+    tbody.innerHTML = '<tr class="empty-row"><td colspan="7">No history yet - waiting for first cycle</td></tr>';
+    return;
+  }
+
+  const rows = historyRows.slice(-80).reverse().map(function(row, idx) {
+    const sig = row.signal || {};
+    const hRowId = 'hist-row-v2-' + idx;
+    const q = sig.question || sig.market || '';
+    const prevProb = previousMarketProbability(row.id, row.ts);
+    const delta = formatDelta(sig.implied_prob, prevProb);
+    return '<tr class="poly-market-row" data-rowid="' + hRowId + '" style="cursor:pointer">' +
+      '<td class="num">' + formatTime(row.ts) + '</td>' +
+      '<td><span class="poly-q-short">' + escapeHtml(truncate(q, 76)) + '</span>' +
+      '<span class="poly-q-full" id="' + hRowId + '" style="display:none;white-space:normal;word-break:break-word;color:var(--text-primary)">' + escapeHtml(q) + '</span></td>' +
+      '<td class="num">' + statusBadge(sig.status || 'Active') + '</td>' +
+      '<td class="num accent">' + formatPct(sig.implied_prob) + '</td>' +
+      '<td class="num">' + delta + '</td>' +
+      '<td class="num">' + formatVol(sig.volume_24h) + '</td>' +
+      '<td class="num">' + formatEndDate(sig.end_date) + '</td>' +
+      '</tr>';
+  });
+
+  tbody.innerHTML = rows.join('');
+
   tbody.querySelectorAll('.poly-market-row').forEach(function(row) {
     row.addEventListener('click', function() {
       var rowId = row.dataset.rowid;
@@ -1686,6 +2209,12 @@ function renderNewsFeed() {
   const refreshEl = document.getElementById('social-last-refresh');
   const badgeEl = document.getElementById('social-badge');
 
+  if (!researchFeedAuditLoading && Date.now() - researchFeedAuditLastFetchMs > RESEARCH_FEED_REFRESH_MS) {
+    fetchResearchFeedAudit(false).then(function() {
+      renderNewsFeed();
+    }).catch(function() {});
+  }
+
   const feed = normalizeNewsFeed(researchXFeed || []);
   researchXFeed = feed;
   researchXTweetCount = feed.length;
@@ -1816,14 +2345,53 @@ function renderResearchFeedItems(items) {
   }).join('');
 }
 
-async function fetchResearchFeedAudit() {
+function researchAuditItemsToNews(items) {
+  return (items || []).map(function(item) {
+    var raw = item.raw && typeof item.raw === 'object' ? item.raw : {};
+    return Object.assign({}, raw, {
+      title: item.title || raw.title || raw.headline || item.text || '',
+      text: item.text || raw.text || raw.summary || raw.headline || item.title || '',
+      headline: item.title || raw.headline || raw.title || '',
+      url: item.url || raw.url || '#',
+      source: item.source || raw.source || raw.publisher || 'news',
+      publisher: item.source || raw.publisher || raw.source || 'news',
+      category: item.category || raw.category || item.source_type || 'Markets',
+      timestamp: item.published_at || item.last_seen_at || raw.timestamp || raw.published_at || raw.published,
+      published_at: item.published_at || raw.published_at || raw.published,
+      sentiment: item.sentiment != null ? item.sentiment : raw.sentiment,
+      reliability: item.reliability != null ? item.reliability : raw.reliability,
+      asset_classes: item.asset_classes || raw.asset_classes,
+      factors: item.factors || raw.factors,
+      tickers: item.tickers || raw.tickers
+    });
+  }).filter(function(item) {
+    return newsItemText(item);
+  });
+}
+
+function absorbResearchFeedAudit(report) {
+  var items = researchAuditItemsToNews(report && report.items);
+  if (items.length) {
+    mergeNewsFeed(items);
+  }
+  if (report && report.last_fetch_time) {
+    newsLastRefresh = report.last_fetch_time;
+  }
+  return items.length;
+}
+
+async function fetchResearchFeedAudit(force) {
   if (researchFeedAuditLoading) return researchFeedAudit;
+  if (!force && researchFeedAudit && Date.now() - researchFeedAuditLastFetchMs < RESEARCH_FEED_REFRESH_MS) {
+    return researchFeedAudit;
+  }
   researchFeedAuditLoading = true;
   try {
-    const response = await fetch('/api/research-feed?limit=100');
-    if (!response.ok) throw new Error('research feed request failed');
-    researchFeedAudit = await response.json();
+    researchFeedAudit = await fetchJsonWithTimeout('/api/research-feed?limit=100', {}, 7000);
+    researchFeedAuditLastFetchMs = Date.now();
+    absorbResearchFeedAudit(researchFeedAudit);
   } catch (err) {
+    researchFeedAuditLastFetchMs = Date.now();
     researchFeedAudit = {
       status: 'ERROR',
       items: [],
@@ -1842,7 +2410,7 @@ async function fetchResearchFeedAudit() {
 
 async function renderResearchFeedAudit(force) {
   if (force || !researchFeedAudit) {
-    await fetchResearchFeedAudit();
+    await fetchResearchFeedAudit(!!force);
   }
   const report = researchFeedAudit || {};
   const items = report.items || [];
@@ -1861,22 +2429,126 @@ async function renderResearchFeedAudit(force) {
   renderResearchFeedItems(items);
 }
 
+function renderForesightRows(events) {
+  var panel = document.getElementById('foresight-ledger-panel');
+  if (!panel) return;
+  if (!events || !events.length) {
+    panel.innerHTML = '<div class="empty-txt">No catalyst events yet</div>';
+    return;
+  }
+  panel.innerHTML =
+    '<table class="dtbl foresight-table">' +
+      '<thead><tr>' +
+        '<th>Event</th><th>State</th><th>Pods</th><th>Factors</th><th class="num">Materiality</th><th class="num">Confidence</th><th>Direction</th><th>Specialists</th>' +
+      '</tr></thead>' +
+      '<tbody>' +
+        events.map(function(event) {
+          var impact = event.materiality_score != null ? Number(event.materiality_score).toFixed(2) : (event.impact_score != null ? Number(event.impact_score).toFixed(2) : '-');
+          var conf = event.confidence != null ? Number(event.confidence).toFixed(2) : '-';
+          var pods = Array.isArray(event.affected_pods) ? event.affected_pods : [];
+          var factors = Array.isArray(event.factors) ? event.factors : [];
+          var specs = Array.isArray(event.suggested_specialists) ? event.suggested_specialists : [];
+          var refs = Array.isArray(event.source_refs) ? event.source_refs : [];
+          var firstUrl = refs.find(function(ref) { return ref && ref.url; });
+          var title = event.title || event.event_id || 'Untitled catalyst';
+          var titleHtml = firstUrl && firstUrl.url
+            ? '<a href="' + escapeHtml(firstUrl.url) + '" target="_blank" rel="noopener">' + escapeHtml(title) + '</a>'
+            : escapeHtml(title);
+          return '<tr>' +
+            '<td><div class="rf-item-title">' + titleHtml + '</div>' +
+              '<div class="rf-item-meta">' + escapeHtml(event.thread_id || event.event_id || '') + ' | ' + escapeHtml(truncate(event.summary || '', 180)) + '</div>' +
+              '<div class="rf-item-meta">' + escapeHtml(truncate(event.transmission_path || event.uncertainty || '', 180)) + '</div></td>' +
+            '<td><span class="badge ' + (String(event.status || '').toLowerCase() === 'active' ? 'b-active' : 'b-pending') + '">' + escapeHtml(String(event.status || 'active').toUpperCase()) + '</span></td>' +
+            '<td><div class="rf-tags">' + researchTags(pods, 'pod') + '</div></td>' +
+            '<td><div class="rf-tags">' + researchTags(factors, 'factor') + '</div></td>' +
+            '<td class="num">' + escapeHtml(impact) + '</td>' +
+            '<td class="num">' + escapeHtml(conf) + '</td>' +
+            '<td>' + escapeHtml((event.direction || 'mixed').toUpperCase()) + '<div class="rf-item-meta">' + escapeHtml(event.horizon || '') + '</div></td>' +
+            '<td><div class="rf-tags">' + researchTags(specs, 'held') + '</div></td>' +
+          '</tr>';
+        }).join('') +
+      '</tbody>' +
+    '</table>';
+}
+
+function renderCatalystThreads(threads) {
+  var panel = document.getElementById('catalyst-thread-panel');
+  if (!panel) return;
+  setText('fs-thread-count', (threads || []).length + ' threads');
+  if (!threads || !threads.length) {
+    panel.innerHTML = '<div class="empty-txt">No catalyst threads yet</div>';
+    return;
+  }
+  panel.innerHTML = '<table class="dtbl foresight-table"><thead><tr>' +
+    '<th>Thread</th><th>Status</th><th class="num">Events</th><th>Pods</th><th>Factors</th><th class="num">Score</th><th>Latest</th>' +
+    '</tr></thead><tbody>' +
+    threads.map(function(t) {
+      return '<tr>' +
+        '<td><div class="rf-item-title">' + escapeHtml(t.title || t.thread_id || '') + '</div>' +
+          '<div class="rf-item-meta">' + escapeHtml(t.thread_id || '') + '</div></td>' +
+        '<td><span class="badge ' + (String(t.status || '').toLowerCase() === 'active' ? 'b-active' : 'b-pending') + '">' + escapeHtml(String(t.status || 'active').toUpperCase()) + '</span></td>' +
+        '<td class="num">' + (t.event_count || 0) + '</td>' +
+        '<td><div class="rf-tags">' + researchTags(t.affected_pods || [], 'pod') + '</div></td>' +
+        '<td><div class="rf-tags">' + researchTags(t.factors || [], 'factor') + '</div></td>' +
+        '<td class="num">' + Number(t.materiality_score || 0).toFixed(2) + '</td>' +
+        '<td class="mono">' + escapeHtml(formatRelativeTime(t.latest_updated_at)) + '</td>' +
+      '</tr>';
+    }).join('') + '</tbody></table>';
+}
+
+async function fetchForesightLedger(force) {
+  if (foresightLedgerLoading) return foresightLedger;
+  if (!force && foresightLedger && Date.now() - foresightLedgerLastFetchMs < RESEARCH_FEED_REFRESH_MS) {
+    return foresightLedger;
+  }
+  foresightLedgerLoading = true;
+  try {
+    foresightLedger = await fetchJsonWithTimeout('/api/foresight?limit=100', {}, 7000);
+    catalystThreads = await fetchJsonWithTimeout('/api/catalyst-threads?limit=50', {}, 7000);
+    foresightLedgerLastFetchMs = Date.now();
+  } catch (err) {
+    foresightLedgerLastFetchMs = Date.now();
+    foresightLedger = {
+      status: 'ERROR',
+      events: [],
+      counts: { active: 0, stale: 0, failed: 1 },
+      event_count: 0,
+      error: String(err && err.message ? err.message : err),
+    };
+    catalystThreads = { threads: [], count: 0, status: 'ERROR' };
+  } finally {
+    foresightLedgerLoading = false;
+  }
+  return foresightLedger;
+}
+
+async function renderForesightLedger(force) {
+  if (force || !foresightLedger) {
+    await fetchForesightLedger(!!force);
+  }
+  var report = foresightLedger || {};
+  var counts = report.counts || {};
+  setText('fs-status', report.status || '-');
+  setText('fs-active', counts.active || 0);
+  setText('fs-stale', counts.stale || 0);
+  setText('fs-failed', counts.failed || 0);
+  renderForesightRows(report.events || []);
+  renderCatalystThreads((catalystThreads || {}).threads || []);
+}
+
 function updateResearchTab(signals, confidence, macroScore) {
   researchSignals = signals || [];
   researchPolyConf = confidence != null ? confidence : 0.5;
   researchMacroScore = macroScore;
 
   if (researchSignals.length > 0) {
-    signalHistory.push({ ts: new Date().toISOString(), signals: researchSignals });
-    const cutoff = new Date(Date.now() - HISTORY_MAX_AGE_MS).toISOString();
-    signalHistory = signalHistory.filter(e => e.ts >= cutoff);
-    if (signalHistory.length > MAX_HISTORY) signalHistory = signalHistory.slice(-MAX_HISTORY);
-    saveSignalHistory();
+    mergePolymarketHistory(researchSignals);
   }
 
+  ensurePolymarketHistoryLayout();
   renderCurrentMarkets(researchSignals);
   updateHistoricalChart();
-  renderHistoryTable();
+  renderHistoryTableV2();
   renderContributors(researchSignals, researchPolyConf, researchMacroScore, researchMomentum);
   renderMacroIndicators();
   updateVixKpi();
@@ -1887,8 +2559,7 @@ function updateResearchTab(signals, confidence, macroScore) {
 function handleMessage(msg) {
   if (msg.type === 'session_snapshot') {
     var snap = msg.data || {};
-    if (snap.iteration) iterCount = snap.iteration;
-    document.getElementById('iter-ctr').textContent = iterCount || '—';
+    updateIterationDisplay(snap);
     if (snap.session_active !== undefined) updateSessionStatus(!!snap.session_active);
     if (snap.firm_inception_pnl !== undefined && snap.firm_inception_pnl !== null) {
       firmInceptionPnl = snap.firm_inception_pnl;
@@ -1897,6 +2568,12 @@ function handleMessage(msg) {
       benchmarkReturns = snap.benchmark_returns;
     }
     if (snap.drawdown_tier) drawdownTierBadge = snap.drawdown_tier;
+    if (snap.research_feed) {
+      researchFeedAudit = snap.research_feed;
+      researchFeedAuditLastFetchMs = Date.now();
+      absorbResearchFeedAudit(researchFeedAudit);
+      renderNewsFeed();
+    }
     fetch('/api/nav-history?limit=' + MAX_NAV_HISTORY).then(function(r) { return r.json(); }).then(function(data) {
       var hist = (data && data.history) ? data.history : [];
       if (hist.length === 0) return;
@@ -2000,10 +2677,7 @@ function handleMessage(msg) {
   if (msg.type === 'session_status') {
     var sd = msg.data || {};
     updateSessionStatus(!!sd.active);
-    if (sd.iteration != null) {
-      iterCount = sd.iteration;
-      document.getElementById('iter-ctr').textContent = iterCount;
-    }
+    updateIterationDisplay(sd);
     if (sd.firm_inception_pnl != null && sd.firm_inception_pnl !== undefined) {
       firmInceptionPnl = sd.firm_inception_pnl;
     }
@@ -2150,7 +2824,19 @@ function handleMessage(msg) {
     if (!agentActivity[act.agent_id]) agentActivity[act.agent_id] = [];
     agentActivity[act.agent_id].unshift(act);
     if (agentActivity[act.agent_id].length > 5) agentActivity[act.agent_id].pop();
-    activityFeed.unshift({ agent_id: act.agent_id, agent_role: act.agent_role, pod_id: act.pod_id, action: act.action, summary: act.summary, detail: act.detail, urls: act.urls, ts: msg.timestamp });
+    activityFeed.unshift({
+      agent_id: act.agent_id,
+      agent_role: act.agent_role,
+      pod_id: act.pod_id,
+      symbol: act.symbol,
+      action: act.action,
+      status: act.status,
+      summary: act.summary,
+      detail: act.detail,
+      reason: act.reason,
+      urls: act.urls,
+      ts: msg.timestamp,
+    });
     if (activityFeed.length > 50) activityFeed.pop();
     updateActivityFeed();
     updateDecisionTimeline();
@@ -3311,12 +3997,15 @@ function updateRiskTable() {
     const lev   = d.gross_leverage != null && d.gross_leverage !== 0 ? d.gross_leverage.toFixed(2) + 'x' : '—';
     const dd    = d.drawdown != null && d.drawdown !== 0 ? (d.drawdown * 100).toFixed(1) + '%' : '0.0%';
     const ddCls = d.drawdown != null && d.drawdown < -0.05 ? 'neg' : '';
+    const guard = String(d.risk_mode || (d.risk_metrics && d.risk_metrics.risk_mode) || 'normal').toUpperCase();
+    const guardCls = guard === 'NORMAL' ? 'b-active' : 'b-pending';
     return `<tr>
       <td class="pod-name">${id.toUpperCase()}</td>
       <td class="r">${var95}</td>
       <td class="r">${lev}</td>
       <td class="r ${ddCls}">${dd}</td>
       <td class="r">${pos}</td>
+      <td class="r"><span class="badge ${guardCls}">${escapeHtml(guard.replace(/_/g, ' '))}</span></td>
       <td class="r"><span class="badge ${sc}">${st}</span></td>
     </tr>`;
   }).join('');
@@ -3762,7 +4451,7 @@ function setPositionDetailsOpen(group, open) {
 
 function enhancePositionModalDetails(overlay) {
   if (!overlay) return;
-  overlay.querySelectorAll('.pos-fills details, .pmh-list details').forEach(function(detail) {
+  overlay.querySelectorAll('.pos-fills details, .pmh-list details, .evidence-list details').forEach(function(detail) {
     detail.addEventListener('toggle', function() {
       if (detail.open) detail.scrollIntoView({ block: 'nearest' });
     });
@@ -3851,11 +4540,15 @@ function buildPositionFromLocal(podId, symbol) {
     entry_thesis: pos.entry_thesis || '',
     stop_loss_pct: pos.stop_loss_pct || 0.05,
     take_profit_pct: pos.take_profit_pct || 0.15,
+    take_profit_levels: pos.take_profit_levels || [],
+    take_profit_hits: pos.take_profit_hits || [],
     max_hold_days: pos.max_hold_days || 0,
     conviction: pos.conviction || 0,
     thesis_status: pos.thesis_status || 'unknown',
     thesis_issues: pos.thesis_issues || [],
     thesis_review: pos.thesis_review || {},
+    evidence_packet: pos.evidence_packet || {},
+    evidence_packets: pos.evidence_packets || [],
     entry_macro_regime: pos.entry_macro_regime || '',
     days_held: daysHeld,
     fills: pos.fills || [],
@@ -3870,6 +4563,143 @@ function closePositionModal() {
   _positionDetailRequestToken++;
   _openModalPodId = null;
   _openModalSymbol = null;
+}
+
+function evidenceStageLabel(value) {
+  return String(value || 'check').replace(/_/g, ' ').toUpperCase();
+}
+
+function renderEvidenceChecks(checks) {
+  if (!Array.isArray(checks) || !checks.length) {
+    return '<div class="pos-empty">No recorded checks for this packet.</div>';
+  }
+  return '<div class="evidence-list">' + checks.map(function(check, idx) {
+    check = check || {};
+    var status = String(check.status || 'INFO').toUpperCase();
+    var score = check.score != null ? 'Score ' + Number(check.score).toFixed(2) : '';
+    var meta = [];
+    if (check.source) meta.push(String(check.source));
+    if (check.price != null) meta.push('$' + Number(check.price).toFixed(2));
+    if (check.price_age_seconds != null) meta.push(String(check.price_age_seconds) + 's old');
+    return '<details class="evidence-check" data-detail-key="evidence-check-' + idx + '">' +
+      '<summary class="evidence-check-summary">' +
+        '<span class="badge ' + executionTruthBadgeClass(status) + '">' + escapeHtml(status) + '</span>' +
+        '<span class="evidence-check-name">' + escapeHtml(evidenceStageLabel(check.name)) + '</span>' +
+        '<span class="evidence-check-score">' + escapeHtml(score || meta.join(' | ')) + '</span>' +
+        '<span class="pmh-caret">v</span>' +
+      '</summary>' +
+      '<div class="pmh-text">' + escapeHtml(check.detail || '') +
+        (check.warnings && check.warnings.length ? '<br><b>Warnings:</b><br>' + escapeHtml(check.warnings.join('\n')) : '') +
+        (check.issues && check.issues.length ? '<br><b>Issues:</b><br>' + escapeHtml(check.issues.join('\n')) : '') +
+      '</div>' +
+    '</details>';
+  }).join('') + '</div>';
+}
+
+function renderEvidenceItems(items) {
+  if (!Array.isArray(items) || !items.length) return '<div class="pos-empty">No items captured.</div>';
+  return items.map(function(item) {
+    item = item || {};
+    var title = item.title || item.text || 'Untitled item';
+    var bits = [];
+    if (item.source) bits.push(item.source);
+    if (item.probability != null) bits.push('p=' + Number(item.probability).toFixed(2));
+    if (item.sentiment != null) bits.push('sent=' + Number(item.sentiment).toFixed(2));
+    if (item.impact != null) bits.push('impact=' + Number(item.impact).toFixed(2));
+    return '<div class="evidence-item">' +
+      '<div class="evidence-item-title">' + escapeHtml(title) + '</div>' +
+      (bits.length ? '<div class="evidence-item-meta">' + escapeHtml(bits.join(' | ')) + '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+function renderSpecialistBriefItems(items) {
+  if (!Array.isArray(items) || !items.length) return '<div class="pos-empty">No specialist briefs captured.</div>';
+  return items.slice(0, 8).map(function(item) {
+    item = item || {};
+    var support = Array.isArray(item.supporting_evidence) ? item.supporting_evidence.join('; ') : '';
+    var oppose = Array.isArray(item.opposing_evidence) ? item.opposing_evidence.join('; ') : '';
+    return '<div class="evidence-item">' +
+      '<div class="evidence-item-title">' + escapeHtml((item.type || 'specialist') + (item.symbol ? ' ' + item.symbol : '')) + '</div>' +
+      '<div class="evidence-item-meta">' + escapeHtml(item.question || '') + '</div>' +
+      '<div class="evidence-note">' + escapeHtml(item.conclusion || '') + '</div>' +
+      (support ? '<div class="evidence-item-meta">Supports: ' + escapeHtml(support) + '</div>' : '') +
+      (oppose ? '<div class="evidence-item-meta">Pushback: ' + escapeHtml(oppose) + '</div>' : '') +
+    '</div>';
+  }).join('');
+}
+
+function renderEvidencePacket(packet) {
+  if (!packet || typeof packet !== 'object' || !Object.keys(packet).length) return '';
+  var trade = packet.trade || {};
+  var market = packet.market_context || {};
+  var position = packet.position_context || {};
+  var evidence = packet.evidence || {};
+  var missing = Array.isArray(packet.missing_evidence) ? packet.missing_evidence : [];
+  var fred = market.fred || {};
+  var fredHtml = Object.keys(fred).length
+    ? Object.keys(fred).map(function(k) {
+        return '<span class="evidence-chip">' + escapeHtml(k + ': ' + fred[k]) + '</span>';
+      }).join('')
+    : '<span class="evidence-muted">No FRED metrics captured.</span>';
+  var triggers = Array.isArray(packet.review_triggers) ? packet.review_triggers : [];
+  return '<div class="pos-section">' +
+    '<div class="pos-section-title">Trade Evidence Packet</div>' +
+    '<div class="evidence-card">' +
+      '<div class="evidence-grid">' +
+        '<div><span>Action</span><b>' + escapeHtml((trade.side || '') + ' ' + (trade.qty || '')) + '</b></div>' +
+        '<div><span>Conviction</span><b>' + (trade.conviction != null ? (Number(trade.conviction) * 100).toFixed(0) + '%' : '-') + '</b></div>' +
+        '<div><span>Price Source</span><b>' + escapeHtml(market.price_source || '-') + '</b></div>' +
+        '<div><span>Price Age</span><b>' + (market.price_age_seconds != null ? escapeHtml(String(market.price_age_seconds) + 's') : '-') + '</b></div>' +
+        '<div><span>Macro Regime</span><b>' + escapeHtml(market.macro_regime || '-') + '</b></div>' +
+        '<div><span>Existing Qty</span><b>' + escapeHtml(String(position.existing_qty || 0)) + '</b></div>' +
+      '</div>' +
+      (missing.length ? '<div class="evidence-warning"><b>Missing / weak evidence:</b><br>' + escapeHtml(missing.join('\n')) + '</div>' : '<div class="thesis-ok">No missing-evidence warnings recorded.</div>') +
+      '<details class="evidence-subsection" open data-detail-key="evidence-checks"><summary>Checks</summary>' + renderEvidenceChecks(packet.checks || []) + '</details>' +
+      '<details class="evidence-subsection" data-detail-key="evidence-facts"><summary>Market Facts</summary><div class="evidence-chip-row">' + fredHtml + '</div></details>' +
+      '<details class="evidence-subsection" data-detail-key="evidence-catalysts"><summary>Catalyst Trail</summary>' + renderEvidenceItems(evidence.catalysts || []) +
+        (evidence.catalyst_reasoning ? '<div class="evidence-note"><b>PM catalyst reasoning:</b> ' + escapeHtml(evidence.catalyst_reasoning) + '</div>' : '') +
+      '</details>' +
+      '<details class="evidence-subsection" data-detail-key="evidence-specialists"><summary>Specialist Briefs</summary>' + renderSpecialistBriefItems(evidence.specialist_briefs || []) + '</details>' +
+      (evidence.committee_review && evidence.committee_review.decision
+        ? '<details class="evidence-subsection" data-detail-key="evidence-ic"><summary>Investment Committee Review</summary><div class="evidence-item"><div class="evidence-item-title">' + escapeHtml(evidence.committee_review.decision || '') + '</div><div class="evidence-note">' + escapeHtml(evidence.committee_review.reason || '') + '</div></div></details>'
+        : '') +
+      '<details class="evidence-subsection" data-detail-key="evidence-news"><summary>News Evidence</summary>' + renderEvidenceItems(evidence.top_news || []) + '</details>' +
+      '<details class="evidence-subsection" data-detail-key="evidence-poly"><summary>Prediction Market Evidence</summary>' + renderEvidenceItems(evidence.top_prediction_markets || []) + '</details>' +
+      (packet.invalidation ? '<div class="evidence-note"><b>Invalidation:</b> ' + escapeHtml(packet.invalidation) + '</div>' : '') +
+      (triggers.length ? '<div class="evidence-note"><b>Review triggers:</b> ' + escapeHtml(triggers.join(', ')) + '</div>' : '') +
+    '</div>' +
+  '</div>';
+}
+
+function latestEvidencePacket(data) {
+  if (data && data.evidence_packet && typeof data.evidence_packet === 'object' && Object.keys(data.evidence_packet).length) {
+    return data.evidence_packet;
+  }
+  var packets = data && Array.isArray(data.evidence_packets) ? data.evidence_packets : [];
+  for (var i = packets.length - 1; i >= 0; i--) {
+    if (packets[i] && typeof packets[i] === 'object' && Object.keys(packets[i]).length) {
+      return packets[i];
+    }
+  }
+  return null;
+}
+
+function renderFillEvidence(packet) {
+  if (!packet || typeof packet !== 'object' || !Object.keys(packet).length) return '';
+  var checks = Array.isArray(packet.checks) ? packet.checks : [];
+  var chips = checks.slice(0, 5).map(function(check) {
+    var status = String((check || {}).status || 'INFO').toUpperCase();
+    return '<span class="evidence-mini-chip ' + executionTruthBadgeClass(status) + '">' +
+      escapeHtml(evidenceStageLabel((check || {}).name) + ': ' + status) +
+    '</span>';
+  }).join('');
+  var missing = Array.isArray(packet.missing_evidence) ? packet.missing_evidence : [];
+  return '<div class="fill-evidence">' +
+    '<div class="fill-reason-label">Evidence Checks</div>' +
+    '<div class="evidence-mini-row">' + (chips || '<span class="evidence-muted">No checks recorded.</span>') + '</div>' +
+    (missing.length ? '<div class="evidence-mini-warning">' + escapeHtml(missing.slice(0, 4).join('\n')) + '</div>' : '') +
+  '</div>';
 }
 
 function renderPositionModal(d, overlay) {
@@ -3888,9 +4718,14 @@ function renderPositionModal(d, overlay) {
   // SL / TP progress bar
   var slPct = ((d.stop_loss_pct || 0.05) * 100).toFixed(1);
   var tpPct = ((d.take_profit_pct || 0.15) * 100).toFixed(1);
+  var tpLevels = Array.isArray(d.take_profit_levels) ? d.take_profit_levels : [];
+  var tpHits = Array.isArray(d.take_profit_hits) ? d.take_profit_hits : [];
+  var maxTierPct = tpLevels.reduce(function(maxVal, level) {
+    return Math.max(maxVal, Number(level.trigger_pct || 0));
+  }, 0);
   var currentPnlPct = pnlPct;
   var barMin = -(d.stop_loss_pct || 0.05) * 100;
-  var barMax = (d.take_profit_pct || 0.15) * 100;
+  var barMax = Math.max((d.take_profit_pct || 0.15), maxTierPct) * 100;
   var barRange = barMax - barMin;
   var markerPos = barRange > 0 ? Math.max(0, Math.min(100, (currentPnlPct - barMin) / barRange * 100)) : 50;
 
@@ -3932,6 +4767,7 @@ function renderPositionModal(d, overlay) {
         (thesisText
           ? '<div class="fill-reason"><div class="fill-reason-label">Entry / Expansion Thesis</div>' + escapeHtml(thesisText) + '</div>'
           : '<div class="fill-reason fill-reason-empty">No PM reasoning captured for this fill.</div>') +
+        renderFillEvidence(f.evidence_packet) +
       '</details>';
     }).join('');
   } else {
@@ -3979,6 +4815,21 @@ function renderPositionModal(d, overlay) {
         '<button type="button" class="pos-detail-btn" onclick="setPositionDetailsOpen(\'fills\', false)">Collapse all</button>' +
       '</span>'
     : '';
+  var tpLevelsHtml = '';
+  if (tpLevels.length) {
+    tpLevelsHtml = '<div class="tp-levels">' + tpLevels.map(function(level, idx) {
+      var trigger = Number(level.trigger_pct || 0) * 100;
+      var closePct = Number(level.close_pct || 0) * 100;
+      var hit = tpHits.indexOf(idx) !== -1;
+      var label = level.label || ('TP' + (idx + 1));
+      return '<div class="tp-level ' + (hit ? 'hit' : 'open') + '">' +
+        '<span class="tp-label">' + escapeHtml(label) + '</span>' +
+        '<span class="tp-trigger">+' + trigger.toFixed(1) + '%</span>' +
+        '<span class="tp-close">close ' + closePct.toFixed(0) + '%</span>' +
+        '<span class="tp-status">' + (hit ? 'hit' : 'open') + '</span>' +
+      '</div>';
+    }).join('') + '</div>';
+  }
 
   overlay.innerHTML = '<div class="pos-modal">' +
     '<button class="pos-modal-close" onclick="closePositionModal()">&times;</button>' +
@@ -4028,6 +4879,7 @@ function renderPositionModal(d, overlay) {
           '<span class="pos-bar-tp-lbl">TP +' + tpPct + '%</span>' +
         '</div>' +
       '</div>' +
+      (tpLevelsHtml || '<div class="pos-exit-meta">Single TP closes the remaining position if reached.</div>') +
       '<div class="pos-exit-meta">Max hold: ' + (d.max_hold_days > 0 ? d.max_hold_days + ' days' : 'No limit (thesis-driven)') + '</div>' +
     '</div>' +
     // Fill timeline
@@ -4040,6 +4892,31 @@ function renderPositionModal(d, overlay) {
     exitsHtml +
     // Entry thesis
     (thesis ? '<div class="pos-section"><div class="pos-section-title">Entry Thesis</div><div class="pos-thesis">' + escapeHtml(thesis) + '</div></div>' : '') +
+    // Evidence packet
+    renderEvidencePacket(latestEvidencePacket(d)) +
+    // Decision replay
+    (function() {
+      var chain = d.decision_chain || [];
+      if (!chain.length) return '';
+      var items = chain.map(function(c, idx) {
+        var status = String(c.status || 'INFO').toUpperCase();
+        var llm = c.llm && c.llm.model ? c.llm.provider + '/' + c.llm.model + ' · ' + c.llm.task : '';
+        var ts = c.timestamp ? new Date(c.timestamp).toLocaleString() : '';
+        return '<details class="pmh-entry" data-detail-key="decision-' + idx + '"' + (idx === 0 ? ' open' : '') + '>' +
+          '<summary class="pmh-header">' +
+            '<span class="badge ' + executionTruthBadgeClass(status) + '">' + escapeHtml(status) + '</span>' +
+            '<span class="rh-badge">' + escapeHtml(String(c.stage || 'decision').replace(/_/g, ' ')) + '</span>' +
+            '<span class="rh-ts">' + escapeHtml(ts) + '</span>' +
+            (llm ? '<span class="audit-model">' + escapeHtml(llm) + '</span>' : '') +
+            '<span class="pmh-caret">▾</span>' +
+          '</summary>' +
+          '<div class="pmh-text"><b>' + escapeHtml(c.summary || '') + '</b>' +
+          (c.detail ? '<br>' + escapeHtml(c.detail) : '') + '</div>' +
+        '</details>';
+      }).join('');
+      return '<div class="pos-section"><div class="pos-section-title">Decision Replay (' + chain.length + ' events)</div>' +
+        '<div class="pmh-list">' + items + '</div></div>';
+    })() +
     // PM Reasoning History
     (function() {
       var rh = d.reasoning_history;
@@ -4211,6 +5088,8 @@ function updateActivityFeed() {
       roleColor = '#e8a000';  // amber — reasoning flagged
     } else if (item.action === 'thesis_revised') {
       roleColor = '#00d68f';  // green — accepted after revision
+    } else if (item.action === 'evidence_review_required' || item.action === 'evidence_review_blocked') {
+      roleColor = '#e84040';
     }
     if (item.action === 'article_deep_dive' && item.urls) {
       shortSummary = escapeHtml(fullSummary) + ' ' +
@@ -5009,6 +5888,41 @@ function loadSavedReports() {
     });
 }
 
+function loadReportCorpus() {
+  var container = document.getElementById('report-corpus-list');
+  if (!container) return;
+  container.innerHTML = '<div class="empty"><div class="empty-txt">Loading report corpus...</div></div>';
+  fetchJsonWithTimeout('/api/reports/corpus?limit=80', {}, 6000)
+    .then(function(data) {
+      reportCorpus = data || {};
+      var reports = reportCorpus.reports || [];
+      if (!reports.length) {
+        container.innerHTML = '<div class="empty"><div class="empty-txt">No report corpus entries yet</div><div class="empty-hint">PM, specialist, IC, thesis, hindsight, and meta reports will appear here.</div></div>';
+        return;
+      }
+      container.innerHTML = '<div class="tbl-wrap tbl-wrap-scroll"><table class="dtbl"><thead><tr>' +
+        '<th>Time</th><th>Type</th><th>Pod</th><th>Symbol</th><th>Title</th><th>Catalysts</th><th>Flags</th>' +
+        '</tr></thead><tbody>' +
+        reports.map(function(r) {
+          var cats = Array.isArray(r.related_catalyst_ids) ? r.related_catalyst_ids : [];
+          var flags = Array.isArray(r.quality_flags) ? r.quality_flags : [];
+          return '<tr>' +
+            '<td class="mono">' + escapeHtml(formatRelativeTime(r.created_at)) + '</td>' +
+            '<td class="mono">' + escapeHtml(r.report_type || '') + '</td>' +
+            '<td class="mono">' + escapeHtml(r.pod_id || '-') + '</td>' +
+            '<td class="mono">' + escapeHtml(r.symbol || '-') + '</td>' +
+            '<td><div class="rf-item-title">' + escapeHtml(r.title || '') + '</div><div class="rf-item-meta">' + escapeHtml(truncate(r.summary || '', 220)) + '</div></td>' +
+            '<td><div class="rf-tags">' + researchTags(cats.slice(0, 4), 'factor') + '</div></td>' +
+            '<td><div class="rf-tags">' + researchTags(flags.slice(0, 4), 'held') + '</div></td>' +
+          '</tr>';
+        }).join('') +
+        '</tbody></table></div>';
+    })
+    .catch(function(err) {
+      container.innerHTML = '<div class="empty"><div class="empty-txt">Failed to load report corpus</div><div class="empty-hint">' + escapeHtml(err && err.message ? err.message : '') + '</div></div>';
+    });
+}
+
 // ─── Closed Positions Tab ─────────────────────────────────────────────────
 var _closedPositions = [];
 
@@ -5146,4 +6060,20 @@ function showClosedPositionDetail(idx) {
 initResearchHistoryChart();
 updateGovHub();
 loadSavedReports();
+loadReportCorpus();
 loadClosedPositions();
+fetchResearchFeedAudit(true).then(function() {
+  renderNewsFeed();
+  renderResearchFeedAudit(false);
+  renderForesightLedger(false);
+}).catch(function() {
+  renderNewsFeed();
+});
+setInterval(function() {
+  fetchResearchFeedAudit(false).then(function() {
+    renderNewsFeed();
+  }).catch(function() {});
+  fetchForesightLedger(false).then(function() {
+    renderForesightLedger(false);
+  }).catch(function() {});
+}, RESEARCH_FEED_REFRESH_MS);

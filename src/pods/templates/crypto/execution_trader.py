@@ -299,11 +299,13 @@ class CryptoExecutionTrader(BasePodAgent):
                         conviction=pm_meta.get("conviction", order.conviction),
                         stop_loss_pct=pm_meta.get("stop_loss_pct"),
                         take_profit_pct=pm_meta.get("take_profit_pct"),
+                        take_profit_levels=pm_meta.get("take_profit_levels"),
                         exit_when=pm_meta.get("exit_when", ""),
                         max_hold_days=pm_meta.get("max_hold_days", 0),
                         expected_price=expected_price,
                         entry_macro_regime=pm_meta.get("entry_macro_regime", ""),
                         thesis_review=pm_meta.get("thesis_review"),
+                        evidence_packet=pm_meta.get("evidence_packet"),
                     )
 
                 try:
@@ -351,6 +353,7 @@ class CryptoExecutionTrader(BasePodAgent):
                         "reasoning": pm_meta.get("reasoning", ""),
                         "conviction": pm_meta.get("conviction", 0.5),
                         "strategy_tag": pm_meta.get("strategy_tag", ""),
+                        "evidence_packet": pm_meta.get("evidence_packet", {}),
                     },
                 )
 

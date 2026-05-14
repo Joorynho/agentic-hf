@@ -11,6 +11,8 @@ import logging
 import os
 import re
 import time
+from collections import deque
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,14 @@ class LLMTask:
     ALLOCATION = "allocation"
     POSITION_REVIEW = "position_review"
     LOSS_REVIEW = "loss_review"
+    SPECIALIST_BRIEFS = "specialist_briefs"
+    PM_FINAL_AFTER_SPECIALISTS = "pm_final_after_specialists"
+    COMMITTEE_REVIEW = "committee_review"
+    DECISION_EVALUATION = "decision_evaluation"
+    SHADOW_REPLAY = "shadow_replay"
+    PORTFOLIO_CONSTRUCTION = "portfolio_construction"
+    THESIS_MONITOR = "thesis_monitor"
+    CALIBRATION = "calibration"
 
 
 _OPENAI_TASK_TIERS = {
@@ -61,6 +71,14 @@ _OPENAI_TASK_TIERS = {
     LLMTask.ALLOCATION: "strong",
     LLMTask.POSITION_REVIEW: "frontier",
     LLMTask.LOSS_REVIEW: "frontier",
+    LLMTask.SPECIALIST_BRIEFS: "strong",
+    LLMTask.PM_FINAL_AFTER_SPECIALISTS: "strong",
+    LLMTask.COMMITTEE_REVIEW: "strong",
+    LLMTask.DECISION_EVALUATION: "default",
+    LLMTask.SHADOW_REPLAY: "strong",
+    LLMTask.PORTFOLIO_CONSTRUCTION: "strong",
+    LLMTask.THESIS_MONITOR: "default",
+    LLMTask.CALIBRATION: "default",
 }
 
 # Backwards-compatible name for older imports/tests. The value now points at
@@ -73,6 +91,7 @@ _openrouter_exhausted = False
 _openrouter_reset: float = 0.0
 _openai_exhausted = False
 _openai_reset: float = 0.0
+_llm_call_log: deque[dict] = deque(maxlen=250)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -112,6 +131,150 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
+def _record_llm_call(
+    *,
+    provider: str,
+    model: str,
+    task: str,
+    status: str,
+    latency_ms: float,
+    error: str = "",
+    fallback_attempt: int = 0,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+    total_tokens: int | None = None,
+    cost_estimate: float | None = None,
+    model_tier: str | None = None,
+    model_selection_reason: str | None = None,
+    budget_mode: str | None = None,
+    fallback_path: str | None = None,
+) -> None:
+    """Store lightweight model observability for dashboard/debugging."""
+    policy = model_policy_for_task(task)
+    _llm_call_log.appendleft({
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "provider": provider,
+        "model": model,
+        "task": task,
+        "status": status,
+        "latency_ms": round(float(latency_ms), 1),
+        "error": str(error or "")[:500],
+        "fallback_attempt": int(fallback_attempt or 0),
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+        "cost_estimate": cost_estimate,
+        "model_tier": model_tier or policy["model_tier"],
+        "model_selection_reason": model_selection_reason or policy["model_selection_reason"],
+        "budget_mode": budget_mode or ("degraded" if (_openai_exhausted or _openrouter_exhausted) else "normal"),
+        "fallback_path": fallback_path or (f"attempt:{fallback_attempt}" if fallback_attempt else ""),
+    })
+
+
+def _usage_payload(resp) -> dict:
+    usage = getattr(resp, "usage", None)
+    if not usage:
+        return {}
+    prompt = getattr(usage, "prompt_tokens", None)
+    completion = getattr(usage, "completion_tokens", None)
+    total = getattr(usage, "total_tokens", None)
+    if total is None and (prompt is not None or completion is not None):
+        total = int(prompt or 0) + int(completion or 0)
+    return {
+        "prompt_tokens": int(prompt or 0) if prompt is not None else None,
+        "completion_tokens": int(completion or 0) if completion is not None else None,
+        "total_tokens": int(total or 0) if total is not None else None,
+    }
+
+
+def _estimate_call_cost(provider: str, model: str, usage: dict) -> float | None:
+    prompt = usage.get("prompt_tokens")
+    completion = usage.get("completion_tokens")
+    if prompt is None and completion is None:
+        return None
+    # Conservative dashboard estimate, USD per 1M tokens. Override exact
+    # accounting later if provider billing export is wired in.
+    model_l = str(model or "").lower()
+    if provider == "openrouter" and ":free" in model_l:
+        return 0.0
+    if "gpt-5.2" in model_l or "gpt-5" == model_l:
+        in_rate, out_rate = 1.25, 10.0
+    elif "gpt-5-mini" in model_l or "mini" in model_l:
+        in_rate, out_rate = 0.25, 2.0
+    else:
+        in_rate, out_rate = 0.50, 2.0
+    return round(((float(prompt or 0) * in_rate) + (float(completion or 0) * out_rate)) / 1_000_000, 6)
+
+
+def get_recent_llm_calls(limit: int = 100) -> list[dict]:
+    """Return recent LLM call attempts, newest first."""
+    limit = max(1, min(int(limit or 100), len(_llm_call_log) or 1))
+    return list(_llm_call_log)[:limit]
+
+
+def get_last_llm_call(task: str | None = None, success_only: bool = True) -> dict:
+    """Return the latest LLM telemetry row for a task."""
+    task_name = _normalize_task(task) if task else ""
+    for row in _llm_call_log:
+        if task_name and row.get("task") != task_name:
+            continue
+        if success_only and row.get("status") != "success":
+            continue
+        return dict(row)
+    return {}
+
+
+def get_llm_health_report(limit: int = 100) -> dict:
+    """Aggregate model health for the dashboard."""
+    rows = get_recent_llm_calls(limit)
+    by_model: dict[str, dict] = {}
+    by_task: dict[str, dict] = {}
+
+    def bump(bucket: dict[str, dict], key: str, row: dict) -> None:
+        if not key:
+            key = "unknown"
+        stat = bucket.setdefault(key, {
+            "key": key,
+            "calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "avg_latency_ms": 0.0,
+            "last_status": "",
+            "last_error": "",
+            "last_seen": "",
+        })
+        stat["calls"] += 1
+        if row.get("status") == "success":
+            stat["successes"] += 1
+        else:
+            stat["failures"] += 1
+        n = stat["calls"]
+        stat["avg_latency_ms"] = round(
+            ((float(stat["avg_latency_ms"]) * (n - 1)) + float(row.get("latency_ms") or 0.0)) / n,
+            1,
+        )
+        stat["last_status"] = row.get("status", "")
+        stat["last_error"] = row.get("error", "")
+        stat["last_seen"] = row.get("ts", "")
+
+    for row in rows:
+        bump(by_model, f"{row.get('provider')}/{row.get('model')}", row)
+        bump(by_task, str(row.get("task") or ""), row)
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "provider_order": _provider_order(),
+        "default_openai_model": _openai_default_model(),
+        "strong_openai_model": _openai_strong_model(),
+        "frontier_openai_model": _openai_frontier_model(),
+        "openai_exhausted": _openai_exhausted,
+        "openrouter_exhausted": _openrouter_exhausted,
+        "by_model": sorted(by_model.values(), key=lambda x: x["calls"], reverse=True),
+        "by_task": sorted(by_task.values(), key=lambda x: x["calls"], reverse=True),
+        "recent": rows,
+    }
+
+
 def _openai_default_model() -> str:
     return (
         os.getenv("OPENAI_MODEL_DEFAULT")
@@ -137,6 +300,31 @@ def _openai_frontier_model() -> str:
     ).strip()
 
 
+def model_policy_for_task(task: str | None = None, risk_context: dict | None = None) -> dict:
+    """Return model tier metadata for a task.
+
+    This is intentionally lightweight: exact provider/model candidates remain
+    below in provider-specific routing, while this function explains why a task
+    deserves cheap/default/strong/frontier treatment.
+    """
+    task_name = _normalize_task(task)
+    risk_context = risk_context or {}
+    tier = _OPENAI_TASK_TIERS.get(task_name, "default")
+    reason = f"task_policy:{task_name}"
+    if risk_context.get("risk_increasing") and float(risk_context.get("notional", 0.0) or 0.0) >= 500:
+        tier = "frontier" if tier == "strong" else tier
+        reason += "; high_notional_risk_increasing"
+    if risk_context.get("degraded_dependencies"):
+        tier = "strong" if tier == "default" else tier
+        reason += "; degraded_dependencies"
+    return {
+        "task": task_name,
+        "model_tier": tier,
+        "model_selection_reason": reason,
+        "budget_mode": "degraded" if (_openai_exhausted or _openrouter_exhausted) else "normal",
+    }
+
+
 def openai_models_for_task(task: str | None = None) -> list[str]:
     """Return ordered OpenAI model candidates for a task.
 
@@ -151,7 +339,7 @@ def openai_models_for_task(task: str | None = None) -> list[str]:
     default_model = _openai_default_model()
     strong_model = _openai_strong_model()
     frontier_model = _openai_frontier_model()
-    tier = _OPENAI_TASK_TIERS.get(task_name, "default")
+    tier = model_policy_for_task(task_name)["model_tier"]
 
     if tier == "frontier":
         models = [explicit, _last_success_openai_model.get(task_name, ""), frontier_model, strong_model, default_model]
@@ -240,28 +428,168 @@ def has_llm_key() -> bool:
     return bool(os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY"))
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
+
+
+def _is_gpt5_model(model: str) -> bool:
+    return str(model or "").strip().lower().startswith("gpt-5")
+
+
+def _gpt5_min_completion_tokens(task: str | None = None) -> int:
+    task_name = _normalize_task(task)
+    if task_name in {LLMTask.POSITION_REVIEW, LLMTask.LOSS_REVIEW}:
+        return _positive_int_env("OPENAI_GPT5_FRONTIER_MIN_COMPLETION_TOKENS", 900)
+    if task_name in {
+        LLMTask.PM_DECISION,
+        LLMTask.ARTICLE_DEEP_DIVE,
+        LLMTask.THESIS_VERIFICATION,
+        LLMTask.GOVERNANCE,
+        LLMTask.ALLOCATION,
+        LLMTask.THEME_SCAN,
+    }:
+        return _positive_int_env("OPENAI_GPT5_STRONG_MIN_COMPLETION_TOKENS", 700)
+    return _positive_int_env("OPENAI_GPT5_DEFAULT_MIN_COMPLETION_TOKENS", 400)
+
+
+def _openai_completion_budget(model: str, max_tokens: int, task: str | None = None) -> int:
+    requested = max(1, int(max_tokens or 1))
+    if _is_gpt5_model(model):
+        return max(requested, _gpt5_min_completion_tokens(task))
+    return requested
+
+
+def _openai_token_limit_kwargs(model: str, max_tokens: int, task: str | None = None) -> dict[str, int]:
+    """Return the correct token-limit parameter for the OpenAI chat API.
+
+    GPT-5 chat-completions models reject `max_tokens` and require
+    `max_completion_tokens`; older chat-completions models still use
+    `max_tokens`. OpenRouter stays on `max_tokens` in its own call path.
+    """
+    budget = _openai_completion_budget(model, max_tokens, task)
+    if _is_gpt5_model(model):
+        return {"max_completion_tokens": budget}
+    return {"max_tokens": budget}
+
+
+def _text_from_content_part(part: object) -> str:
+    if isinstance(part, str):
+        return part
+    if isinstance(part, dict):
+        text = part.get("text")
+        if isinstance(text, str):
+            return text
+        if isinstance(text, dict) and isinstance(text.get("value"), str):
+            return text["value"]
+        value = part.get("value")
+        return value if isinstance(value, str) else ""
+    text = getattr(part, "text", None)
+    if isinstance(text, str):
+        return text
+    if isinstance(text, dict) and isinstance(text.get("value"), str):
+        return text["value"]
+    value = getattr(part, "value", None)
+    return value if isinstance(value, str) else ""
+
+
+def _extract_chat_completion_text(resp: object) -> str:
+    """Extract text from OpenAI-compatible chat completion responses.
+
+    Most responses expose `choices[0].message.content` as a string, but some
+    SDK/provider combinations can return a list of text parts. Treat a 200 OK
+    with no usable text as an empty response so the router can try the next
+    model and record why it moved on.
+    """
+    choices = getattr(resp, "choices", None) or []
+    if not choices:
+        return ""
+    message = getattr(choices[0], "message", None)
+    if message is None:
+        return ""
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(_text_from_content_part(part) for part in content)
+    if content is not None:
+        return str(content)
+    refusal = getattr(message, "refusal", None)
+    return refusal if isinstance(refusal, str) else ""
+
+
 def _try_openai(client, messages: list[dict], max_tokens: int, task: str, openai_module) -> str:
     global _openai_exhausted, _openai_reset
     last_error: Exception | None = None
-    for model in openai_models_for_task(task):
+    for attempt_idx, model in enumerate(openai_models_for_task(task)):
+        started = time.perf_counter()
         try:
             resp = client.chat.completions.create(
-                model=model, max_tokens=max_tokens, messages=messages,
+                model=model,
+                messages=messages,
+                **_openai_token_limit_kwargs(model, max_tokens, task),
             )
-            text = resp.choices[0].message.content
+            text = _extract_chat_completion_text(resp).strip()
+            usage = _usage_payload(resp)
             if text:
                 _last_success_openai_model[task] = model
+                _record_llm_call(
+                    provider="openai",
+                    model=model,
+                    task=task,
+                    status="success",
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    fallback_attempt=attempt_idx,
+                    **usage,
+                    cost_estimate=_estimate_call_cost("openai", model, usage),
+                )
                 logger.info("[llm] Success via OpenAI/%s task=%s", model, task)
                 return text
+            last_error = RuntimeError("OpenAI returned 200 OK but no message content text")
+            _record_llm_call(
+                provider="openai",
+                model=model,
+                task=task,
+                status="empty_response",
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(last_error),
+                fallback_attempt=attempt_idx,
+            )
+            logger.warning("[llm] OpenAI/%s returned empty response for task=%s", model, task)
+            continue
         except openai_module.RateLimitError as exc:
             _openai_exhausted = True
             _openai_reset = time.time() + _cooldown_seconds("OPENAI_COOLDOWN_SECONDS", 3600)
+            _record_llm_call(
+                provider="openai",
+                model=model,
+                task=task,
+                status="rate_limited",
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(exc),
+                fallback_attempt=attempt_idx,
+            )
             logger.error("[llm] OpenAI quota/rate-limit hit; cooling down: %s", exc)
             last_error = exc
             break
         except openai_module.APIStatusError as exc:
             last_error = exc
             status = getattr(exc, "status_code", None)
+            record_status = "unavailable" if status in {400, 404} else "failed"
+            _record_llm_call(
+                provider="openai",
+                model=model,
+                task=task,
+                status=record_status,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(exc),
+                fallback_attempt=attempt_idx,
+            )
             if status in {400, 404}:
                 logger.warning("[llm] OpenAI/%s unavailable for task=%s: %s", model, task, exc)
                 continue
@@ -269,6 +597,15 @@ def _try_openai(client, messages: list[dict], max_tokens: int, task: str, openai
             continue
         except Exception as exc:
             last_error = exc
+            _record_llm_call(
+                provider="openai",
+                model=model,
+                task=task,
+                status="failed",
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(exc),
+                fallback_attempt=attempt_idx,
+            )
             logger.error("[llm] OpenAI/%s failed for task=%s: %s", model, task, exc)
             continue
     if last_error:
@@ -280,20 +617,54 @@ def _try_openrouter(client, messages: list[dict], max_tokens: int, task: str, op
     global _last_success_model, _openrouter_exhausted, _openrouter_reset
     rate_limit_count = 0
     last_error: Exception | None = None
-    for model in openrouter_models_for_task(task):
+    for attempt_idx, model in enumerate(openrouter_models_for_task(task)):
+        started = time.perf_counter()
         try:
             resp = client.chat.completions.create(
                 model=model, max_tokens=max_tokens, messages=messages,
             )
-            text = resp.choices[0].message.content
+            text = _extract_chat_completion_text(resp).strip()
+            usage = _usage_payload(resp)
             if text:
                 _last_success_model = model
+                _record_llm_call(
+                    provider="openrouter",
+                    model=model,
+                    task=task,
+                    status="success",
+                    latency_ms=(time.perf_counter() - started) * 1000,
+                    fallback_attempt=attempt_idx,
+                    **usage,
+                    cost_estimate=_estimate_call_cost("openrouter", model, usage),
+                )
                 logger.info("[llm] Success via OpenRouter/%s task=%s", model, task)
                 return text
+            last_error = RuntimeError("OpenRouter returned 200 OK but no message content text")
+            _record_llm_call(
+                provider="openrouter",
+                model=model,
+                task=task,
+                status="empty_response",
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(last_error),
+                fallback_attempt=attempt_idx,
+            )
+            logger.debug("[llm] OpenRouter/%s returned empty response for task=%s", model, task)
+            continue
         except (openai_module.RateLimitError, openai_module.APIStatusError) as exc:
             last_error = exc
             err_str = str(getattr(exc, "body", "") or "")
             status = getattr(exc, "status_code", None)
+            record_status = "unavailable" if status in {400, 404} else "rate_limited"
+            _record_llm_call(
+                provider="openrouter",
+                model=model,
+                task=task,
+                status=record_status,
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(exc),
+                fallback_attempt=attempt_idx,
+            )
             if status in {400, 404}:
                 logger.debug("[llm] OpenRouter/%s unavailable for task=%s: %s", model, task, exc)
                 continue
@@ -311,6 +682,15 @@ def _try_openrouter(client, messages: list[dict], max_tokens: int, task: str, op
             time.sleep(0.05)
         except Exception as exc:
             last_error = exc
+            _record_llm_call(
+                provider="openrouter",
+                model=model,
+                task=task,
+                status="failed",
+                latency_ms=(time.perf_counter() - started) * 1000,
+                error=str(exc),
+                fallback_attempt=attempt_idx,
+            )
             logger.debug("[llm] OpenRouter/%s failed for task=%s: %s", model, task, exc)
     if last_error:
         raise RuntimeError(f"OpenRouter failed for task={task}: {last_error}") from last_error

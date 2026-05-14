@@ -212,6 +212,39 @@ class TestRESTEndpoints:
         assert "iteration" in data
         assert "uptime_seconds" in data
 
+    def test_get_session_snapshot_http_fallback(self, client, app):
+        """Test HTTP snapshot endpoint used when browser WebSocket is unavailable."""
+        app.state.iteration = 7
+        app.state.session_stage = "agent_decisions"
+        app.state.session_stage_detail = "Iteration 7: running PM/risk/execution agents"
+        app.state.session_stage_updated_at = "2026-05-12T12:00:00+00:00"
+        app.state.pod_summaries = {
+            "equities": {
+                "pod_id": "equities",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "ACTIVE",
+                "risk_metrics": {
+                    "nav": 1005.0,
+                    "daily_pnl": 5.0,
+                },
+                "positions": [{"symbol": "SPY", "qty": 1}],
+            }
+        }
+
+        response = client.get("/api/session/snapshot")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["type"] == "session_snapshot"
+        assert data["data"]["iteration"] == 7
+        assert data["data"]["stage"] == "agent_decisions"
+        assert data["data"]["stage_detail"] == "Iteration 7: running PM/risk/execution agents"
+        assert data["data"]["session_active"] is False
+        equities = data["data"]["pod_summaries"]["equities"]
+        assert equities["data"]["nav"] == 1005.0
+        assert equities["data"]["daily_pnl"] == 5.0
+        assert equities["data"]["current_positions"] == [{"symbol": "SPY", "qty": 1}]
+
     def test_get_all_pods_empty(self, client):
         """Test get all pods endpoint when no pods exist."""
         response = client.get("/api/pods")
@@ -438,6 +471,58 @@ class TestRESTEndpoints:
         assert data["recent_orders"][0]["order_id"] == "local-1"
         sm.get_execution_truth.assert_called_once()
 
+    def test_evidence_review_endpoint_uses_session_manager(self, client, app):
+        """Evidence review endpoint exposes weak/stale thesis evidence queue."""
+        sm = MagicMock()
+        sm.get_evidence_review_queue.return_value = {
+            "status": "CHECK",
+            "counts": {"URGENT": 1, "REVIEW": 0, "WATCH": 0},
+            "queue": [{"pod_id": "crypto", "symbol": "SOL/USD", "status": "URGENT"}],
+            "generated_at": "2026-05-12T12:00:00+00:00",
+        }
+        app.state.session_manager = sm
+
+        response = client.get("/api/evidence-review")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["queue"][0]["symbol"] == "SOL/USD"
+        assert data["counts"]["URGENT"] == 1
+        sm.get_evidence_review_queue.assert_called_once()
+
+    def test_foresight_and_challenge_endpoints_use_session_manager(self, client, app):
+        """Foresight, specialist, and IC endpoints expose recent decision-layer records."""
+        sm = MagicMock()
+        sm.get_foresight_report.return_value = {
+            "status": "OK",
+            "events": [{"event_id": "cat-1", "title": "Oil shock"}],
+            "event_count": 1,
+            "counts": {"active": 1, "stale": 0, "failed": 0},
+        }
+        sm.get_specialist_briefs.return_value = {
+            "briefs": [{"brief_id": "brief-1", "type": "macro_policy"}],
+            "count": 1,
+        }
+        sm.get_committee_reviews.return_value = {
+            "reviews": [{"review_id": "ic-1", "decision": "APPROVE"}],
+            "count": 1,
+        }
+        app.state.session_manager = sm
+
+        foresight = client.get("/api/foresight?limit=25&pod_id=commodities")
+        specialists = client.get("/api/specialist-briefs?limit=25&pod_id=commodities")
+        committee = client.get("/api/committee-reviews?limit=25&pod_id=commodities")
+
+        assert foresight.status_code == 200
+        assert foresight.json()["events"][0]["event_id"] == "cat-1"
+        assert specialists.status_code == 200
+        assert specialists.json()["briefs"][0]["brief_id"] == "brief-1"
+        assert committee.status_code == 200
+        assert committee.json()["reviews"][0]["decision"] == "APPROVE"
+        sm.get_foresight_report.assert_called_once_with(limit=25, pod_id="commodities")
+        sm.get_specialist_briefs.assert_called_once_with(limit=25, pod_id="commodities")
+        sm.get_committee_reviews.assert_called_once_with(limit=25, pod_id="commodities")
+
     def test_positions_endpoint_refreshes_prices_before_returning_positions(self, client, app):
         """Open positions endpoint triggers the non-blocking live-price refresh hook."""
         sm = MagicMock()
@@ -492,6 +577,18 @@ class TestRESTEndpoints:
                     "summary": "BUY SPY",
                     "detail": "Thesis verified",
                 },
+            }, {
+                "timestamp": "2026-05-08T09:00:30+00:00",
+                "data": {
+                    "agent_role": "Runtime",
+                    "pod_id": "crypto",
+                    "symbol": "SOL/USD",
+                    "action": "evidence_review_blocked",
+                    "status": "BLOCKED",
+                    "summary": "CRYPTO evidence guard blocked BUY SOL/USD",
+                    "detail": "Fresh expansion thesis required",
+                    "reason": "REVIEW evidence review for SOL/USD: missing valuation evidence",
+                },
             }],
             "recent_governance": [{
                 "timestamp": "2026-05-08T09:01:00+00:00",
@@ -521,9 +618,12 @@ class TestRESTEndpoints:
         assert response.status_code == 200
         data = response.json()
         stages = {item["stage"] for item in data["items"]}
-        assert {"trade_decision", "governance", "preflight"}.issubset(stages)
+        assert {"trade_decision", "evidence_review_blocked", "governance", "preflight"}.issubset(stages)
         rejected = [item for item in data["items"] if item.get("status") == "REJECTED"][0]
         assert rejected["reason"] == "Asset is not tradable"
+        evidence = [item for item in data["items"] if item["stage"] == "evidence_review_blocked"][0]
+        assert evidence["status"] == "BLOCKED"
+        assert evidence["reason"] == "REVIEW evidence review for SOL/USD: missing valuation evidence"
 
     def test_research_feed_endpoint_uses_session_manager_and_listener_state(self, client, app):
         """Research feed endpoint exposes persistent feed, health, and action audit."""
@@ -550,6 +650,32 @@ class TestRESTEndpoints:
             limit=25,
             listener_state=app.state.listener._app_state,
         )
+
+    def test_research_feed_endpoint_falls_back_to_in_memory_news(self, client, app):
+        """Research feed endpoint still returns news when persistent diagnostics are unavailable."""
+        class Ingestion:
+            news_items = [{
+                "title": "Oil jumps as shipping risk rises",
+                "source": "Reuters",
+                "published_at": "2026-05-12T10:00:00+00:00",
+                "url": "https://example.com/oil",
+            }]
+            x_feed = []
+            last_fetch_time = datetime(2026, 5, 12, 10, 1, tzinfo=timezone.utc)
+
+        class Session:
+            _research_ingestion = Ingestion()
+
+        app.state.session_manager = Session()
+
+        response = client.get("/api/research-feed?limit=10")
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "FALLBACK"
+        assert data["item_count"] == 1
+        assert data["items"][0]["title"] == "Oil jumps as shipping risk rises"
+        assert data["items"][0]["source"] == "Reuters"
 
     def test_loss_reviews_endpoint_uses_session_manager(self, client, app):
         """Loss-review endpoint exposes active pod interventions from SessionManager."""
@@ -790,6 +916,8 @@ class TestSessionControl:
         data = resp.json()
         assert data["active"] is False
         assert "iteration" in data
+        assert data["stage"] == "idle"
+        assert data["stage_detail"] == "Idle"
         assert "uptime_seconds" in data
         assert "pod_count" in data
 
@@ -798,6 +926,11 @@ class TestSessionControl:
         sm = app_with_manager.state.session_manager
         sm.session_active = True
         sm.iteration = 42
+        sm.session_stage = {
+            "stage": "research",
+            "stage_detail": "Iteration 42: refreshing pod research",
+            "stage_updated_at": "2026-05-12T12:00:00+00:00",
+        }
         sm._pod_runtimes = {"equities": None, "fx": None, "crypto": None, "commodities": None}
 
         resp = client_with_manager.get("/api/session/status")
@@ -805,6 +938,8 @@ class TestSessionControl:
         data = resp.json()
         assert data["active"] is True
         assert data["iteration"] == 42
+        assert data["stage"] == "research"
+        assert data["stage_detail"] == "Iteration 42: refreshing pod research"
         assert data["pod_count"] == 4
 
     def test_stop_session_calls_manager(self, app_with_manager, client_with_manager):
@@ -881,3 +1016,65 @@ class TestSessionControl:
         resp = client.post("/api/session/start")
         assert resp.status_code == 403
         assert "disabled" in resp.json()["detail"].lower()
+
+
+class TestManagedRuntimeEndpoints:
+    """REST coverage for the managed-agent operating-layer APIs."""
+
+    def test_managed_runtime_endpoints_return_empty_without_manager(self, client):
+        for path, key in [
+            ("/api/agent-runs", "runs"),
+            ("/api/artifacts", "artifacts"),
+            ("/api/reports/corpus", "reports"),
+            ("/api/hindsight", "reviews"),
+            ("/api/scheduler/jobs", "jobs"),
+            ("/api/catalyst-threads", "threads"),
+            ("/api/decision-trace", "stages"),
+            ("/api/decision-evaluations", "evaluations"),
+            ("/api/shadow-replay", "replays"),
+            ("/api/portfolio-construction", "reviews"),
+            ("/api/thesis-monitor", "results"),
+            ("/api/calibration", "scores"),
+        ]:
+            resp = client.get(path)
+            assert resp.status_code == 200
+            data = resp.json()
+            assert key in data
+            assert data[key] == []
+
+        resp = client.get("/api/budgets")
+        assert resp.status_code == 200
+        assert "today" in resp.json()
+
+    def test_managed_runtime_endpoints_delegate_to_session_manager(self, event_bus):
+        sm = MagicMock()
+        sm.get_agent_runs.return_value = {"runs": [{"run_id": "run_1"}], "count": 1}
+        sm.get_artifacts.return_value = {"artifacts": [{"kind": "fresh_prices"}], "count": 1}
+        sm.get_report_corpus.return_value = {"reports": [{"report_id": "report_1"}], "count": 1}
+        sm.get_hindsight_report.return_value = {"reviews": [{"report_id": "hindsight_1"}], "count": 1}
+        sm.get_budget_report.return_value = {"today": {"calls": 3}, "recent": []}
+        sm.get_scheduler_jobs.return_value = {"jobs": [{"job_name": "price_refresh"}], "count": 1}
+        sm.get_catalyst_threads.return_value = {"threads": [{"thread_id": "thread_1"}], "count": 1}
+        sm.get_decision_trace.return_value = {"stages": [{"stage": "pm_decision"}], "count": 1}
+        sm.get_decision_evaluations.return_value = {"evaluations": [{"evaluation_id": "eval_1"}], "count": 1}
+        sm.get_shadow_replay.return_value = {"replays": [{"replay_id": "replay_1"}], "count": 1}
+        sm.get_portfolio_construction_reviews.return_value = {"reviews": [{"review_id": "pc_1"}], "count": 1}
+        sm.get_thesis_monitor_results.return_value = {"results": [{"monitor_id": "tm_1"}], "count": 1}
+        sm.get_calibration_report.return_value = {"scores": [{"entity_type": "symbol"}], "count": 1}
+
+        app = create_app(event_bus=event_bus, session_manager=sm)
+        client = TestClient(app)
+
+        assert client.get("/api/agent-runs").json()["runs"][0]["run_id"] == "run_1"
+        assert client.get("/api/artifacts").json()["artifacts"][0]["kind"] == "fresh_prices"
+        assert client.get("/api/reports/corpus").json()["reports"][0]["report_id"] == "report_1"
+        assert client.get("/api/hindsight").json()["reviews"][0]["report_id"] == "hindsight_1"
+        assert client.get("/api/budgets").json()["today"]["calls"] == 3
+        assert client.get("/api/scheduler/jobs").json()["jobs"][0]["job_name"] == "price_refresh"
+        assert client.get("/api/catalyst-threads").json()["threads"][0]["thread_id"] == "thread_1"
+        assert client.get("/api/decision-trace?symbol=GLD").json()["stages"][0]["stage"] == "pm_decision"
+        assert client.get("/api/decision-evaluations?run=true").json()["evaluations"][0]["evaluation_id"] == "eval_1"
+        assert client.get("/api/shadow-replay?snapshot_id=snap_1&run=true").json()["replays"][0]["replay_id"] == "replay_1"
+        assert client.get("/api/portfolio-construction").json()["reviews"][0]["review_id"] == "pc_1"
+        assert client.get("/api/thesis-monitor").json()["results"][0]["monitor_id"] == "tm_1"
+        assert client.get("/api/calibration?run=true").json()["scores"][0]["entity_type"] == "symbol"
